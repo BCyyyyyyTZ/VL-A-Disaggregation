@@ -18,7 +18,7 @@ import tyro
 Mode = Literal["monolithic", "split-no-mps", "split-mps"]
 TraceStatus = Literal["ok", "error", "timeout"]
 DEFAULT_PROFILE_CHECKPOINT_CONFIG = "pi05_libero"
-DEFAULT_PROFILE_CHECKPOINT_DIR = "/data2/tianze/checkpoints/RLinf-Pi05-LIBERO-SFT"
+DEFAULT_PROFILE_CHECKPOINT_DIR = "/data2/gaobowen/model/RLinf-Pi05-LIBERO-SFT"
 
 
 @dataclasses.dataclass(frozen=True, slots=True)

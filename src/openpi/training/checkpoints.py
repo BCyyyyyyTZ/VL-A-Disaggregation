@@ -114,6 +114,26 @@ def load_norm_stats(assets_dir: epath.Path | str, asset_id: str) -> dict[str, _n
     return norm_stats
 
 
+def load_checkpoint_norm_stats(
+    checkpoint_dir: epath.Path | str,
+    asset_id: str,
+) -> dict[str, _normalize.NormStats] | None:
+    """Load checkpoint norm stats from OpenPI assets layout, with raw asset layout fallback."""
+
+    checkpoint_dir = epath.Path(checkpoint_dir)
+    candidates = (checkpoint_dir / "assets", checkpoint_dir)
+    errors: list[FileNotFoundError] = []
+    for assets_dir in candidates:
+        try:
+            return load_norm_stats(assets_dir, asset_id)
+        except FileNotFoundError as exc:
+            errors.append(exc)
+            logging.info(f"Norm stats not found in {assets_dir / asset_id}, trying next checkpoint layout.")
+
+    tried = ", ".join(str(assets_dir / asset_id) for assets_dir in candidates)
+    raise FileNotFoundError(f"Norm stats for asset_id={asset_id!r} not found. Tried: {tried}") from errors[-1]
+
+
 class Callback(Protocol):
     def __call__(self, directory: epath.Path) -> None: ...
 

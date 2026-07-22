@@ -61,12 +61,12 @@ def create_trained_policy(
         # that the policy is using the same normalization stats as the original training process.
         if data_config.asset_id is None:
             raise ValueError("Asset id is required to load norm stats.")
-        norm_stats = _checkpoints.load_norm_stats(checkpoint_dir / "assets", data_config.asset_id)
+        norm_stats = _checkpoints.load_checkpoint_norm_stats(checkpoint_dir, data_config.asset_id)
 
     # Determine the device to use for PyTorch models
     if is_pytorch and pytorch_device is None:
         try:
-            import torch
+            import torch  # noqa: PLC0415
 
             pytorch_device = "cuda" if torch.cuda.is_available() else "cpu"
         except ImportError:

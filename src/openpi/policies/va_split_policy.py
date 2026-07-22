@@ -135,7 +135,7 @@ def create_trained_va_split_policy(
     if norm_stats is None:
         if data_config.asset_id is None:
             raise ValueError("Asset id is required to load norm stats.")
-        norm_stats = _checkpoints.load_norm_stats(pathlib.Path(checkpoint_dir) / "assets", data_config.asset_id)
+        norm_stats = _checkpoints.load_checkpoint_norm_stats(pathlib.Path(checkpoint_dir), data_config.asset_id)
 
     runtime = ProcessVASplitRuntime(
         model_factory=functools.partial(_load_pytorch_model, train_config, weight_path),

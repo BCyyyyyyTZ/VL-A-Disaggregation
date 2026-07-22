@@ -2,6 +2,7 @@ import dataclasses
 import enum
 import logging
 import socket
+from typing import Any
 
 import tyro
 
@@ -57,6 +58,7 @@ class Args:
     va_split_max_ae_batch_size: int = 8
     ae_sm_percent: int = 20
     vlm_sm_percent: int = 0
+    pytorch_device: str | None = None
 
     # Specifies how to load the policy. If not provided, the default policy for the environment will be used.
     policy: Checkpoint | Default = dataclasses.field(default_factory=Default)
@@ -102,8 +104,14 @@ def _create_checkpoint_policy(args: Args, checkpoint: Checkpoint) -> _policy.Bas
             max_ae_batch_size=args.va_split_max_ae_batch_size,
             ae_sm_percent=args.ae_sm_percent,
             vlm_sm_percent=args.vlm_sm_percent,
+            pytorch_device=args.pytorch_device,
         )
-    return _policy_config.create_trained_policy(train_config, checkpoint.dir, default_prompt=args.default_prompt)
+    return _policy_config.create_trained_policy(
+        train_config,
+        checkpoint.dir,
+        default_prompt=args.default_prompt,
+        pytorch_device=args.pytorch_device,
+    )
 
 
 def create_policy(args: Args) -> _policy.BasePolicy:
@@ -123,6 +131,7 @@ def create_policy(args: Args) -> _policy.BasePolicy:
 def main(args: Args) -> None:
     policy = create_policy(args)
     policy_metadata = policy.metadata
+    policy_to_close = policy
 
     # Record the policy's behavior.
     if args.record:
@@ -138,7 +147,20 @@ def main(args: Args) -> None:
         port=args.port,
         metadata=policy_metadata,
     )
-    server.serve_forever()
+    try:
+        server.serve_forever()
+    finally:
+        _close_policy(policy_to_close)
+
+
+def _close_policy(policy: Any) -> None:
+    shutdown = getattr(policy, "shutdown", None)
+    if callable(shutdown):
+        shutdown()
+        return
+    close = getattr(policy, "close", None)
+    if callable(close):
+        close()
 
 
 if __name__ == "__main__":
