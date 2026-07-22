@@ -76,7 +76,7 @@ class SimpleQueue:
         self.items.append(item)
 
 
-def _ready(request_id: str) -> PrefixReady:
+def _ready(request_id: str, *, num_steps: int = 1) -> PrefixReady:
     return PrefixReady(
         request_id=request_id,
         feature=PrefixFeature(
@@ -84,8 +84,9 @@ def _ready(request_id: str) -> PrefixReady:
             prefix_pad_masks=torch.ones(1, 3, dtype=torch.bool),
             state=torch.zeros(1, 2),
         ),
-        num_steps=1,
+        num_steps=num_steps,
         sample_kwargs={"noise": torch.zeros(1, 2, 1)},
+        timing={"vlm_prefix_forward_ms": 1.5},
     )
 
 
@@ -121,6 +122,10 @@ def test_ae_worker_batches_two_ready_requests_for_one_denoise_step():
     assert [release.request_id for release in releases] == ["req-1", "req-2"]
     for result in results:
         torch.testing.assert_close(result.actions, -torch.ones(1, 2, 1))
+        assert result.timing is not None
+        assert result.timing["vlm_prefix_forward_ms"] == 1.5
+        assert result.timing["ae_step_ms"] >= 0.0
+        assert result.timing["ae_effective_batch"] == 2.0
     assert worker.active == {}
 
 
@@ -134,6 +139,20 @@ def test_ae_worker_batches_huggingface_dynamic_cache_by_batch_dimension():
 
     assert [result.request_id for result in results] == ["req-1", "req-2"]
     assert [release.request_id for release in releases] == ["req-1", "req-2"]
+
+
+def test_ae_worker_does_not_batch_requests_with_different_num_steps():
+    model = FakeAEModel()
+    worker = AEWorker(model=model, device="cpu", max_batch_size=2)
+    worker.add_prefix(_ready("req-1", num_steps=1))
+    worker.add_prefix(_ready("req-2", num_steps=2))
+
+    results, releases = worker.step_once()
+
+    assert model.batch_sizes == [1]
+    assert [result.request_id for result in results] == ["req-1"]
+    assert [release.request_id for release in releases] == ["req-1"]
+    assert list(worker.active) == ["req-2"]
 
 
 def test_ae_process_releases_feature_when_add_prefix_fails():

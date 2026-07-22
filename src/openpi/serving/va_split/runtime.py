@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+import contextlib
 import os
 import threading
 import time
@@ -111,6 +112,7 @@ class ProcessVASplitRuntime:
         self._pending_results: dict[str, ActionResult] = {}
         self._pending_errors: dict[str | None, WorkerError] = {}
         self._shutdown_seen = False
+        self._closed = False
         self._condition = threading.Condition()
 
         ctx = torch.multiprocessing.get_context(start_method)
@@ -142,6 +144,8 @@ class ProcessVASplitRuntime:
         self._result_thread.start()
 
     def infer(self, observation: dict, sample_kwargs: dict) -> ActionResult:
+        if self._closed:
+            raise RuntimeError("VA split runtime is shut down")
         request_id = str(uuid.uuid4())
         self._request_queue.put(
             RequestEnvelope(
@@ -188,11 +192,16 @@ class ProcessVASplitRuntime:
                 return
 
     def shutdown(self) -> None:
-        self._request_queue.put(Shutdown())
+        if self._closed:
+            return
+        self._closed = True
+        with contextlib.suppress(Exception):
+            self._request_queue.put(Shutdown())
         for process in (self._vlm_process, self._ae_process):
             process.join(timeout=5)
             if process.is_alive():
                 process.terminate()
+        self._result_thread.join(timeout=5)
 
     def reset(self) -> None:
         pass

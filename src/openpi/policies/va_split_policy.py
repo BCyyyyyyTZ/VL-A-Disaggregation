@@ -88,6 +88,13 @@ class VASplitPolicy(_policy.BasePolicy):
         if hasattr(self._runtime, "reset"):
             self._runtime.reset()
 
+    def shutdown(self) -> None:
+        if hasattr(self._runtime, "shutdown"):
+            self._runtime.shutdown()
+
+    def close(self) -> None:
+        self.shutdown()
+
 
 def _load_pytorch_model(train_config: _config.TrainConfig, weight_path: str):
     model = train_config.model.load_pytorch(train_config, weight_path)

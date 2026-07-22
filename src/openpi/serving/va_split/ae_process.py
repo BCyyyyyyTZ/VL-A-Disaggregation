@@ -11,6 +11,7 @@ from transformers.cache_utils import DynamicCache
 
 from openpi.models_pytorch.pi0_split_types import DenoiseState
 from openpi.models_pytorch.pi0_split_types import PrefixFeature
+from openpi.serving.va_split.timing import synchronize_cuda_if_needed
 from openpi.serving.va_split.types import ActionResult
 from openpi.serving.va_split.types import PrefixReady
 from openpi.serving.va_split.types import ReleaseFeature
@@ -27,6 +28,9 @@ class AERequestState:
     num_steps: int
     dt: torch.Tensor
     started_ns: int
+    timing: dict[str, float]
+    ae_step_ms: list[float]
+    ae_batch_sizes: list[int]
 
 
 def _cat_tree(values: list[Any]) -> Any:
@@ -88,16 +92,25 @@ class AEWorker:
             num_steps=ready.num_steps,
             dt=denoise_state.dt,
             started_ns=time.monotonic_ns(),
+            timing=dict(ready.timing or {}),
+            ae_step_ms=[],
+            ae_batch_sizes=[],
         )
 
     def select_ready_lanes(self) -> list[AERequestState]:
-        return sorted(self.active.values(), key=lambda req: (req.step_idx, req.started_ns))[: self._max_batch_size]
+        ordered = sorted(self.active.values(), key=lambda req: (req.step_idx, req.started_ns))
+        if not ordered:
+            return []
+        first_num_steps = ordered[0].num_steps
+        return [request for request in ordered if request.num_steps == first_num_steps][: self._max_batch_size]
 
     def step_once(self) -> tuple[list[ActionResult], list[ReleaseFeature]]:
         batch = self.select_ready_lanes()
         if not batch:
             return [], []
 
+        synchronize_cuda_if_needed(self._device)
+        step_start_ns = time.monotonic_ns()
         prefix_batch = _batch_prefix_features([request.feature for request in batch])
         x_t = torch.cat([request.x_t for request in batch], dim=0)
         step_idx = torch.tensor([request.step_idx for request in batch], device=self._device, dtype=torch.int32)
@@ -110,8 +123,20 @@ class AEWorker:
         for row, request in enumerate(batch):
             request.x_t = request.x_t + request.dt * v_t[row : row + 1]
             request.step_idx += 1
+        synchronize_cuda_if_needed(self._device)
+        step_ms = (time.monotonic_ns() - step_start_ns) / 1_000_000
+
+        for request in batch:
+            request.ae_step_ms.append(step_ms)
+            request.ae_batch_sizes.append(len(batch))
             if request.step_idx == request.num_steps:
-                results.append(ActionResult(request_id=request.request_id, actions=request.x_t))
+                results.append(
+                    ActionResult(
+                        request_id=request.request_id,
+                        actions=request.x_t,
+                        timing=_finish_timing(request),
+                    )
+                )
                 releases.append(ReleaseFeature(request_id=request.request_id, slot_id=-1))
                 del self.active[request.request_id]
         return results, releases
@@ -188,3 +213,13 @@ class AEProcess:
             self._result_queue.put(WorkerError(request_id=request_id, error=error, traceback=traceback_text))
             self._release_queue.put(ReleaseFeature(request_id=request_id, slot_id=-1))
             del self.worker.active[request_id]
+
+
+def _finish_timing(request: AERequestState) -> dict[str, float]:
+    timing = dict(request.timing)
+    if request.ae_step_ms:
+        timing["ae_step_ms"] = sum(request.ae_step_ms) / len(request.ae_step_ms)
+        timing["ae_step_total_ms"] = sum(request.ae_step_ms)
+    if request.ae_batch_sizes:
+        timing["ae_effective_batch"] = sum(request.ae_batch_sizes) / len(request.ae_batch_sizes)
+    return timing

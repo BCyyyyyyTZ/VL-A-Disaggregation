@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import queue
+import time
 import traceback
 from typing import Any
 
@@ -8,6 +9,7 @@ import torch
 
 from openpi.models import model as _model
 from openpi.models_pytorch.pi0_split_types import PrefixFeature
+from openpi.serving.va_split.timing import synchronize_cuda_if_needed
 from openpi.serving.va_split.types import PrefixReady
 from openpi.serving.va_split.types import ReleaseFeature
 from openpi.serving.va_split.types import RequestEnvelope
@@ -24,8 +26,12 @@ class VLMWorker:
         self.live_features: dict[str, PrefixFeature] = {}
 
     def handle_request(self, request: RequestEnvelope) -> PrefixReady:
+        synchronize_cuda_if_needed(self._device)
+        start_ns = time.monotonic_ns()
         observation = _model.Observation.from_dict(_move_tensors_to_device(dict(request.observation), self._device))
         feature = self._model.build_prefix_feature(self._device, observation)
+        synchronize_cuda_if_needed(self._device)
+        elapsed_ms = (time.monotonic_ns() - start_ns) / 1_000_000
         self.live_features[request.request_id] = feature
         sample_kwargs = dict(request.sample_kwargs)
         num_steps = int(sample_kwargs.get("num_steps", 10))
@@ -34,6 +40,7 @@ class VLMWorker:
             feature=feature,
             num_steps=num_steps,
             sample_kwargs=sample_kwargs,
+            timing={"vlm_prefix_forward_ms": elapsed_ms},
         )
 
     def release(self, release: ReleaseFeature) -> None:

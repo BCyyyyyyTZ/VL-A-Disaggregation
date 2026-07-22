@@ -10,6 +10,7 @@ from openpi.serving.va_split.types import ActionResult
 class FakeRuntime:
     def __init__(self):
         self.sample_kwargs = None
+        self.shutdown_called = False
 
     def infer(self, observation: dict, sample_kwargs: dict) -> ActionResult:
         self.sample_kwargs = sample_kwargs
@@ -20,6 +21,9 @@ class FakeRuntime:
             actions=torch.ones(1, 2, 3),
             timing={"runtime_ms": 2.0},
         )
+
+    def shutdown(self) -> None:
+        self.shutdown_called = True
 
 
 def test_va_split_policy_preserves_infer_output_contract():
@@ -42,3 +46,12 @@ def test_va_split_policy_preserves_infer_output_contract():
     assert result["policy_timing"]["infer_ms"] >= 0.0
     assert runtime.sample_kwargs == {"num_steps": 4}
     assert policy.metadata == {"model": "fake"}
+
+
+def test_va_split_policy_shutdown_delegates_to_runtime():
+    runtime = FakeRuntime()
+    policy = VASplitPolicy(runtime=runtime)
+
+    policy.shutdown()
+
+    assert runtime.shutdown_called is True

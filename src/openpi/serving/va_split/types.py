@@ -20,6 +20,7 @@ class PrefixReady:
     feature: PrefixFeature
     num_steps: int
     sample_kwargs: dict[str, Any]
+    timing: dict[str, float] | None = None
     slot_id: int = -1
 
 
