@@ -84,6 +84,13 @@ def test_make_synthetic_libero_requests_can_omit_noise():
     assert requests[0].noise is None
 
 
+def test_args_defaults_to_profile_checkpoint():
+    args = profile_va_split.Args()
+
+    assert args.policy.config == "pi05_libero"
+    assert args.policy.dir == "/data2/tianze/checkpoints/RLinf-Pi05-LIBERO-SFT"
+
+
 class _ConcurrentFakePolicy:
     supports_concurrent_infer = True
 

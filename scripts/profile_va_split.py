@@ -17,6 +17,8 @@ import tyro
 
 Mode = Literal["monolithic", "split-no-mps", "split-mps"]
 TraceStatus = Literal["ok", "error", "timeout"]
+DEFAULT_PROFILE_CHECKPOINT_CONFIG = "pi05_libero"
+DEFAULT_PROFILE_CHECKPOINT_DIR = "/data2/tianze/checkpoints/RLinf-Pi05-LIBERO-SFT"
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -52,9 +54,13 @@ class Checkpoint:
     dir: str
 
 
+def _default_profile_checkpoint() -> Checkpoint:
+    return Checkpoint(config=DEFAULT_PROFILE_CHECKPOINT_CONFIG, dir=DEFAULT_PROFILE_CHECKPOINT_DIR)
+
+
 @dataclasses.dataclass
 class Args:
-    policy: Checkpoint
+    policy: Checkpoint = dataclasses.field(default_factory=_default_profile_checkpoint)
     mode: Mode = "split-mps"
     num_requests: int = 128
     request_rate_hz: float = 16.0
