@@ -7,6 +7,7 @@ import tyro
 
 from openpi.policies import policy as _policy
 from openpi.policies import policy_config as _policy_config
+from openpi.policies import va_split_policy as _va_split_policy
 from openpi.serving import websocket_policy_server
 from openpi.training import config as _config
 
@@ -51,6 +52,12 @@ class Args:
     # Record the policy's behavior for debugging.
     record: bool = False
 
+    # Use the OpenPI-only PyTorch VLM/AE split runtime.
+    va_split: bool = False
+    va_split_max_ae_batch_size: int = 8
+    ae_sm_percent: int = 20
+    vlm_sm_percent: int = 0
+
     # Specifies how to load the policy. If not provided, the default policy for the environment will be used.
     policy: Checkpoint | Default = dataclasses.field(default_factory=Default)
 
@@ -85,14 +92,31 @@ def create_default_policy(env: EnvMode, *, default_prompt: str | None = None) ->
     raise ValueError(f"Unsupported environment mode: {env}")
 
 
-def create_policy(args: Args) -> _policy.Policy:
+def _create_checkpoint_policy(args: Args, checkpoint: Checkpoint) -> _policy.BasePolicy:
+    train_config = _config.get_config(checkpoint.config)
+    if args.va_split:
+        return _va_split_policy.create_trained_va_split_policy(
+            train_config,
+            checkpoint.dir,
+            default_prompt=args.default_prompt,
+            max_ae_batch_size=args.va_split_max_ae_batch_size,
+            ae_sm_percent=args.ae_sm_percent,
+            vlm_sm_percent=args.vlm_sm_percent,
+        )
+    return _policy_config.create_trained_policy(train_config, checkpoint.dir, default_prompt=args.default_prompt)
+
+
+def create_policy(args: Args) -> _policy.BasePolicy:
     """Create a policy from the given arguments."""
     match args.policy:
         case Checkpoint():
-            return _policy_config.create_trained_policy(
-                _config.get_config(args.policy.config), args.policy.dir, default_prompt=args.default_prompt
-            )
+            return _create_checkpoint_policy(args, args.policy)
         case Default():
+            if args.va_split:
+                checkpoint = DEFAULT_CHECKPOINT.get(args.env)
+                if checkpoint is None:
+                    raise ValueError(f"Unsupported environment mode: {args.env}")
+                return _create_checkpoint_policy(args, checkpoint)
             return create_default_policy(args.env, default_prompt=args.default_prompt)
 
 

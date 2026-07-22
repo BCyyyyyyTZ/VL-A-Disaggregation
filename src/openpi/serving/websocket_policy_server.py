@@ -58,7 +58,7 @@ class WebsocketPolicyServer:
                 obs = msgpack_numpy.unpackb(await websocket.recv())
 
                 infer_time = time.monotonic()
-                action = self._policy.infer(obs)
+                action = await infer_policy_async(self._policy, obs)
                 infer_time = time.monotonic() - infer_time
 
                 action["server_timing"] = {
@@ -88,3 +88,9 @@ def _health_check(connection: _server.ServerConnection, request: _server.Request
         return connection.respond(http.HTTPStatus.OK, "OK\n")
     # Continue with the normal request handling.
     return None
+
+
+async def infer_policy_async(policy: _base_policy.BasePolicy, obs: dict) -> dict:
+    if getattr(policy, "supports_concurrent_infer", False):
+        return await asyncio.to_thread(policy.infer, obs)
+    return policy.infer(obs)

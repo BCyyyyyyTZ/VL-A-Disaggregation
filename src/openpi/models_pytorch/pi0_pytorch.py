@@ -8,6 +8,8 @@ import torch.nn.functional as F  # noqa: N812
 
 import openpi.models.gemma as _gemma
 from openpi.models_pytorch.gemma_pytorch import PaliGemmaWithExpertModel
+from openpi.models_pytorch.pi0_split_types import DenoiseState
+from openpi.models_pytorch.pi0_split_types import PrefixFeature
 import openpi.models_pytorch.preprocessing_pytorch as _preprocessing
 
 
@@ -117,7 +119,7 @@ class PI0Pytorch(nn.Module):
 
         msg = "transformers_replace is not installed correctly. Please install it with `uv pip install transformers==4.53.2` and `cp -r ./src/openpi/models_pytorch/transformers_replace/* .venv/lib/python3.11/site-packages/transformers/`."
         try:
-            from transformers.models.siglip import check
+            from transformers.models.siglip import check  # noqa: PLC0415
 
             if not check.check_whether_transformers_replace_is_installed_correctly():
                 raise ValueError(msg)
@@ -183,6 +185,56 @@ class PI0Pytorch(nn.Module):
         time_beta = sample_beta(1.5, 1.0, bsize, device)
         time = time_beta * 0.999 + 0.001
         return time.to(dtype=torch.float32, device=device)
+
+    @torch.no_grad()
+    def build_prefix_feature(self, device, observation) -> PrefixFeature:
+        """Build reusable prefix KV cache for split VLM/AE inference."""
+        del device
+        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=False)
+
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
+        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+        prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
+        self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
+
+        _, past_key_values = self.paligemma_with_expert.forward(
+            attention_mask=prefix_att_2d_masks_4d,
+            position_ids=prefix_position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, None],
+            use_cache=True,
+        )
+        return PrefixFeature(
+            past_key_values=past_key_values,
+            prefix_pad_masks=prefix_pad_masks,
+            state=state,
+        )
+
+    @torch.no_grad()
+    def init_denoise_state(self, device, batch_size: int, noise: torch.Tensor | None, num_steps: int) -> DenoiseState:
+        """Initialize denoise loop state for split AE inference."""
+        if noise is None:
+            noise = self.sample_noise((batch_size, self.config.action_horizon, self.config.action_dim), device)
+        dt = torch.tensor(-1.0 / num_steps, dtype=torch.float32, device=device)
+        step_idx = torch.tensor(0, dtype=torch.int32, device=device)
+        return DenoiseState(x_t=noise, step_idx=step_idx, num_steps=num_steps, dt=dt)
+
+    @torch.no_grad()
+    def denoise_one_batch(self, prefix_batch: PrefixFeature, denoise_batch: DenoiseState) -> torch.Tensor:
+        """Run one split AE denoise step for a batch."""
+        timestep = (
+            1.0 + denoise_batch.step_idx.to(dtype=torch.float32, device=denoise_batch.x_t.device) * denoise_batch.dt
+        )
+        if timestep.ndim == 0:
+            timestep = timestep.expand(denoise_batch.x_t.shape[0])
+        return self.denoise_step(
+            prefix_batch.state,
+            prefix_batch.prefix_pad_masks,
+            prefix_batch.past_key_values,
+            denoise_batch.x_t,
+            timestep,
+        )
 
     def embed_prefix(
         self, images, img_masks, lang_tokens, lang_masks
@@ -381,35 +433,18 @@ class PI0Pytorch(nn.Module):
             actions_shape = (bsize, self.config.action_horizon, self.config.action_dim)
             noise = self.sample_noise(actions_shape, device)
 
-        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=False)
-
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
-        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
-        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
-
-        # Compute image and language key value cache
-        prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
-        self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
-
-        _, past_key_values = self.paligemma_with_expert.forward(
-            attention_mask=prefix_att_2d_masks_4d,
-            position_ids=prefix_position_ids,
-            past_key_values=None,
-            inputs_embeds=[prefix_embs, None],
-            use_cache=True,
-        )
-
         dt = -1.0 / num_steps
         dt = torch.tensor(dt, dtype=torch.float32, device=device)
+        prefix_feature = self.build_prefix_feature(device, observation)
 
         x_t = noise
         time = torch.tensor(1.0, dtype=torch.float32, device=device)
         while time >= -dt / 2:
             expanded_time = time.expand(bsize)
             v_t = self.denoise_step(
-                state,
-                prefix_pad_masks,
-                past_key_values,
+                prefix_feature.state,
+                prefix_feature.prefix_pad_masks,
+                prefix_feature.past_key_values,
                 x_t,
                 expanded_time,
             )
