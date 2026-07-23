@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 import contextlib
+from dataclasses import replace
 import os
 import threading
 import time
@@ -250,7 +251,7 @@ class ProcessVASplitRuntime:
                 return
             with self._condition:
                 if isinstance(message, ActionResult):
-                    self._pending_results[message.request_id] = message
+                    self._pending_results[message.request_id] = _mark_collected_result(message)
                 elif isinstance(message, WorkerError):
                     self._pending_errors[message.request_id] = message
                 elif isinstance(message, Shutdown):
@@ -300,8 +301,24 @@ def _aggregate_batch_timing(row_timings: list[dict[str, float]], *, batch_size: 
         values = [float(row[key]) for row in row_timings if key in row]
         if values:
             timing[key] = sum(values) / len(values)
+    for key in ("vlm_request_transfer_ms", "prefix_transfer_ms", "ae_result_transfer_ms", "va_split_transfer_ms"):
+        values = [float(row[key]) for row in row_timings if key in row]
+        if values:
+            timing[key] = sum(values) / len(values)
     ae_batch_values = [float(row["ae_effective_batch"]) for row in row_timings if "ae_effective_batch" in row]
     if ae_batch_values:
         timing["ae_effective_batch"] = sum(ae_batch_values) / len(ae_batch_values)
         timing["ae_effective_batch_mean"] = timing["ae_effective_batch"]
     return timing
+
+
+def _mark_collected_result(result: ActionResult) -> ActionResult:
+    timing = dict(result.timing or {})
+    result_enqueue_ns = timing.pop("_ae_result_enqueue_ns", None)
+    if result_enqueue_ns is not None:
+        timing["ae_result_transfer_ms"] = max(0.0, (time.monotonic_ns() - float(result_enqueue_ns)) / 1_000_000)
+    transfer_keys = ("vlm_request_transfer_ms", "prefix_transfer_ms", "ae_result_transfer_ms")
+    transfer_values = [float(timing[key]) for key in transfer_keys if key in timing]
+    if transfer_values:
+        timing["va_split_transfer_ms"] = sum(transfer_values)
+    return replace(result, timing=timing)

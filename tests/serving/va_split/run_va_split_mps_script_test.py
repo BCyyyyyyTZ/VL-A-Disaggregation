@@ -16,7 +16,7 @@ def test_run_va_split_mps_defaults_to_libero_env_python():
 
     assert 'PYTHON_BIN="${PYTHON_BIN:-/data1/tianze/RLinf-tianze/openpi05_libero_env/bin/python}"' in script
     assert 'WARMUP_REQUESTS="${WARMUP_REQUESTS:-2}"' in script
-    assert 'BATCH_SIZE="${BATCH_SIZE:-1}"' in script
+    assert 'BATCH_SIZE="${BATCH_SIZE:-${MAX_VLM_BATCH_SIZE}}"' in script
     assert 'ENABLE_POLICY_BATCH="${ENABLE_POLICY_BATCH:-true}"' in script
     assert 'VA_SPLIT_MAX_VLM_BATCH_SIZE="${VA_SPLIT_MAX_VLM_BATCH_SIZE:-8}"' in script
     assert 'VA_SPLIT_MAX_VLM_WAIT_MS="${VA_SPLIT_MAX_VLM_WAIT_MS:-2.0}"' in script
@@ -138,6 +138,7 @@ def test_run_va_split_mps_profile_can_run_monolithic_baseline_without_mps(tmp_pa
     assert result.returncode == 0, result.stderr
     args = python_arg_log.read_text(encoding="utf-8").splitlines()
     assert _flag_value(args, "--mode") == "monolithic"
+    assert _flag_value(args, "--batch-size") == "8"
     assert "--pytorch-compile-mode" not in args
     assert "--no-require-mps-env" in args
     assert not mps_arg_log.exists()

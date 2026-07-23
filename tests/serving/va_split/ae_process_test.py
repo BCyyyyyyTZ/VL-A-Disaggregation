@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import dataclasses
 import queue
+import time
 from types import SimpleNamespace
 
 import torch
@@ -127,6 +129,28 @@ def test_ae_worker_batches_two_ready_requests_for_one_denoise_step():
         assert result.timing["ae_step_ms"] >= 0.0
         assert result.timing["ae_effective_batch"] == 2.0
     assert worker.active == {}
+
+
+def test_ae_process_records_prefix_transfer_latency():
+    prefix_ready = _ready("req-1")
+    prefix_ready = dataclasses.replace(
+        prefix_ready,
+        timing={**(prefix_ready.timing or {}), "_prefix_enqueue_ns": time.monotonic_ns() - 1_000_000},
+    )
+    process = AEProcess(
+        model=FakeAEModel(),
+        device="cpu",
+        prefix_queue=SimpleQueue([prefix_ready]),
+        result_queue=SimpleQueue(),
+        release_queue=SimpleQueue(),
+        max_batch_size=1,
+    )
+
+    process.drain_prefix_ready(block=True)
+
+    request_state = process.worker.active["req-1"]
+    assert request_state.timing["prefix_transfer_ms"] >= 0.0
+    assert "_prefix_enqueue_ns" not in request_state.timing
 
 
 def test_ae_worker_batches_huggingface_dynamic_cache_by_batch_dimension():

@@ -76,7 +76,7 @@ class Args:
     num_requests: int = 128
     request_rate_hz: float = 16.0
     max_inflight: int = 64
-    batch_size: int = 1
+    batch_size: int = 8
     seed: int = 0
     num_steps: int = 10
     action_horizon: int = 10
@@ -163,29 +163,50 @@ def make_synthetic_libero_requests(
     return requests
 
 
-def make_batched_synthetic_requests(
+def make_fcfs_batched_synthetic_requests(
     requests: Sequence[SyntheticRequest],
     *,
-    batch_size: int,
+    max_batch_size: int,
+    max_wait_ms: float,
 ) -> list[SyntheticBatchRequest]:
-    if batch_size <= 0:
-        raise ValueError("batch_size must be positive")
+    if max_batch_size <= 0:
+        raise ValueError("max_batch_size must be positive")
+    if max_wait_ms < 0:
+        raise ValueError("max_wait_ms must be non-negative")
 
     batches = []
-    for start in range(0, len(requests), batch_size):
-        group = tuple(requests[start : start + batch_size])
-        if not group:
-            continue
+    max_wait_s = max_wait_ms / 1000.0
+    start = 0
+    while start < len(requests):
+        group = [requests[start]]
+        deadline_s = requests[start].scheduled_at_s + max_wait_s
+        next_index = start + 1
+        while next_index < len(requests) and len(group) < max_batch_size:
+            candidate = requests[next_index]
+            if candidate.scheduled_at_s > deadline_s:
+                break
+            group.append(candidate)
+            next_index += 1
+        dispatch_at_s = group[-1].scheduled_at_s if len(group) >= max_batch_size else deadline_s
         batches.append(
             SyntheticBatchRequest(
                 request_ids=tuple(request.request_id for request in group),
-                scheduled_at_s=max(request.scheduled_at_s for request in group),
+                scheduled_at_s=float(dispatch_at_s),
                 original_scheduled_at_s=tuple(request.scheduled_at_s for request in group),
                 observation=_stack_observation_batch([request.observation for request in group]),
                 noise=_stack_noise_batch([request.noise for request in group]),
             )
         )
+        start = next_index
     return batches
+
+
+def make_batched_synthetic_requests(
+    requests: Sequence[SyntheticRequest],
+    *,
+    batch_size: int,
+) -> list[SyntheticBatchRequest]:
+    return make_fcfs_batched_synthetic_requests(requests, max_batch_size=batch_size, max_wait_ms=0.0)
 
 
 async def run_benchmark_requests(
@@ -333,6 +354,29 @@ def summarize_traces(
         "end_to_end_latency_p95_ms": _percentile(end_to_end_latency_ms, 95),
         "vlm_prefix_forward_mean_ms": _timing_mean(completed, "vlm_prefix_forward_ms"),
         "vlm_prefix_forward_p50_ms": _timing_percentile(completed, "vlm_prefix_forward_ms", 50),
+        "baseline_vlm_latency_mean_ms": _timing_mean(completed, "baseline_vlm_ms"),
+        "baseline_vlm_latency_p50_ms": _timing_percentile(completed, "baseline_vlm_ms", 50),
+        "baseline_vlm_latency_p95_ms": _timing_percentile(completed, "baseline_vlm_ms", 95),
+        "baseline_ae_latency_mean_ms": _timing_mean(completed, "baseline_ae_ms"),
+        "baseline_ae_latency_p50_ms": _timing_percentile(completed, "baseline_ae_ms", 50),
+        "baseline_ae_latency_p95_ms": _timing_percentile(completed, "baseline_ae_ms", 95),
+        "baseline_ae_step_latency_mean_ms": _timing_mean(completed, "baseline_ae_step_ms"),
+        "baseline_ae_step_latency_p50_ms": _timing_percentile(completed, "baseline_ae_step_ms", 50),
+        "baseline_ae_step_latency_p95_ms": _timing_percentile(completed, "baseline_ae_step_ms", 95),
+        "baseline_ae_steps_mean": _timing_mean(completed, "baseline_ae_steps"),
+        "baseline_effective_batch_mean": _timing_mean(completed, "baseline_effective_batch"),
+        "vlm_request_transfer_mean_ms": _timing_mean(completed, "vlm_request_transfer_ms"),
+        "vlm_request_transfer_p50_ms": _timing_percentile(completed, "vlm_request_transfer_ms", 50),
+        "vlm_request_transfer_p95_ms": _timing_percentile(completed, "vlm_request_transfer_ms", 95),
+        "prefix_transfer_mean_ms": _timing_mean(completed, "prefix_transfer_ms"),
+        "prefix_transfer_p50_ms": _timing_percentile(completed, "prefix_transfer_ms", 50),
+        "prefix_transfer_p95_ms": _timing_percentile(completed, "prefix_transfer_ms", 95),
+        "ae_result_transfer_mean_ms": _timing_mean(completed, "ae_result_transfer_ms"),
+        "ae_result_transfer_p50_ms": _timing_percentile(completed, "ae_result_transfer_ms", 50),
+        "ae_result_transfer_p95_ms": _timing_percentile(completed, "ae_result_transfer_ms", 95),
+        "va_split_transfer_mean_ms": _timing_mean(completed, "va_split_transfer_ms"),
+        "va_split_transfer_p50_ms": _timing_percentile(completed, "va_split_transfer_ms", 50),
+        "va_split_transfer_p95_ms": _timing_percentile(completed, "va_split_transfer_ms", 95),
         "ae_step_mean_ms": _timing_mean(completed, "ae_step_ms"),
         "ae_step_p50_ms": _timing_percentile(completed, "ae_step_ms", 50),
         "ae_effective_batch_mean": _timing_mean(completed, "ae_effective_batch"),
@@ -428,11 +472,13 @@ def run_profile(args: Args) -> BenchmarkResult:
     policy_device = getattr(policy, "_pytorch_device", args.pytorch_device)
     sampler = GpuUtilizationSampler(device_index=resolve_gpu_device_index(policy_device, args.gpu_device_index))
     try:
-        supports_concurrent_infer = bool(getattr(policy, "supports_concurrent_infer", False))
-        max_workers = args.max_inflight if supports_concurrent_infer else 1
-        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="va-profile") as executor:
-            if args.batch_size > 1:
-                batch_requests = make_batched_synthetic_requests(requests, batch_size=args.batch_size)
+        if args.mode == "monolithic" and args.batch_size > 1:
+            batch_requests = make_fcfs_batched_synthetic_requests(
+                requests,
+                max_batch_size=args.batch_size,
+                max_wait_ms=args.max_vlm_wait_ms,
+            )
+            with ThreadPoolExecutor(max_workers=1, thread_name_prefix="va-profile-baseline-model") as executor:
                 warmup_policy_batch(
                     policy,
                     batch_requests[0],
@@ -449,7 +495,10 @@ def run_profile(args: Args) -> BenchmarkResult:
                         executor=executor,
                     )
                 )
-            else:
+        else:
+            supports_concurrent_infer = bool(getattr(policy, "supports_concurrent_infer", False))
+            max_workers = args.max_inflight if supports_concurrent_infer else 1
+            with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="va-profile") as executor:
                 warmup_policy(
                     policy,
                     requests[0],
@@ -1021,13 +1070,20 @@ def main(args: Args) -> None:
     if args.json_output is not None:
         payload = {
             "summary": result.summary,
-            "traces": [dataclasses.asdict(trace) for trace in result.traces],
+            "per_request_e2e_ms": per_request_e2e_ms(result.traces),
             "consistency": result.consistency,
         }
         args.json_output.write_text(
             json.dumps(payload, default=_json_default, indent=2, sort_keys=True),
             encoding="utf-8",
         )
+
+
+def per_request_e2e_ms(traces: list[RequestTrace]) -> dict[str, float]:
+    return {
+        trace.request_id: (trace.completed_at_s - trace.scheduled_at_s) * 1000.0
+        for trace in sorted(traces, key=lambda trace: trace.request_id)
+    }
 
 
 def _json_default(value: Any) -> Any:

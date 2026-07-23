@@ -80,7 +80,8 @@ def test_vlm_worker_publishes_prefix_and_releases_live_feature():
         request_id="req-1",
         observation=_request_observation(),
         sample_kwargs={"num_steps": 4},
-        enqueue_ns=123,
+        enqueue_ns=1_000_000,
+        dequeue_ns=3_000_000,
     )
 
     ready = worker.handle_request(request)
@@ -90,6 +91,7 @@ def test_vlm_worker_publishes_prefix_and_releases_live_feature():
     assert ready.sample_kwargs == {"num_steps": 4}
     assert ready.timing is not None
     assert ready.timing["vlm_prefix_forward_ms"] >= 0.0
+    assert ready.timing["vlm_request_transfer_ms"] == 2.0
     assert "req-1" in worker.live_features
     torch.testing.assert_close(ready.feature.prefix_pad_masks, torch.ones(1, 3, dtype=torch.bool))
 

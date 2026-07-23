@@ -12,6 +12,7 @@ class RequestEnvelope:
     observation: dict[str, Any]
     sample_kwargs: dict[str, Any]
     enqueue_ns: int
+    dequeue_ns: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -21,6 +22,7 @@ class BatchRequestEnvelope:
     observation: dict[str, Any]
     sample_kwargs: dict[str, Any]
     enqueue_ns: int
+    dequeue_ns: int | None = None
 
 
 @dataclass(frozen=True, slots=True)

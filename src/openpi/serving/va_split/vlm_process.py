@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import deque
 from collections.abc import Hashable
 from dataclasses import dataclass
+from dataclasses import replace
 import queue
 import time
 import traceback
@@ -47,13 +48,13 @@ class VLMWorker:
         request_ids = tuple(request.request_id for request in requests)
         sample_kwargs = _stack_request_sample_kwargs(requests)
         observation = _stack_request_observations([request.observation for request in requests])
-        enqueue_ns = min(request.enqueue_ns for request in requests)
         return self._handle_batched_observation(
             batch_id=f"batch-{request_ids[0]}",
             request_ids=request_ids,
             observation=observation,
             sample_kwargs=sample_kwargs,
-            enqueue_ns=enqueue_ns,
+            enqueue_ns_by_row=tuple(request.enqueue_ns for request in requests),
+            dequeue_ns_by_row=tuple(request.dequeue_ns for request in requests),
         )
 
     def handle_batch_request(self, request: BatchRequestEnvelope) -> list[PrefixReady]:
@@ -62,7 +63,8 @@ class VLMWorker:
             request_ids=request.request_ids,
             observation=request.observation,
             sample_kwargs=dict(request.sample_kwargs),
-            enqueue_ns=request.enqueue_ns,
+            enqueue_ns_by_row=tuple(request.enqueue_ns for _ in request.request_ids),
+            dequeue_ns_by_row=tuple(request.dequeue_ns for _ in request.request_ids),
         )
 
     def _handle_batched_observation(
@@ -72,8 +74,11 @@ class VLMWorker:
         request_ids: tuple[str, ...],
         observation: dict[str, Any],
         sample_kwargs: dict[str, Any],
-        enqueue_ns: int,
+        enqueue_ns_by_row: tuple[int, ...],
+        dequeue_ns_by_row: tuple[int | None, ...],
     ) -> list[PrefixReady]:
+        if len(enqueue_ns_by_row) != len(request_ids) or len(dequeue_ns_by_row) != len(request_ids):
+            raise ValueError("enqueue/dequeue timing must have one entry per request id")
         synchronize_cuda_if_needed(self._device)
         start_ns = time.monotonic_ns()
         observation = _model.Observation.from_dict(_move_tensors_to_device(dict(observation), self._device))
@@ -87,6 +92,8 @@ class VLMWorker:
         num_steps = int(sample_kwargs.get("num_steps", 10))
         ready = []
         for row, request_id in enumerate(request_ids):
+            enqueue_ns = enqueue_ns_by_row[row]
+            dequeue_ns = dequeue_ns_by_row[row] or enqueue_ns
             self.live_features[request_id] = feature
             self._request_to_batch[request_id] = batch_id
             row_kwargs = _sample_kwargs_for_row(sample_kwargs, row, batch_size)
@@ -99,7 +106,8 @@ class VLMWorker:
                     timing={
                         "vlm_prefix_forward_ms": elapsed_ms,
                         "vlm_effective_batch": float(batch_size),
-                        "vlm_queue_wait_ms": max(0.0, (start_ns - enqueue_ns) / 1_000_000),
+                        "vlm_request_transfer_ms": max(0.0, (dequeue_ns - enqueue_ns) / 1_000_000),
+                        "vlm_queue_wait_ms": max(0.0, (start_ns - dequeue_ns) / 1_000_000),
                     },
                 )
             )
@@ -162,7 +170,7 @@ class VLMProcess:
             if isinstance(message, BatchRequestEnvelope):
                 try:
                     for ready in self.worker.handle_batch_request(message):
-                        self._prefix_queue.put(ready)
+                        self._put_prefix_ready(ready)
                 except Exception as exc:  # pragma: no cover - exercised through integration/runtime failures.
                     for request_id in message.request_ids:
                         self._prefix_queue.put(
@@ -181,7 +189,7 @@ class VLMProcess:
             try:
                 requests, shutdown_after_batch = self._collect_fcfs_batch(message)
                 for ready in self.worker.handle_batch(requests):
-                    self._prefix_queue.put(ready)
+                    self._put_prefix_ready(ready)
             except Exception as exc:  # pragma: no cover - exercised through integration/runtime failures.
                 for request in requests if "requests" in locals() else [message]:
                     self._prefix_queue.put(
@@ -203,6 +211,11 @@ class VLMProcess:
                 return
             if isinstance(message, ReleaseFeature):
                 self.worker.release(message)
+
+    def _put_prefix_ready(self, ready: PrefixReady) -> None:
+        timing = dict(ready.timing or {})
+        timing["_prefix_enqueue_ns"] = float(time.monotonic_ns())
+        self._prefix_queue.put(replace(ready, timing=timing))
 
     def _collect_fcfs_batch(self, first_request: RequestEnvelope) -> tuple[list[RequestEnvelope], bool]:
         requests = [first_request]
@@ -239,12 +252,18 @@ class VLMProcess:
     def _next_request_message(self, *, timeout: float) -> Any:
         if self._backlog:
             return self._backlog.popleft()
-        return self._request_queue.get(timeout=timeout)
+        return _mark_dequeued_message(self._request_queue.get(timeout=timeout))
 
     def _next_request_message_nowait(self) -> Any:
         if self._backlog:
             return self._backlog.popleft()
-        return self._request_queue.get_nowait()
+        return _mark_dequeued_message(self._request_queue.get_nowait())
+
+
+def _mark_dequeued_message(message: Any) -> Any:
+    if isinstance(message, RequestEnvelope | BatchRequestEnvelope):
+        return replace(message, dequeue_ns=time.monotonic_ns())
+    return message
 
 
 def _move_tensors_to_device(value: Any, device: str) -> Any:

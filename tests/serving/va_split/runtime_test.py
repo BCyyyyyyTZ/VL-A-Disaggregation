@@ -1,5 +1,9 @@
+# ruff: noqa: SLF001
+
 from __future__ import annotations
 
+import threading
+import time
 from types import SimpleNamespace
 
 import torch
@@ -7,6 +11,9 @@ import torch
 from openpi.models_pytorch.pi0_split_types import DenoiseState
 from openpi.models_pytorch.pi0_split_types import PrefixFeature
 from openpi.serving.va_split.runtime import LocalVASplitRuntime
+from openpi.serving.va_split.runtime import ProcessVASplitRuntime
+from openpi.serving.va_split.types import ActionResult
+from openpi.serving.va_split.types import Shutdown
 
 
 class FakeSplitModel:
@@ -97,3 +104,36 @@ def test_local_va_split_runtime_infer_batch_builds_prefix_once_and_returns_row_o
     assert result.timing["vlm_effective_batch"] == 2.0
     assert result.timing["ae_effective_batch_mean"] == 2.0
     assert runtime.vlm_worker.live_features == {}
+
+
+class _ResultQueue:
+    def __init__(self, messages):
+        self._messages = list(messages)
+
+    def get(self):
+        return self._messages.pop(0)
+
+
+def test_process_runtime_collect_results_records_ae_result_transfer_latency():
+    runtime = object.__new__(ProcessVASplitRuntime)
+    runtime._result_queue = _ResultQueue(
+        [
+            ActionResult(
+                request_id="req-1",
+                actions=torch.zeros(1, 2, 1),
+                timing={"_ae_result_enqueue_ns": time.monotonic_ns() - 1_000_000},
+            ),
+            Shutdown(),
+        ]
+    )
+    runtime._condition = threading.Condition()
+    runtime._pending_results = {}
+    runtime._pending_errors = {}
+    runtime._shutdown_seen = False
+
+    runtime._collect_results()
+
+    timing = runtime._pending_results["req-1"].timing
+    assert timing is not None
+    assert timing["ae_result_transfer_ms"] >= 0.0
+    assert "_ae_result_enqueue_ns" not in timing

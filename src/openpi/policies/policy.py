@@ -1,4 +1,5 @@
 from collections.abc import Sequence
+import dataclasses
 import logging
 import pathlib
 import time
@@ -90,9 +91,20 @@ class Policy(BasePolicy):
 
         observation = _model.Observation.from_dict(inputs)
         start_time = time.monotonic()
+        if self._is_pytorch_model:
+            actions, component_timing = _sample_pytorch_actions_with_component_timing(
+                self._model,
+                self._sample_actions,
+                self._pytorch_device,
+                observation,
+                sample_kwargs,
+            )
+        else:
+            actions = self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs)
+            component_timing = {}
         outputs = {
             "state": inputs["state"],
-            "actions": self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs),
+            "actions": actions,
         }
         model_time = time.monotonic() - start_time
         if self._is_pytorch_model:
@@ -103,6 +115,7 @@ class Policy(BasePolicy):
         outputs = self._output_transform(outputs)
         outputs["policy_timing"] = {
             "infer_ms": model_time * 1000,
+            **component_timing,
         }
         return outputs
 
@@ -129,7 +142,13 @@ class Policy(BasePolicy):
 
         observation = _model.Observation.from_dict(inputs)
         start_time = time.monotonic()
-        actions = self._sample_actions(self._pytorch_device, observation, **sample_kwargs)
+        actions, component_timing = _sample_pytorch_actions_with_component_timing(
+            self._model,
+            self._sample_actions,
+            self._pytorch_device,
+            observation,
+            sample_kwargs,
+        )
         model_time = time.monotonic() - start_time
 
         outputs = _batch.apply_output_transform_batch(
@@ -143,12 +162,73 @@ class Policy(BasePolicy):
             "infer_ms": model_time * 1000,
             "effective_batch": batch_size,
             "policy_effective_batch": batch_size,
+            **component_timing,
         }
         return outputs
 
     @property
     def metadata(self) -> dict[str, Any]:
         return self._metadata
+
+
+def _sample_pytorch_actions_with_component_timing(
+    model: Any,
+    sample_actions,
+    device: str,
+    observation: _model.Observation,
+    sample_kwargs: dict[str, Any],
+) -> tuple[torch.Tensor, dict[str, float]]:
+    if not _supports_pytorch_component_timing(model, sample_kwargs):
+        return sample_actions(device, observation, **sample_kwargs), {}
+
+    batch_size = int(observation.state.shape[0])
+    num_steps = int(sample_kwargs.get("num_steps", 10))
+    noise = sample_kwargs.get("noise")
+
+    with torch.no_grad():
+        _sync_torch_device(device)
+        vlm_start = time.monotonic()
+        prefix_feature = model.build_prefix_feature(device, observation)
+        _sync_torch_device(device)
+        vlm_ms = (time.monotonic() - vlm_start) * 1000
+
+        denoise_state = model.init_denoise_state(device, batch_size, noise, num_steps)
+        ae_step_ms: list[float] = []
+        for _ in range(num_steps):
+            _sync_torch_device(device)
+            ae_step_start = time.monotonic()
+            v_t = model.denoise_one_batch(prefix_feature, denoise_state)
+            denoise_state = dataclasses.replace(
+                denoise_state,
+                x_t=denoise_state.x_t + denoise_state.dt * v_t,
+                step_idx=denoise_state.step_idx + 1,
+            )
+            _sync_torch_device(device)
+            ae_step_ms.append((time.monotonic() - ae_step_start) * 1000)
+
+    ae_ms = sum(ae_step_ms)
+    timing = {
+        "baseline_vlm_ms": vlm_ms,
+        "baseline_ae_ms": ae_ms,
+        "baseline_ae_step_ms": ae_ms / len(ae_step_ms) if ae_step_ms else 0.0,
+        "baseline_ae_steps": float(num_steps),
+        "baseline_effective_batch": float(batch_size),
+    }
+    return denoise_state.x_t, timing
+
+
+def _supports_pytorch_component_timing(model: Any, sample_kwargs: dict[str, Any]) -> bool:
+    if set(sample_kwargs) - {"noise", "num_steps"}:
+        return False
+    return all(
+        callable(getattr(model, name, None))
+        for name in ("build_prefix_feature", "init_denoise_state", "denoise_one_batch")
+    )
+
+
+def _sync_torch_device(device: str) -> None:
+    if isinstance(device, str) and device.startswith("cuda") and torch.cuda.is_available():
+        torch.cuda.synchronize(device)
 
 
 class PolicyRecorder(_base_policy.BasePolicy):

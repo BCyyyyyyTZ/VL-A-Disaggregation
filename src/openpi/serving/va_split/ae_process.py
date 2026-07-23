@@ -82,6 +82,10 @@ class AEWorker:
         noise = sample_kwargs.get("noise")
         if torch.is_tensor(noise):
             noise = noise.to(self._device)
+        timing = dict(ready.timing or {})
+        prefix_enqueue_ns = timing.pop("_prefix_enqueue_ns", None)
+        if prefix_enqueue_ns is not None:
+            timing["prefix_transfer_ms"] = max(0.0, (time.monotonic_ns() - float(prefix_enqueue_ns)) / 1_000_000)
         batch_size = ready.feature.prefix_pad_masks.shape[0]
         denoise_state = self._model.init_denoise_state(self._device, batch_size, noise, ready.num_steps)
         self.active[ready.request_id] = AERequestState(
@@ -92,7 +96,7 @@ class AEWorker:
             num_steps=ready.num_steps,
             dt=denoise_state.dt,
             started_ns=time.monotonic_ns(),
-            timing=dict(ready.timing or {}),
+            timing=timing,
             ae_step_ms=[],
             ae_batch_sizes=[],
         )
@@ -175,7 +179,9 @@ class AEProcess:
 
         for result in results:
             actions = result.actions.detach().cpu() if torch.is_tensor(result.actions) else result.actions
-            self._result_queue.put(ActionResult(request_id=result.request_id, actions=actions, timing=result.timing))
+            timing = dict(result.timing or {})
+            timing["_ae_result_enqueue_ns"] = float(time.monotonic_ns())
+            self._result_queue.put(ActionResult(request_id=result.request_id, actions=actions, timing=timing))
         for release in releases:
             self._release_queue.put(release)
 
