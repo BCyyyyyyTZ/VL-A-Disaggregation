@@ -313,6 +313,130 @@ async def run_benchmark_batch_requests(
     return sorted(traces, key=lambda trace: trace.request_id)
 
 
+async def run_benchmark_runtime_batch_requests(
+    policy: Any,
+    requests: list[SyntheticRequest],
+    *,
+    max_inflight: int,
+    timeout_s: float,
+    max_batch_size: int,
+    max_wait_ms: float,
+    executor: ThreadPoolExecutor | None = None,
+) -> list[RequestTrace]:
+    if max_inflight <= 0:
+        raise ValueError("max_inflight must be positive")
+    if timeout_s <= 0:
+        raise ValueError("timeout_s must be positive")
+    if max_batch_size <= 0:
+        raise ValueError("max_batch_size must be positive")
+    if max_wait_ms < 0:
+        raise ValueError("max_wait_ms must be non-negative")
+
+    start_s = time.monotonic()
+    traces: list[RequestTrace] = []
+    in_flight = 0
+    owns_executor = executor is None
+    if executor is None:
+        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="va-profile-baseline-model")
+
+    try:
+        queued_requests: list[SyntheticRequest] = []
+        next_request_index = 0
+        running_task: asyncio.Task[list[RequestTrace]] | None = None
+        running_batch_size = 0
+
+        def admit_due_requests() -> None:
+            nonlocal in_flight, next_request_index
+            now_s = time.monotonic()
+            while (
+                next_request_index < len(requests)
+                and in_flight < max_inflight
+                and start_s + requests[next_request_index].scheduled_at_s <= now_s
+            ):
+                queued_requests.append(requests[next_request_index])
+                in_flight += 1
+                next_request_index += 1
+
+        def next_admittable_arrival_abs_s() -> float | None:
+            if next_request_index >= len(requests) or in_flight >= max_inflight:
+                return None
+            return start_s + requests[next_request_index].scheduled_at_s
+
+        async def collect_runtime_batch() -> list[SyntheticRequest]:
+            batch = [queued_requests.pop(0)]
+            deadline_s = time.monotonic() + max_wait_ms / 1000.0
+            while len(batch) < max_batch_size:
+                admit_due_requests()
+                if queued_requests:
+                    batch.append(queued_requests.pop(0))
+                    continue
+                if max_wait_ms == 0:
+                    break
+                remaining_s = deadline_s - time.monotonic()
+                if remaining_s <= 0:
+                    break
+                next_arrival_s = next_admittable_arrival_abs_s()
+                sleep_until_s = deadline_s if next_arrival_s is None else min(deadline_s, next_arrival_s)
+                await _sleep_until(sleep_until_s)
+            return batch
+
+        def start_batch(batch: list[SyntheticRequest]) -> tuple[asyncio.Task[list[RequestTrace]], int]:
+            submitted_at_s = time.monotonic() - start_s
+            batch_request = SyntheticBatchRequest(
+                request_ids=tuple(request.request_id for request in batch),
+                scheduled_at_s=submitted_at_s,
+                original_scheduled_at_s=tuple(request.scheduled_at_s for request in batch),
+                observation=_stack_observation_batch([request.observation for request in batch]),
+                noise=_stack_noise_batch([request.noise for request in batch]),
+            )
+            return (
+                asyncio.create_task(
+                    _run_one_batch_request(
+                        policy,
+                        batch_request,
+                        submitted_at_s=submitted_at_s,
+                        timeout_s=timeout_s,
+                        start_s=start_s,
+                        executor=executor,
+                    )
+                ),
+                len(batch),
+            )
+
+        while next_request_index < len(requests) or queued_requests or running_task is not None:
+            admit_due_requests()
+
+            if running_task is not None and running_task.done():
+                traces.extend(running_task.result())
+                in_flight -= running_batch_size
+                running_task = None
+                running_batch_size = 0
+                continue
+
+            if running_task is None and queued_requests:
+                running_task, running_batch_size = start_batch(await collect_runtime_batch())
+                continue
+
+            next_arrival_s = next_admittable_arrival_abs_s()
+            if running_task is not None:
+                if next_arrival_s is None:
+                    await asyncio.sleep(0.001)
+                else:
+                    await asyncio.sleep(min(max(0.0, next_arrival_s - time.monotonic()), 0.001))
+                continue
+
+            if next_arrival_s is not None:
+                await _sleep_until(next_arrival_s)
+                continue
+
+            await asyncio.sleep(0.001)
+    finally:
+        if owns_executor:
+            executor.shutdown(wait=True)
+
+    return sorted(traces, key=lambda trace: trace.request_id)
+
+
 def summarize_traces(
     traces: list[RequestTrace],
     *,
@@ -473,7 +597,7 @@ def run_profile(args: Args) -> BenchmarkResult:
     sampler = GpuUtilizationSampler(device_index=resolve_gpu_device_index(policy_device, args.gpu_device_index))
     try:
         if args.mode == "monolithic" and args.batch_size > 1:
-            batch_requests = make_fcfs_batched_synthetic_requests(
+            warmup_batch_requests = make_fcfs_batched_synthetic_requests(
                 requests,
                 max_batch_size=args.batch_size,
                 max_wait_ms=args.max_vlm_wait_ms,
@@ -481,17 +605,19 @@ def run_profile(args: Args) -> BenchmarkResult:
             with ThreadPoolExecutor(max_workers=1, thread_name_prefix="va-profile-baseline-model") as executor:
                 warmup_policy_batch(
                     policy,
-                    batch_requests[0],
+                    warmup_batch_requests[0],
                     num_requests=args.warmup_requests,
                     executor=executor,
                 )
                 sampler.start()
                 traces = asyncio.run(
-                    run_benchmark_batch_requests(
+                    run_benchmark_runtime_batch_requests(
                         policy,
-                        batch_requests,
+                        requests,
                         max_inflight=args.max_inflight,
                         timeout_s=args.timeout_s,
+                        max_batch_size=args.batch_size,
+                        max_wait_ms=args.max_vlm_wait_ms,
                         executor=executor,
                     )
                 )

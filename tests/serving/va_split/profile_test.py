@@ -435,6 +435,40 @@ def test_run_profile_monolithic_batching_uses_one_model_lane(monkeypatch):
     assert policy.max_active_calls == 1
 
 
+def test_run_profile_monolithic_batching_collects_from_runtime_queue(monkeypatch):
+    policy = _ConcurrentFakePolicy(sleep_s=0.03)
+    requests = [
+        dataclasses.replace(request, scheduled_at_s=scheduled_at_s)
+        for request, scheduled_at_s in zip(
+            _fake_requests(6),
+            [0.0, 0.004, 0.005, 0.006, 0.007, 0.008],
+            strict=True,
+        )
+    ]
+    monkeypatch.setattr(profile_va_split, "create_policy_for_mode", lambda args, mode: policy)
+    monkeypatch.setattr(profile_va_split, "make_synthetic_libero_requests", lambda **kwargs: requests)
+
+    result = profile_va_split.run_profile(
+        profile_va_split.Args(
+            mode="monolithic",
+            policy=profile_va_split.Checkpoint(config="dummy", dir="/tmp/checkpoint"),
+            num_requests=6,
+            request_rate_hz=1000.0,
+            max_inflight=8,
+            batch_size=3,
+            max_vlm_wait_ms=2.0,
+            warmup_requests=0,
+            pytorch_device="cpu",
+        )
+    )
+
+    assert [trace.request_id for trace in result.traces] == [f"req-{idx:06d}" for idx in range(6)]
+    assert policy.infer_calls == 0
+    assert policy.infer_batch_calls == 3
+    assert policy.observed_batch_sizes == [1, 3, 2]
+    assert policy.max_active_calls == 1
+
+
 def test_run_profile_does_not_add_outer_batching_for_split_modes(monkeypatch):
     policy = _SerialFakePolicy(sleep_s=0.0)
 
