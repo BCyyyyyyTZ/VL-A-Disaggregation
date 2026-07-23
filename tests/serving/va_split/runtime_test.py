@@ -12,9 +12,11 @@ from openpi.serving.va_split.runtime import LocalVASplitRuntime
 class FakeSplitModel:
     def __init__(self):
         self.config = SimpleNamespace(action_horizon=2, action_dim=1)
+        self.prefix_batch_sizes: list[int] = []
 
     def build_prefix_feature(self, device: str, observation) -> PrefixFeature:
         assert device == "cpu"
+        self.prefix_batch_sizes.append(int(observation.state.shape[0]))
         return PrefixFeature(
             past_key_values=("kv",),
             prefix_pad_masks=torch.ones(observation.state.shape[0], 3, dtype=torch.bool),
@@ -62,4 +64,36 @@ def test_local_va_split_runtime_runs_vlm_then_ae_and_releases_prefix():
 
     assert result.request_id
     torch.testing.assert_close(result.actions, -torch.ones(1, 2, 1))
+    assert runtime.vlm_worker.live_features == {}
+
+
+def test_local_va_split_runtime_infer_batch_builds_prefix_once_and_returns_row_order():
+    model = FakeSplitModel()
+    runtime = LocalVASplitRuntime(model=model, device="cpu", max_ae_batch_size=2)
+    image = torch.zeros(2, 3, 224, 224)
+    observation = {
+        "image": {
+            "base_0_rgb": image,
+            "left_wrist_0_rgb": image.clone(),
+            "right_wrist_0_rgb": image.clone(),
+        },
+        "image_mask": {
+            "base_0_rgb": torch.ones(2, dtype=torch.bool),
+            "left_wrist_0_rgb": torch.ones(2, dtype=torch.bool),
+            "right_wrist_0_rgb": torch.ones(2, dtype=torch.bool),
+        },
+        "state": torch.zeros(2, 2),
+        "tokenized_prompt": torch.ones(2, 8, dtype=torch.long),
+        "tokenized_prompt_mask": torch.ones(2, 8, dtype=torch.bool),
+    }
+
+    result = runtime.infer_batch(observation, {"num_steps": 1, "noise": torch.zeros(2, 2, 1)})
+
+    assert result.request_id
+    assert model.prefix_batch_sizes == [2]
+    torch.testing.assert_close(result.actions, -torch.ones(2, 2, 1))
+    assert result.timing is not None
+    assert result.timing["effective_batch"] == 2
+    assert result.timing["vlm_effective_batch"] == 2.0
+    assert result.timing["ae_effective_batch_mean"] == 2.0
     assert runtime.vlm_worker.live_features == {}

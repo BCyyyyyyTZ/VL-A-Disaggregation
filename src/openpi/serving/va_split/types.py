@@ -15,6 +15,15 @@ class RequestEnvelope:
 
 
 @dataclass(frozen=True, slots=True)
+class BatchRequestEnvelope:
+    batch_id: str
+    request_ids: tuple[str, ...]
+    observation: dict[str, Any]
+    sample_kwargs: dict[str, Any]
+    enqueue_ns: int
+
+
+@dataclass(frozen=True, slots=True)
 class PrefixReady:
     request_id: str
     feature: PrefixFeature

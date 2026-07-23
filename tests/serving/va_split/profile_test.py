@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import threading
 import time
@@ -8,6 +9,8 @@ import time
 import numpy as np
 import pytest
 
+from openpi.policies import va_split_policy
+from openpi.training import config as training_config
 from scripts import profile_va_split
 
 
@@ -91,6 +94,14 @@ def test_args_defaults_to_profile_checkpoint():
     assert args.policy.dir == "/data2/gaobowen/model/RLinf-Pi05-LIBERO-SFT"
 
 
+def test_args_defaults_to_two_warmup_requests():
+    assert profile_va_split.Args().warmup_requests == 2
+
+
+def test_args_disables_pytorch_compile_by_default():
+    assert profile_va_split.Args().pytorch_compile_mode is None
+
+
 class _ConcurrentFakePolicy:
     supports_concurrent_infer = True
 
@@ -117,6 +128,17 @@ class _ConcurrentFakePolicy:
                 "vlm_prefix_forward_ms": 1.0,
                 "ae_step_ms": 2.0,
                 "ae_effective_batch": 3.0,
+            },
+        }
+
+    def infer_batch(self, obs, *, noise=None):
+        self.completed_calls += 1
+        batch_size = len(obs["value"])
+        return {
+            "actions": np.asarray(obs["value"], dtype=np.float32).reshape(batch_size, 1),
+            "policy_timing": {
+                "effective_batch": float(batch_size),
+                "policy_effective_batch": float(batch_size),
             },
         }
 
@@ -154,12 +176,229 @@ def test_run_benchmark_allows_concurrent_policy_overlap():
     assert summary["completed_requests"] == 4
     assert summary["failed_requests"] == 0
     assert summary["timeout_requests"] == 0
-    assert summary["target_request_rate_hz"] == 1000.0
+    assert summary["target_requests_per_second"] == 1000.0
+    assert summary["throughput_requests_per_second"] is not None
     assert summary["inflight_peak"] == 4
+    assert summary["submit_lateness_mean_ms"] is not None
+    assert summary["action_latency_mean_ms"] is not None
+    assert summary["end_to_end_latency_mean_ms"] is not None
+    assert summary["vlm_prefix_forward_mean_ms"] == 1.0
     assert summary["vlm_prefix_forward_p50_ms"] == 1.0
+    assert summary["ae_step_mean_ms"] == 2.0
     assert summary["ae_step_p50_ms"] == 2.0
     assert summary["ae_effective_batch_mean"] == 3.0
+    assert summary["effective_batch_mean"] == 3.0
+    assert summary["effective_batch_p50"] == 3.0
+    assert summary["effective_batch_p95"] == 3.0
+    assert summary["effective_batch_p99"] == 3.0
+    assert summary["effective_batch_max"] == 3.0
     assert policy.max_active_calls > 1
+
+
+def test_make_batched_synthetic_requests_stacks_observations_and_noise():
+    batches = profile_va_split.make_batched_synthetic_requests(_fake_requests(5), batch_size=2)
+
+    assert [batch.request_ids for batch in batches] == [
+        ("req-000000", "req-000001"),
+        ("req-000002", "req-000003"),
+        ("req-000004",),
+    ]
+    assert batches[0].scheduled_at_s == _fake_requests(2)[1].scheduled_at_s
+    assert batches[0].observation["value"].shape == (2,)
+    assert batches[0].noise.shape == (2, 2, 3)
+    assert batches[-1].observation["value"].shape == (1,)
+
+
+def test_make_batched_synthetic_requests_stacks_libero_prompt_batch():
+    requests = profile_va_split.make_synthetic_libero_requests(
+        num_requests=2,
+        request_rate_hz=128.0,
+        seed=11,
+        fixed_noise=True,
+    )
+
+    batches = profile_va_split.make_batched_synthetic_requests(requests, batch_size=2)
+
+    assert batches[0].observation["observation/state"].shape == (2, 8)
+    assert batches[0].observation["observation/image"].shape == (2, 224, 224, 3)
+    assert batches[0].observation["prompt"] == ["do something", "do something"]
+    assert batches[0].noise.shape == (2, 10, 32)
+
+
+def test_run_benchmark_batches_call_policy_infer_batch_once_per_wave():
+    policy = _ConcurrentFakePolicy(sleep_s=0.0)
+    batches = profile_va_split.make_batched_synthetic_requests(_fake_requests(4), batch_size=2)
+
+    traces = asyncio.run(
+        profile_va_split.run_benchmark_batch_requests(
+            policy,
+            batches,
+            max_inflight=2,
+            timeout_s=1.0,
+        )
+    )
+    summary = profile_va_split.summarize_traces(traces, target_request_rate_hz=1000.0, inflight_peak=2)
+
+    assert [trace.request_id for trace in traces] == ["req-000000", "req-000001", "req-000002", "req-000003"]
+    assert [trace.status for trace in traces] == ["ok", "ok", "ok", "ok"]
+    assert policy.completed_calls == 2
+    assert all(trace.policy_timing["effective_batch"] == 2.0 for trace in traces)
+    assert summary["policy_effective_batch_mean"] == 2.0
+    assert summary["batch_wait_p95_ms"] is not None
+
+
+def test_summarize_traces_reports_realized_offered_rate_and_slo_goodput():
+    traces = [
+        profile_va_split.RequestTrace(
+            request_id="req-0",
+            scheduled_at_s=0.0,
+            submitted_at_s=0.0,
+            completed_at_s=0.1,
+            status="ok",
+            policy_timing={},
+        ),
+        profile_va_split.RequestTrace(
+            request_id="req-1",
+            scheduled_at_s=1.0,
+            submitted_at_s=1.0,
+            completed_at_s=1.3,
+            status="ok",
+            policy_timing={},
+        ),
+        profile_va_split.RequestTrace(
+            request_id="req-2",
+            scheduled_at_s=2.0,
+            submitted_at_s=2.0,
+            completed_at_s=2.1,
+            status="ok",
+            policy_timing={},
+        ),
+    ]
+
+    summary = profile_va_split.summarize_traces(traces, target_request_rate_hz=2.0, inflight_peak=1)
+
+    assert summary["realized_offered_requests_per_second"] == 1.5
+    assert summary["slo_ms"] == 200.0
+    assert summary["slo_goodput_requests_per_second"] == 1.0
+    assert summary["slo_good_requests"] == 2
+
+
+def test_run_profile_warms_up_policy_before_timed_workload(monkeypatch):
+    policy = _SerialFakePolicy(sleep_s=0.0)
+    calls = []
+    worker_thread_ids = []
+
+    def infer(obs, *, noise=None):
+        calls.append(obs["value"])
+        worker_thread_ids.append(threading.get_ident())
+        return {
+            "actions": np.asarray([obs["value"]], dtype=np.float32),
+            "policy_timing": {"infer_ms": 0.0},
+        }
+
+    policy.infer = infer
+    monkeypatch.setattr(profile_va_split, "create_policy_for_mode", lambda args, mode: policy)
+    monkeypatch.setattr(profile_va_split, "make_synthetic_libero_requests", lambda **kwargs: _fake_requests(2))
+
+    result = profile_va_split.run_profile(
+        profile_va_split.Args(
+            policy=profile_va_split.Checkpoint(config="dummy", dir="/tmp/checkpoint"),
+            num_requests=2,
+            request_rate_hz=1000.0,
+            warmup_requests=2,
+            pytorch_device="cpu",
+        )
+    )
+
+    assert calls[:2] == [0, 0]
+    assert [trace.request_id for trace in result.traces] == ["req-000000", "req-000001"]
+    assert policy.completed_calls == 0
+    assert len(set(worker_thread_ids)) == 1
+    assert worker_thread_ids[0] != threading.get_ident()
+
+
+def test_create_policy_for_mode_uses_profile_timeout_for_split_runtime(monkeypatch):
+    @dataclasses.dataclass(frozen=True)
+    class FakeModelConfig:
+        pytorch_compile_mode: str | None = "max-autotune"
+
+    @dataclasses.dataclass(frozen=True)
+    class FakeTrainConfig:
+        model: FakeModelConfig = dataclasses.field(default_factory=FakeModelConfig)
+
+    train_config = FakeTrainConfig()
+    captured_kwargs = {}
+
+    def create_split_policy(received_train_config, *args, **kwargs):
+        captured_kwargs["train_config"] = received_train_config
+        captured_kwargs.update(kwargs)
+        return "split-policy"
+
+    monkeypatch.setattr(training_config, "get_config", lambda config_name: train_config)
+    monkeypatch.setattr(va_split_policy, "create_trained_va_split_policy", create_split_policy)
+
+    policy = profile_va_split.create_policy_for_mode(
+        profile_va_split.Args(
+            mode="split-no-mps",
+            policy=profile_va_split.Checkpoint(config="dummy", dir="/tmp/checkpoint"),
+            timeout_s=321.0,
+            max_vlm_batch_size=6,
+            max_vlm_wait_ms=1.25,
+        ),
+        "split-no-mps",
+    )
+
+    assert policy == "split-policy"
+    assert captured_kwargs["train_config"].model.pytorch_compile_mode is None
+    assert captured_kwargs["result_timeout_s"] == 321.0
+    assert captured_kwargs["max_vlm_batch_size"] == 6
+    assert captured_kwargs["max_vlm_wait_ms"] == 1.25
+
+
+def test_create_policy_for_mode_allows_explicit_pytorch_compile_opt_in(monkeypatch):
+    @dataclasses.dataclass(frozen=True)
+    class FakeModelConfig:
+        pytorch_compile_mode: str | None = "max-autotune"
+
+    @dataclasses.dataclass(frozen=True)
+    class FakeTrainConfig:
+        model: FakeModelConfig = dataclasses.field(default_factory=FakeModelConfig)
+
+    captured_kwargs = {}
+
+    def create_split_policy(received_train_config, *args, **kwargs):
+        captured_kwargs["train_config"] = received_train_config
+        return "split-policy"
+
+    monkeypatch.setattr(training_config, "get_config", lambda config_name: FakeTrainConfig())
+    monkeypatch.setattr(va_split_policy, "create_trained_va_split_policy", create_split_policy)
+
+    policy = profile_va_split.create_policy_for_mode(
+        profile_va_split.Args(
+            mode="split-no-mps",
+            policy=profile_va_split.Checkpoint(config="dummy", dir="/tmp/checkpoint"),
+            pytorch_compile_mode="default",
+        ),
+        "split-no-mps",
+    )
+
+    assert policy == "split-policy"
+    assert captured_kwargs["train_config"].model.pytorch_compile_mode == "default"
+
+
+def test_print_summary_uses_requests_per_second_units(capsys):
+    profile_va_split.print_summary(
+        {
+            "target_requests_per_second": 4.0,
+            "throughput_requests_per_second": 2.5,
+            "completed_requests": 128,
+        }
+    )
+
+    output = capsys.readouterr().out
+    assert "target_requests_per_second: 4.000" in output
+    assert "throughput_requests_per_second: 2.500" in output
+    assert "hz" not in output.lower()
 
 
 def test_run_benchmark_serializes_non_concurrent_policy():

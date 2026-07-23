@@ -1,4 +1,5 @@
 import asyncio
+from collections.abc import Sequence
 import http
 import logging
 import time
@@ -24,11 +25,14 @@ class WebsocketPolicyServer:
         host: str = "0.0.0.0",
         port: int | None = None,
         metadata: dict | None = None,
+        *,
+        enable_policy_batch: bool = True,
     ) -> None:
         self._policy = policy
         self._host = host
         self._port = port
         self._metadata = metadata or {}
+        self._enable_policy_batch = enable_policy_batch
         logging.getLogger("websockets.server").setLevel(logging.INFO)
 
     def serve_forever(self) -> None:
@@ -58,7 +62,7 @@ class WebsocketPolicyServer:
                 obs = msgpack_numpy.unpackb(await websocket.recv())
 
                 infer_time = time.monotonic()
-                action = await infer_policy_async(self._policy, obs)
+                action = await infer_policy_async(self._policy, obs, enable_policy_batch=self._enable_policy_batch)
                 infer_time = time.monotonic() - infer_time
 
                 action["server_timing"] = {
@@ -90,7 +94,21 @@ def _health_check(connection: _server.ServerConnection, request: _server.Request
     return None
 
 
-async def infer_policy_async(policy: _base_policy.BasePolicy, obs: dict) -> dict:
+async def infer_policy_async(policy: _base_policy.BasePolicy, obs: dict, *, enable_policy_batch: bool = True) -> dict:
+    if enable_policy_batch and _should_use_policy_batch(policy, obs):
+        if getattr(policy, "supports_concurrent_infer", False):
+            return await asyncio.to_thread(policy.infer_batch, obs)
+        return policy.infer_batch(obs)
     if getattr(policy, "supports_concurrent_infer", False):
         return await asyncio.to_thread(policy.infer, obs)
     return policy.infer(obs)
+
+
+def _should_use_policy_batch(policy: _base_policy.BasePolicy, obs: dict) -> bool:
+    infer_batch = getattr(policy, "infer_batch", None)
+    if not callable(infer_batch):
+        return False
+    prompts = obs.get("prompt")
+    if isinstance(prompts, str):
+        return False
+    return isinstance(prompts, Sequence) and all(isinstance(prompt, str) for prompt in prompts)

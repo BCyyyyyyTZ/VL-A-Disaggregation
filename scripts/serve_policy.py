@@ -2,7 +2,7 @@ import dataclasses
 import enum
 import logging
 import socket
-from typing import Any
+from typing import Any, Literal
 
 import tyro
 
@@ -20,6 +20,9 @@ class EnvMode(enum.Enum):
     ALOHA_SIM = "aloha_sim"
     DROID = "droid"
     LIBERO = "libero"
+
+
+CompileMode = Literal["default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"]
 
 
 @dataclasses.dataclass
@@ -56,9 +59,13 @@ class Args:
     # Use the OpenPI-only PyTorch VLM/AE split runtime.
     va_split: bool = False
     va_split_max_ae_batch_size: int = 8
+    va_split_max_vlm_batch_size: int = 8
+    va_split_max_vlm_wait_ms: float = 2.0
     ae_sm_percent: int = 20
     vlm_sm_percent: int = 0
+    enable_policy_batch: bool = True
     pytorch_device: str | None = None
+    pytorch_compile_mode: CompileMode | None = None
 
     # Specifies how to load the policy. If not provided, the default policy for the environment will be used.
     policy: Checkpoint | Default = dataclasses.field(default_factory=Default)
@@ -94,14 +101,27 @@ def create_default_policy(env: EnvMode, *, default_prompt: str | None = None) ->
     raise ValueError(f"Unsupported environment mode: {env}")
 
 
+def _with_pytorch_compile_mode(
+    train_config: _config.TrainConfig, compile_mode: CompileMode | None
+) -> _config.TrainConfig:
+    if not hasattr(train_config.model, "pytorch_compile_mode"):
+        return train_config
+    return dataclasses.replace(
+        train_config,
+        model=dataclasses.replace(train_config.model, pytorch_compile_mode=compile_mode),
+    )
+
+
 def _create_checkpoint_policy(args: Args, checkpoint: Checkpoint) -> _policy.BasePolicy:
-    train_config = _config.get_config(checkpoint.config)
+    train_config = _with_pytorch_compile_mode(_config.get_config(checkpoint.config), args.pytorch_compile_mode)
     if args.va_split:
         return _va_split_policy.create_trained_va_split_policy(
             train_config,
             checkpoint.dir,
             default_prompt=args.default_prompt,
             max_ae_batch_size=args.va_split_max_ae_batch_size,
+            max_vlm_batch_size=args.va_split_max_vlm_batch_size,
+            max_vlm_wait_ms=args.va_split_max_vlm_wait_ms,
             ae_sm_percent=args.ae_sm_percent,
             vlm_sm_percent=args.vlm_sm_percent,
             pytorch_device=args.pytorch_device,
@@ -146,6 +166,7 @@ def main(args: Args) -> None:
         host="0.0.0.0",
         port=args.port,
         metadata=policy_metadata,
+        enable_policy_batch=args.enable_policy_batch,
     )
     try:
         server.serve_forever()

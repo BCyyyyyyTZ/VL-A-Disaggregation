@@ -20,6 +20,16 @@ class FakeConcurrentPolicy(FakePolicy):
     supports_concurrent_infer = True
 
 
+class FakeBatchPolicy(FakePolicy):
+    def __init__(self):
+        super().__init__()
+        self.batch_calls = 0
+
+    def infer_batch(self, obs):
+        self.batch_calls += 1
+        return {"actions": obs["value"]}
+
+
 def test_infer_policy_keeps_default_policies_on_event_loop(monkeypatch):
     policy = FakePolicy()
 
@@ -48,3 +58,29 @@ def test_infer_policy_offloads_concurrent_policies(monkeypatch):
 
     assert result == {"actions": 4}
     assert len(calls) == 1
+
+
+def test_infer_policy_uses_batch_path_for_prompt_batches():
+    policy = FakeBatchPolicy()
+
+    result = asyncio.run(websocket_policy_server.infer_policy_async(policy, {"prompt": ["a", "b"], "value": [1, 2]}))
+
+    assert result == {"actions": [1, 2]}
+    assert policy.calls == 0
+    assert policy.batch_calls == 1
+
+
+def test_infer_policy_batch_path_can_be_disabled():
+    policy = FakeBatchPolicy()
+
+    result = asyncio.run(
+        websocket_policy_server.infer_policy_async(
+            policy,
+            {"prompt": ["a", "b"], "value": [1, 2]},
+            enable_policy_batch=False,
+        )
+    )
+
+    assert result == {"actions": [1, 2]}
+    assert policy.calls == 1
+    assert policy.batch_calls == 0

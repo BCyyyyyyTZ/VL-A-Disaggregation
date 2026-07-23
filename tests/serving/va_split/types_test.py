@@ -6,6 +6,7 @@ import torch
 
 from openpi.models_pytorch.pi0_split_types import PrefixFeature
 from openpi.serving.va_split.types import ActionResult
+from openpi.serving.va_split.types import BatchRequestEnvelope
 from openpi.serving.va_split.types import PrefixReady
 from openpi.serving.va_split.types import ReleaseFeature
 from openpi.serving.va_split.types import RequestEnvelope
@@ -22,6 +23,20 @@ def _round_trip(message: object) -> object:
 def test_request_envelope_round_trips_through_queue():
     message = RequestEnvelope(
         request_id="req-1",
+        observation={"state": [1.0, 2.0]},
+        sample_kwargs={"num_steps": 4},
+        enqueue_ns=123,
+    )
+
+    received = _round_trip(message)
+
+    assert received == message
+
+
+def test_batch_request_envelope_round_trips_through_queue():
+    message = BatchRequestEnvelope(
+        batch_id="batch-1",
+        request_ids=("req-1", "req-2"),
         observation={"state": [1.0, 2.0]},
         sample_kwargs={"num_steps": 4},
         enqueue_ns=123,

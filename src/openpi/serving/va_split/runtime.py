@@ -12,6 +12,7 @@ import torch
 from openpi.serving.va_split.ae_process import AEProcess
 from openpi.serving.va_split.ae_process import AEWorker
 from openpi.serving.va_split.types import ActionResult
+from openpi.serving.va_split.types import BatchRequestEnvelope
 from openpi.serving.va_split.types import RequestEnvelope
 from openpi.serving.va_split.types import Shutdown
 from openpi.serving.va_split.types import WorkerError
@@ -46,6 +47,31 @@ class LocalVASplitRuntime:
                     return result
         raise RuntimeError(f"Request {request_id} finished without an ActionResult")
 
+    def infer_batch(self, observation: dict, sample_kwargs: dict) -> ActionResult:
+        batch_size = int(observation["state"].shape[0])
+        batch_id = str(uuid.uuid4())
+        request_ids = tuple(f"{batch_id}:{row}" for row in range(batch_size))
+        ready_messages = self.vlm_worker.handle_batch_request(
+            BatchRequestEnvelope(
+                batch_id=batch_id,
+                request_ids=request_ids,
+                observation=observation,
+                sample_kwargs=dict(sample_kwargs),
+                enqueue_ns=time.monotonic_ns(),
+            )
+        )
+        for ready in ready_messages:
+            self.ae_worker.add_prefix(ready)
+
+        results_by_id: dict[str, ActionResult] = {}
+        while len(results_by_id) < batch_size:
+            results, releases = self.ae_worker.step_once()
+            for release in releases:
+                self.vlm_worker.release(release)
+            for result in results:
+                results_by_id[result.request_id] = result
+        return _combine_ordered_results(batch_id, request_ids, results_by_id)
+
 
 def _prepare_model(model_factory: Callable[[], object], device: str):
     model = model_factory()
@@ -64,7 +90,16 @@ def _apply_env_updates(env_updates: dict[str, str | None] | None) -> None:
             os.environ[key] = value
 
 
-def _run_vlm_process(model_factory, device, request_queue, prefix_queue, release_queue, env_updates=None) -> None:
+def _run_vlm_process(
+    model_factory,
+    device,
+    request_queue,
+    prefix_queue,
+    release_queue,
+    max_vlm_batch_size,
+    max_vlm_wait_ms,
+    env_updates=None,
+) -> None:
     _apply_env_updates(env_updates)
     model = _prepare_model(model_factory, device)
     VLMProcess(
@@ -73,6 +108,8 @@ def _run_vlm_process(model_factory, device, request_queue, prefix_queue, release
         request_queue=request_queue,
         prefix_queue=prefix_queue,
         release_queue=release_queue,
+        max_batch_size=max_vlm_batch_size,
+        max_wait_ms=max_vlm_wait_ms,
     ).run()
 
 
@@ -100,6 +137,8 @@ class ProcessVASplitRuntime:
         model_factory: Callable[[], object],
         device: str,
         max_ae_batch_size: int = 8,
+        max_vlm_batch_size: int = 8,
+        max_vlm_wait_ms: float = 2.0,
         start_method: str = "spawn",
         result_timeout_s: float = 120.0,
         vlm_env_updates: dict[str, str | None] | None = None,
@@ -108,6 +147,8 @@ class ProcessVASplitRuntime:
         self._model_factory = model_factory
         self._device = device
         self._max_ae_batch_size = max_ae_batch_size
+        self._max_vlm_batch_size = max_vlm_batch_size
+        self._max_vlm_wait_ms = max_vlm_wait_ms
         self._result_timeout_s = result_timeout_s
         self._pending_results: dict[str, ActionResult] = {}
         self._pending_errors: dict[str | None, WorkerError] = {}
@@ -122,7 +163,16 @@ class ProcessVASplitRuntime:
         self._release_queue = ctx.Queue()
         self._vlm_process = ctx.Process(
             target=_run_vlm_process,
-            args=(model_factory, device, self._request_queue, self._prefix_queue, self._release_queue, vlm_env_updates),
+            args=(
+                model_factory,
+                device,
+                self._request_queue,
+                self._prefix_queue,
+                self._release_queue,
+                max_vlm_batch_size,
+                max_vlm_wait_ms,
+                vlm_env_updates,
+            ),
             daemon=True,
         )
         self._ae_process = ctx.Process(
@@ -156,6 +206,24 @@ class ProcessVASplitRuntime:
             )
         )
         return self._wait_for_result(request_id)
+
+    def infer_batch(self, observation: dict, sample_kwargs: dict) -> ActionResult:
+        if self._closed:
+            raise RuntimeError("VA split runtime is shut down")
+        batch_size = int(observation["state"].shape[0])
+        batch_id = str(uuid.uuid4())
+        request_ids = tuple(f"{batch_id}:{row}" for row in range(batch_size))
+        self._request_queue.put(
+            BatchRequestEnvelope(
+                batch_id=batch_id,
+                request_ids=request_ids,
+                observation=observation,
+                sample_kwargs=dict(sample_kwargs),
+                enqueue_ns=time.monotonic_ns(),
+            )
+        )
+        results_by_id = {request_id: self._wait_for_result(request_id) for request_id in request_ids}
+        return _combine_ordered_results(batch_id, request_ids, results_by_id)
 
     def _wait_for_result(self, request_id: str) -> ActionResult:
         deadline = time.monotonic() + self._result_timeout_s
@@ -210,3 +278,30 @@ class ProcessVASplitRuntime:
 def _worker_error_to_runtime_error(error: WorkerError) -> RuntimeError:
     detail = f"\n{error.traceback}" if error.traceback else ""
     return RuntimeError(f"VA split worker failed for {error.request_id}: {error.error}{detail}")
+
+
+def _combine_ordered_results(
+    batch_id: str,
+    request_ids: tuple[str, ...],
+    results_by_id: dict[str, ActionResult],
+) -> ActionResult:
+    ordered = [results_by_id[request_id] for request_id in request_ids]
+    actions = torch.cat([result.actions for result in ordered], dim=0)
+    timing = _aggregate_batch_timing([dict(result.timing or {}) for result in ordered], batch_size=len(request_ids))
+    return ActionResult(request_id=batch_id, actions=actions, timing=timing)
+
+
+def _aggregate_batch_timing(row_timings: list[dict[str, float]], *, batch_size: int) -> dict[str, float]:
+    timing: dict[str, float] = {
+        "effective_batch": float(batch_size),
+        "policy_effective_batch": float(batch_size),
+    }
+    for key in ("vlm_prefix_forward_ms", "vlm_queue_wait_ms", "vlm_effective_batch", "ae_step_ms", "ae_step_total_ms"):
+        values = [float(row[key]) for row in row_timings if key in row]
+        if values:
+            timing[key] = sum(values) / len(values)
+    ae_batch_values = [float(row["ae_effective_batch"]) for row in row_timings if "ae_effective_batch" in row]
+    if ae_batch_values:
+        timing["ae_effective_batch"] = sum(ae_batch_values) / len(ae_batch_values)
+        timing["ae_effective_batch_mean"] = timing["ae_effective_batch"]
+    return timing

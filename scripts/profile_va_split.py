@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 import contextlib
 import dataclasses
@@ -16,6 +17,7 @@ import numpy as np
 import tyro
 
 Mode = Literal["monolithic", "split-no-mps", "split-mps"]
+CompileMode = Literal["default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"]
 TraceStatus = Literal["ok", "error", "timeout"]
 DEFAULT_PROFILE_CHECKPOINT_CONFIG = "pi05_libero"
 DEFAULT_PROFILE_CHECKPOINT_DIR = "/data2/gaobowen/model/RLinf-Pi05-LIBERO-SFT"
@@ -25,6 +27,15 @@ DEFAULT_PROFILE_CHECKPOINT_DIR = "/data2/gaobowen/model/RLinf-Pi05-LIBERO-SFT"
 class SyntheticRequest:
     request_id: str
     scheduled_at_s: float
+    observation: dict[str, Any]
+    noise: np.ndarray | None
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class SyntheticBatchRequest:
+    request_ids: tuple[str, ...]
+    scheduled_at_s: float
+    original_scheduled_at_s: tuple[float, ...]
     observation: dict[str, Any]
     noise: np.ndarray | None
 
@@ -65,6 +76,7 @@ class Args:
     num_requests: int = 128
     request_rate_hz: float = 16.0
     max_inflight: int = 64
+    batch_size: int = 1
     seed: int = 0
     num_steps: int = 10
     action_horizon: int = 10
@@ -74,8 +86,13 @@ class Args:
     prompt: str = "do something"
     fixed_noise: bool = True
     timeout_s: float = 60.0
+    warmup_requests: int = 2
+    slo_ms: float = 200.0
     pytorch_device: str | None = None
+    pytorch_compile_mode: CompileMode | None = None
     max_ae_batch_size: int = 8
+    max_vlm_batch_size: int = 8
+    max_vlm_wait_ms: float = 2.0
     ae_sm_percent: int = 20
     vlm_sm_percent: int = 0
     require_mps_env: bool = True
@@ -146,12 +163,38 @@ def make_synthetic_libero_requests(
     return requests
 
 
+def make_batched_synthetic_requests(
+    requests: Sequence[SyntheticRequest],
+    *,
+    batch_size: int,
+) -> list[SyntheticBatchRequest]:
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+
+    batches = []
+    for start in range(0, len(requests), batch_size):
+        group = tuple(requests[start : start + batch_size])
+        if not group:
+            continue
+        batches.append(
+            SyntheticBatchRequest(
+                request_ids=tuple(request.request_id for request in group),
+                scheduled_at_s=max(request.scheduled_at_s for request in group),
+                original_scheduled_at_s=tuple(request.scheduled_at_s for request in group),
+                observation=_stack_observation_batch([request.observation for request in group]),
+                noise=_stack_noise_batch([request.noise for request in group]),
+            )
+        )
+    return batches
+
+
 async def run_benchmark_requests(
     policy: Any,
     requests: list[SyntheticRequest],
     *,
     max_inflight: int,
     timeout_s: float,
+    executor: ThreadPoolExecutor | None = None,
 ) -> list[RequestTrace]:
     if max_inflight <= 0:
         raise ValueError("max_inflight must be positive")
@@ -161,10 +204,13 @@ async def run_benchmark_requests(
     start_s = time.monotonic()
     pending: set[asyncio.Task[RequestTrace]] = set()
     traces: list[RequestTrace] = []
-    supports_concurrent_infer = bool(getattr(policy, "supports_concurrent_infer", False))
-    max_workers = max_inflight if supports_concurrent_infer else 1
+    owns_executor = executor is None
+    if executor is None:
+        supports_concurrent_infer = bool(getattr(policy, "supports_concurrent_infer", False))
+        max_workers = max_inflight if supports_concurrent_infer else 1
+        executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="va-profile")
 
-    with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="va-profile") as executor:
+    try:
         for request in requests:
             await _sleep_until(start_s + request.scheduled_at_s)
             while len(pending) >= max_inflight:
@@ -186,6 +232,62 @@ async def run_benchmark_requests(
         while pending:
             done, pending = await _wait_for_completed_requests(pending)
             traces.extend(task.result() for task in done)
+    finally:
+        if owns_executor:
+            executor.shutdown(wait=True)
+
+    return sorted(traces, key=lambda trace: trace.request_id)
+
+
+async def run_benchmark_batch_requests(
+    policy: Any,
+    requests: list[SyntheticBatchRequest],
+    *,
+    max_inflight: int,
+    timeout_s: float,
+    executor: ThreadPoolExecutor | None = None,
+) -> list[RequestTrace]:
+    if max_inflight <= 0:
+        raise ValueError("max_inflight must be positive")
+    if timeout_s <= 0:
+        raise ValueError("timeout_s must be positive")
+
+    start_s = time.monotonic()
+    pending: set[asyncio.Task[list[RequestTrace]]] = set()
+    traces: list[RequestTrace] = []
+    owns_executor = executor is None
+    if executor is None:
+        supports_concurrent_infer = bool(getattr(policy, "supports_concurrent_infer", False))
+        max_workers = max_inflight if supports_concurrent_infer else 1
+        executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="va-profile")
+
+    try:
+        for request in requests:
+            await _sleep_until(start_s + request.scheduled_at_s)
+            while len(pending) >= max_inflight:
+                done, pending = await _wait_for_completed_batch_requests(pending)
+                for task in done:
+                    traces.extend(task.result())
+            submitted_abs_s = time.monotonic()
+            task = asyncio.create_task(
+                _run_one_batch_request(
+                    policy,
+                    request,
+                    submitted_at_s=submitted_abs_s - start_s,
+                    timeout_s=timeout_s,
+                    start_s=start_s,
+                    executor=executor,
+                )
+            )
+            pending.add(task)
+
+        while pending:
+            done, pending = await _wait_for_completed_batch_requests(pending)
+            for task in done:
+                traces.extend(task.result())
+    finally:
+        if owns_executor:
+            executor.shutdown(wait=True)
 
     return sorted(traces, key=lambda trace: trace.request_id)
 
@@ -195,6 +297,7 @@ def summarize_traces(
     *,
     target_request_rate_hz: float,
     inflight_peak: int,
+    slo_ms: float = 200.0,
     gpu_sm_util_mean: float | None = None,
     gpu_mem_bw_util_mean: float | None = None,
 ) -> dict[str, float | int | None]:
@@ -204,24 +307,45 @@ def summarize_traces(
     action_latency_ms = [(trace.completed_at_s - trace.submitted_at_s) * 1000.0 for trace in completed]
     end_to_end_latency_ms = [(trace.completed_at_s - trace.scheduled_at_s) * 1000.0 for trace in completed]
     submit_lateness_ms = [(trace.submitted_at_s - trace.scheduled_at_s) * 1000.0 for trace in traces]
+    slo_good = _slo_good_traces(completed, slo_ms=slo_ms)
 
     summary: dict[str, float | int | None] = {
         "target_request_rate_hz": float(target_request_rate_hz),
-        "achieved_request_rate_hz": _achieved_request_rate_hz(completed),
+        "target_requests_per_second": float(target_request_rate_hz),
+        "realized_offered_requests_per_second": _rate_over_scheduled_span(len(traces), traces),
+        "throughput_requests_per_second": _throughput_requests_per_second(completed),
+        "slo_ms": float(slo_ms),
+        "slo_good_requests": len(slo_good),
+        "slo_goodput_requests_per_second": _rate_over_scheduled_span(len(slo_good), traces),
         "num_requests": len(traces),
         "completed_requests": len(completed),
         "failed_requests": len(failed),
         "timeout_requests": len(timed_out),
+        "submit_lateness_mean_ms": _mean(submit_lateness_ms),
         "submit_lateness_p50_ms": _percentile(submit_lateness_ms, 50),
         "submit_lateness_p95_ms": _percentile(submit_lateness_ms, 95),
+        "action_latency_mean_ms": _mean(action_latency_ms),
         "action_latency_p50_ms": _percentile(action_latency_ms, 50),
         "action_latency_p95_ms": _percentile(action_latency_ms, 95),
         "action_latency_p99_ms": _percentile(action_latency_ms, 99),
+        "end_to_end_latency_mean_ms": _mean(end_to_end_latency_ms),
         "end_to_end_latency_p50_ms": _percentile(end_to_end_latency_ms, 50),
         "end_to_end_latency_p95_ms": _percentile(end_to_end_latency_ms, 95),
+        "vlm_prefix_forward_mean_ms": _timing_mean(completed, "vlm_prefix_forward_ms"),
         "vlm_prefix_forward_p50_ms": _timing_percentile(completed, "vlm_prefix_forward_ms", 50),
+        "ae_step_mean_ms": _timing_mean(completed, "ae_step_ms"),
         "ae_step_p50_ms": _timing_percentile(completed, "ae_step_ms", 50),
         "ae_effective_batch_mean": _timing_mean(completed, "ae_effective_batch"),
+        "vlm_effective_batch_mean": _timing_mean(completed, "vlm_effective_batch"),
+        "policy_effective_batch_mean": _timing_mean(completed, "policy_effective_batch"),
+        "batch_wait_mean_ms": _timing_mean(completed, "batch_wait_ms"),
+        "batch_wait_p50_ms": _timing_percentile(completed, "batch_wait_ms", 50),
+        "batch_wait_p95_ms": _timing_percentile(completed, "batch_wait_ms", 95),
+        "effective_batch_mean": _mean(_effective_batch_values(completed)),
+        "effective_batch_p50": _percentile(_effective_batch_values(completed), 50),
+        "effective_batch_p95": _percentile(_effective_batch_values(completed), 95),
+        "effective_batch_p99": _percentile(_effective_batch_values(completed), 99),
+        "effective_batch_max": _max(_effective_batch_values(completed)),
         "inflight_peak": int(inflight_peak),
         "gpu_sm_util_mean": gpu_sm_util_mean,
         "gpu_mem_bw_util_mean": gpu_mem_bw_util_mean,
@@ -303,16 +427,45 @@ def run_profile(args: Args) -> BenchmarkResult:
     policy = create_policy_for_mode(args, args.mode)
     policy_device = getattr(policy, "_pytorch_device", args.pytorch_device)
     sampler = GpuUtilizationSampler(device_index=resolve_gpu_device_index(policy_device, args.gpu_device_index))
-    sampler.start()
     try:
-        traces = asyncio.run(
-            run_benchmark_requests(
-                policy,
-                requests,
-                max_inflight=args.max_inflight,
-                timeout_s=args.timeout_s,
-            )
-        )
+        supports_concurrent_infer = bool(getattr(policy, "supports_concurrent_infer", False))
+        max_workers = args.max_inflight if supports_concurrent_infer else 1
+        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="va-profile") as executor:
+            if args.batch_size > 1:
+                batch_requests = make_batched_synthetic_requests(requests, batch_size=args.batch_size)
+                warmup_policy_batch(
+                    policy,
+                    batch_requests[0],
+                    num_requests=args.warmup_requests,
+                    executor=executor,
+                )
+                sampler.start()
+                traces = asyncio.run(
+                    run_benchmark_batch_requests(
+                        policy,
+                        batch_requests,
+                        max_inflight=args.max_inflight,
+                        timeout_s=args.timeout_s,
+                        executor=executor,
+                    )
+                )
+            else:
+                warmup_policy(
+                    policy,
+                    requests[0],
+                    num_requests=args.warmup_requests,
+                    executor=executor,
+                )
+                sampler.start()
+                traces = asyncio.run(
+                    run_benchmark_requests(
+                        policy,
+                        requests,
+                        max_inflight=args.max_inflight,
+                        timeout_s=args.timeout_s,
+                        executor=executor,
+                    )
+                )
     finally:
         sampler.stop()
         close_policy(policy)
@@ -321,11 +474,47 @@ def run_profile(args: Args) -> BenchmarkResult:
         traces,
         target_request_rate_hz=args.request_rate_hz,
         inflight_peak=compute_inflight_peak(traces),
+        slo_ms=args.slo_ms,
         gpu_sm_util_mean=sampler.gpu_sm_util_mean,
         gpu_mem_bw_util_mean=sampler.gpu_mem_bw_util_mean,
     )
     consistency = _run_consistency_check(args, requests) if args.check_consistency else None
     return BenchmarkResult(traces=traces, summary=summary, consistency=consistency)
+
+
+def warmup_policy(
+    policy: Any,
+    request: SyntheticRequest,
+    *,
+    num_requests: int,
+    executor: ThreadPoolExecutor,
+) -> None:
+    if num_requests < 0:
+        raise ValueError("warmup_requests must be non-negative")
+    for _ in range(num_requests):
+        executor.submit(_call_policy_infer, policy, request).result()
+
+
+def warmup_policy_batch(
+    policy: Any,
+    request: SyntheticBatchRequest,
+    *,
+    num_requests: int,
+    executor: ThreadPoolExecutor,
+) -> None:
+    if num_requests < 0:
+        raise ValueError("warmup_requests must be non-negative")
+    for _ in range(num_requests):
+        executor.submit(_call_policy_infer_batch, policy, request).result()
+
+
+def _with_pytorch_compile_mode(train_config, compile_mode: CompileMode | None):
+    if not hasattr(train_config.model, "pytorch_compile_mode"):
+        return train_config
+    return dataclasses.replace(
+        train_config,
+        model=dataclasses.replace(train_config.model, pytorch_compile_mode=compile_mode),
+    )
 
 
 def create_policy_for_mode(args: Args, mode: Mode):
@@ -335,7 +524,7 @@ def create_policy_for_mode(args: Args, mode: Mode):
     from openpi.policies import va_split_policy as _va_split_policy  # noqa: PLC0415
     from openpi.training import config as _config  # noqa: PLC0415
 
-    train_config = _config.get_config(args.policy.config)
+    train_config = _with_pytorch_compile_mode(_config.get_config(args.policy.config), args.pytorch_compile_mode)
     sample_kwargs = {"num_steps": args.num_steps}
     if mode == "monolithic":
         return _policy_config.create_trained_policy(
@@ -352,8 +541,11 @@ def create_policy_for_mode(args: Args, mode: Mode):
         sample_kwargs=sample_kwargs,
         pytorch_device=args.pytorch_device,
         max_ae_batch_size=args.max_ae_batch_size,
+        max_vlm_batch_size=args.max_vlm_batch_size,
+        max_vlm_wait_ms=args.max_vlm_wait_ms,
         ae_sm_percent=ae_sm_percent,
         vlm_sm_percent=vlm_sm_percent,
+        result_timeout_s=args.timeout_s,
     )
 
 
@@ -428,6 +620,13 @@ async def _wait_for_completed_requests(
     return done, pending
 
 
+async def _wait_for_completed_batch_requests(
+    pending: set[asyncio.Task[list[RequestTrace]]],
+) -> tuple[set[asyncio.Task[list[RequestTrace]]], set[asyncio.Task[list[RequestTrace]]]]:
+    done, pending = await asyncio.wait(pending, timeout=0.1, return_when=asyncio.FIRST_COMPLETED)
+    return done, pending
+
+
 async def _run_one_request(
     policy: Any,
     request: SyntheticRequest,
@@ -458,6 +657,34 @@ async def _run_one_request(
         return _failed_trace(request, submitted_at_s, start_s, "error", repr(exc))
 
 
+async def _run_one_batch_request(
+    policy: Any,
+    request: SyntheticBatchRequest,
+    *,
+    submitted_at_s: float,
+    timeout_s: float,
+    start_s: float,
+    executor: ThreadPoolExecutor,
+) -> list[RequestTrace]:
+    try:
+        result = await _infer_policy_batch(policy, request, executor=executor)
+        completed_at_s = time.monotonic() - start_s
+        if completed_at_s - submitted_at_s > timeout_s:
+            return _timeout_batch_trace(request, submitted_at_s, completed_at_s, timeout_s)
+        actions, policy_timing = _extract_policy_result(result)
+        return _batch_result_traces(
+            request,
+            submitted_at_s=submitted_at_s,
+            completed_at_s=completed_at_s,
+            actions=actions,
+            policy_timing=policy_timing,
+        )
+    except TimeoutError as exc:
+        return _failed_batch_traces(request, submitted_at_s, start_s, "timeout", str(exc))
+    except Exception as exc:  # pragma: no cover - exact model failures are environment dependent.
+        return _failed_batch_traces(request, submitted_at_s, start_s, "error", repr(exc))
+
+
 async def _infer_policy(
     policy: Any,
     request: SyntheticRequest,
@@ -468,10 +695,29 @@ async def _infer_policy(
     return await loop.run_in_executor(executor, _call_policy_infer, policy, request)
 
 
+async def _infer_policy_batch(
+    policy: Any,
+    request: SyntheticBatchRequest,
+    *,
+    executor: ThreadPoolExecutor,
+) -> Any:
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(executor, _call_policy_infer_batch, policy, request)
+
+
 def _call_policy_infer(policy: Any, request: SyntheticRequest) -> Any:
     if request.noise is None:
         return policy.infer(request.observation)
     return policy.infer(request.observation, noise=request.noise)
+
+
+def _call_policy_infer_batch(policy: Any, request: SyntheticBatchRequest) -> Any:
+    infer_batch = getattr(policy, "infer_batch", None)
+    if not callable(infer_batch):
+        raise AttributeError("policy does not support infer_batch")
+    if request.noise is None:
+        return infer_batch(request.observation)
+    return infer_batch(request.observation, noise=request.noise)
 
 
 def _extract_policy_result(result: Any) -> tuple[Any | None, dict[str, float]]:
@@ -480,6 +726,38 @@ def _extract_policy_result(result: Any) -> tuple[Any | None, dict[str, float]]:
     actions = getattr(result, "actions", None)
     timing = getattr(result, "timing", None)
     return actions, dict(timing or {})
+
+
+def _batch_result_traces(
+    request: SyntheticBatchRequest,
+    *,
+    submitted_at_s: float,
+    completed_at_s: float,
+    actions: Any | None,
+    policy_timing: dict[str, float],
+) -> list[RequestTrace]:
+    actions_array = None if actions is None else np.asarray(actions)
+    traces = []
+    for row, request_id in enumerate(request.request_ids):
+        row_timing = dict(policy_timing)
+        row_timing.setdefault("effective_batch", float(len(request.request_ids)))
+        row_timing.setdefault("policy_effective_batch", float(len(request.request_ids)))
+        row_timing["batch_wait_ms"] = max(
+            0.0,
+            (request.scheduled_at_s - request.original_scheduled_at_s[row]) * 1000.0,
+        )
+        traces.append(
+            RequestTrace(
+                request_id=request_id,
+                scheduled_at_s=request.original_scheduled_at_s[row],
+                submitted_at_s=submitted_at_s,
+                completed_at_s=completed_at_s,
+                status="ok",
+                policy_timing=row_timing,
+                actions=None if actions_array is None else actions_array[row],
+            )
+        )
+    return traces
 
 
 def _failed_trace(
@@ -500,6 +778,28 @@ def _failed_trace(
     )
 
 
+def _failed_batch_traces(
+    request: SyntheticBatchRequest,
+    submitted_at_s: float,
+    start_s: float,
+    status: TraceStatus,
+    error: str,
+) -> list[RequestTrace]:
+    completed_at_s = time.monotonic() - start_s
+    return [
+        RequestTrace(
+            request_id=request_id,
+            scheduled_at_s=scheduled_at_s,
+            submitted_at_s=submitted_at_s,
+            completed_at_s=completed_at_s,
+            status=status,
+            policy_timing={},
+            error=error,
+        )
+        for request_id, scheduled_at_s in zip(request.request_ids, request.original_scheduled_at_s, strict=True)
+    ]
+
+
 def _timeout_trace(
     request: SyntheticRequest,
     submitted_at_s: float,
@@ -515,6 +815,26 @@ def _timeout_trace(
         policy_timing={},
         error=f"exceeded timeout_s={timeout_s}",
     )
+
+
+def _timeout_batch_trace(
+    request: SyntheticBatchRequest,
+    submitted_at_s: float,
+    completed_at_s: float,
+    timeout_s: float,
+) -> list[RequestTrace]:
+    return [
+        RequestTrace(
+            request_id=request_id,
+            scheduled_at_s=scheduled_at_s,
+            submitted_at_s=submitted_at_s,
+            completed_at_s=completed_at_s,
+            status="timeout",
+            policy_timing={},
+            error=f"exceeded timeout_s={timeout_s}",
+        )
+        for request_id, scheduled_at_s in zip(request.request_ids, request.original_scheduled_at_s, strict=True)
+    ]
 
 
 def _run_consistency_check(args: Args, requests: list[SyntheticRequest]) -> dict[str, Any]:
@@ -561,6 +881,12 @@ def _mean(values: list[float]) -> float | None:
     return float(np.mean(np.asarray(values, dtype=np.float64)))
 
 
+def _max(values: list[float]) -> float | None:
+    if not values:
+        return None
+    return float(np.max(np.asarray(values, dtype=np.float64)))
+
+
 def _timing_values(traces: list[RequestTrace], key: str) -> list[float]:
     values = []
     for trace in traces:
@@ -578,7 +904,55 @@ def _timing_mean(traces: list[RequestTrace], key: str) -> float | None:
     return _mean(_timing_values(traces, key))
 
 
-def _achieved_request_rate_hz(completed: list[RequestTrace]) -> float | None:
+def _effective_batch_values(traces: list[RequestTrace]) -> list[float]:
+    values = []
+    for trace in traces:
+        value = trace.policy_timing.get(
+            "ae_effective_batch",
+            trace.policy_timing.get("effective_batch", trace.policy_timing.get("policy_effective_batch", 1.0)),
+        )
+        if value is not None and math.isfinite(value):
+            values.append(float(value))
+    return values
+
+
+def _stack_observation_batch(observations: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    return _stack_tree(list(observations))
+
+
+def _stack_tree(values: list[Any]) -> Any:
+    first = values[0]
+    if isinstance(first, dict):
+        return {key: _stack_tree([value[key] for value in values]) for key in first}
+    if isinstance(first, str):
+        return list(values)
+    return np.asarray(values).copy()
+
+
+def _stack_noise_batch(noises: Sequence[np.ndarray | None]) -> np.ndarray | None:
+    if all(noise is None for noise in noises):
+        return None
+    if any(noise is None for noise in noises):
+        raise ValueError("Cannot batch a mix of fixed-noise and noise-free requests")
+    return np.asarray(noises).copy()
+
+
+def _slo_good_traces(completed: list[RequestTrace], *, slo_ms: float) -> list[RequestTrace]:
+    return [trace for trace in completed if (trace.completed_at_s - trace.scheduled_at_s) * 1000.0 <= slo_ms]
+
+
+def _rate_over_scheduled_span(count: int, traces: list[RequestTrace]) -> float | None:
+    if not traces:
+        return None
+    first_scheduled_at_s = min(trace.scheduled_at_s for trace in traces)
+    last_scheduled_at_s = max(trace.scheduled_at_s for trace in traces)
+    duration_s = last_scheduled_at_s - first_scheduled_at_s
+    if duration_s <= 0:
+        return None
+    return count / duration_s
+
+
+def _throughput_requests_per_second(completed: list[RequestTrace]) -> float | None:
     if not completed:
         return None
     first_submitted_at_s = min(trace.submitted_at_s for trace in completed)

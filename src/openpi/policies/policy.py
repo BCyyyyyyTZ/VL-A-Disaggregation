@@ -15,6 +15,7 @@ from typing_extensions import override
 
 from openpi import transforms as _transforms
 from openpi.models import model as _model
+from openpi.policies import batch_inference as _batch
 from openpi.shared import array_typing as at
 from openpi.shared import nnx_utils
 
@@ -102,6 +103,46 @@ class Policy(BasePolicy):
         outputs = self._output_transform(outputs)
         outputs["policy_timing"] = {
             "infer_ms": model_time * 1000,
+        }
+        return outputs
+
+    def infer_batch(self, obs_batch: dict, *, noise: np.ndarray | None = None) -> dict:
+        if not self._is_pytorch_model:
+            raise NotImplementedError("Policy.infer_batch currently supports PyTorch models only")
+
+        inputs = _batch.apply_input_transform_batch(
+            obs_batch,
+            self._input_transform,
+            kind="torch",
+            device=self._pytorch_device,
+        )
+        batch_size = int(inputs["state"].shape[0])
+
+        sample_kwargs = dict(self._sample_kwargs)
+        if noise is not None:
+            sample_kwargs["noise"] = _batch.prepare_batch_noise(
+                noise,
+                batch_size=batch_size,
+                kind="torch",
+                device=self._pytorch_device,
+            )
+
+        observation = _model.Observation.from_dict(inputs)
+        start_time = time.monotonic()
+        actions = self._sample_actions(self._pytorch_device, observation, **sample_kwargs)
+        model_time = time.monotonic() - start_time
+
+        outputs = _batch.apply_output_transform_batch(
+            {
+                "state": inputs["state"],
+                "actions": actions,
+            },
+            self._output_transform,
+        )
+        outputs["policy_timing"] = {
+            "infer_ms": model_time * 1000,
+            "effective_batch": batch_size,
+            "policy_effective_batch": batch_size,
         }
         return outputs
 

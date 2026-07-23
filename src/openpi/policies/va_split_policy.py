@@ -13,6 +13,7 @@ import torch
 from typing_extensions import override
 
 from openpi import transforms as _transforms
+from openpi.policies import batch_inference as _batch
 from openpi.policies import policy as _policy
 from openpi.serving.va_split.runtime import ProcessVASplitRuntime
 from openpi.serving.va_split.types import ActionResult
@@ -79,6 +80,48 @@ class VASplitPolicy(_policy.BasePolicy):
         }
         return outputs
 
+    def infer_batch(self, obs_batch: dict, *, noise: np.ndarray | None = None) -> dict:
+        inputs = _batch.apply_input_transform_batch(
+            obs_batch,
+            self._input_transform,
+            kind="torch",
+        )
+        batch_size = int(inputs["state"].shape[0])
+
+        sample_kwargs = dict(self._sample_kwargs)
+        if noise is not None:
+            sample_kwargs["noise"] = _batch.prepare_batch_noise(
+                noise,
+                batch_size=batch_size,
+                kind="torch",
+            )
+
+        start_time = time.monotonic()
+        runtime_result = self._runtime.infer_batch(inputs, sample_kwargs)
+        infer_ms = (time.monotonic() - start_time) * 1000
+
+        if isinstance(runtime_result, ActionResult):
+            actions = runtime_result.actions
+            runtime_timing = dict(runtime_result.timing or {})
+        else:
+            actions = runtime_result
+            runtime_timing = {}
+
+        outputs = _batch.apply_output_transform_batch(
+            {
+                "state": inputs["state"],
+                "actions": actions,
+            },
+            self._output_transform,
+        )
+        outputs["policy_timing"] = {
+            "infer_ms": infer_ms,
+            "effective_batch": batch_size,
+            "policy_effective_batch": batch_size,
+            **runtime_timing,
+        }
+        return outputs
+
     @property
     def metadata(self) -> dict[str, Any]:
         return self._metadata
@@ -99,6 +142,10 @@ class VASplitPolicy(_policy.BasePolicy):
 def _load_pytorch_model(train_config: _config.TrainConfig, weight_path: str):
     model = train_config.model.load_pytorch(train_config, weight_path)
     model.paligemma_with_expert.to_bfloat16_for_selected_params("bfloat16")
+    compile_mode = train_config.model.pytorch_compile_mode
+    if compile_mode is not None:
+        model.build_prefix_feature = torch.compile(model.build_prefix_feature, mode=compile_mode, dynamic=True)
+        model.denoise_one_batch = torch.compile(model.denoise_one_batch, mode=compile_mode, dynamic=True)
     return model
 
 
@@ -118,8 +165,11 @@ def create_trained_va_split_policy(
     norm_stats: dict[str, _transforms.NormStats] | None = None,
     pytorch_device: str | None = None,
     max_ae_batch_size: int = 8,
+    max_vlm_batch_size: int = 8,
+    max_vlm_wait_ms: float = 2.0,
     ae_sm_percent: int = 20,
     vlm_sm_percent: int = 0,
+    result_timeout_s: float = 120.0,
 ) -> VASplitPolicy:
     """Create a PyTorch VA split policy from a trained checkpoint."""
     repack_transforms = repack_transforms or _transforms.Group()
@@ -141,6 +191,9 @@ def create_trained_va_split_policy(
         model_factory=functools.partial(_load_pytorch_model, train_config, weight_path),
         device=pytorch_device,
         max_ae_batch_size=max_ae_batch_size,
+        max_vlm_batch_size=max_vlm_batch_size,
+        max_vlm_wait_ms=max_vlm_wait_ms,
+        result_timeout_s=result_timeout_s,
         vlm_env_updates=_mps_env_updates(vlm_sm_percent),
         ae_env_updates=_mps_env_updates(ae_sm_percent),
     )
