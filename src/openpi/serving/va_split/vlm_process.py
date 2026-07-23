@@ -160,6 +160,7 @@ class VLMProcess:
     def run(self) -> None:
         while True:
             self._drain_releases()
+            self._prefetch_request_backlog(max_messages=self._max_batch_size)
             try:
                 message = self._next_request_message(timeout=0.01)
             except queue.Empty:
@@ -221,6 +222,7 @@ class VLMProcess:
         requests = [first_request]
         compatibility_key = _request_compatibility_key(first_request)
         shutdown_after_batch = False
+        self._prefetch_request_backlog(max_messages=self._max_batch_size - len(requests))
         deadline_ns = time.monotonic_ns() + int(self._max_wait_ms * 1_000_000)
 
         while len(requests) < self._max_batch_size:
@@ -240,6 +242,13 @@ class VLMProcess:
             requests.append(message)
 
         return requests, shutdown_after_batch
+
+    def _prefetch_request_backlog(self, *, max_messages: int) -> None:
+        for _ in range(max(0, max_messages)):
+            try:
+                self._backlog.append(_mark_dequeued_message(self._request_queue.get_nowait()))
+            except queue.Empty:
+                return
 
     def _next_fcfs_candidate(self, deadline_ns: int) -> Any:
         if self._max_wait_ms == 0:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import queue
+import time
 
 import torch
 
@@ -63,6 +64,17 @@ class SimpleQueue:
 
     def put(self, item):
         self.items.append(item)
+
+
+class SlowBlockingGetQueue(SimpleQueue):
+    def __init__(self, messages=(), *, get_delay_s: float):
+        super().__init__(messages)
+        self._get_delay_s = get_delay_s
+
+    def get(self, timeout=None):
+        del timeout
+        time.sleep(self._get_delay_s)
+        return super().get_nowait()
 
 
 def _request(request_id: str, *, prompt_len: int = 8, image_size: int = 224) -> RequestEnvelope:
@@ -145,6 +157,32 @@ def test_vlm_process_fcfs_collector_batches_compatible_ready_requests():
         release_queue=SimpleQueue(),
         max_batch_size=4,
         max_wait_ms=0.0,
+    )
+
+    process.run()
+
+    ready = prefix_queue.items[:-1]
+    assert model.batch_sizes == [4, 1]
+    assert [message.request_id for message in ready] == [f"req-{idx}" for idx in range(5)]
+    assert [message.timing["vlm_effective_batch"] for message in ready] == [4.0, 4.0, 4.0, 4.0, 1.0]
+    assert isinstance(prefix_queue.items[-1], Shutdown)
+
+
+def test_vlm_process_prefetches_ready_queue_before_fcfs_wait_window():
+    model = FakeVLMModel()
+    request_queue = SlowBlockingGetQueue(
+        [*[_request(f"req-{idx}") for idx in range(5)], Shutdown()],
+        get_delay_s=0.003,
+    )
+    prefix_queue = SimpleQueue()
+    process = VLMProcess(
+        model=model,
+        device="cpu",
+        request_queue=request_queue,
+        prefix_queue=prefix_queue,
+        release_queue=SimpleQueue(),
+        max_batch_size=4,
+        max_wait_ms=1.0,
     )
 
     process.run()
