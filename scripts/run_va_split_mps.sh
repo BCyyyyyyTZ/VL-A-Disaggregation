@@ -115,17 +115,50 @@ else
 fi
 export PYTHONPATH="${REPO_ROOT}/src:${REPO_ROOT}/packages/openpi-client/src${PYTHONPATH:+:${PYTHONPATH}}"
 
+cleanup_mps_pipe_dir() {
+  local pipe_dir="$1"
+  # Stale control sockets after quit can block a later MPS start on the same GPU.
+  rm -f \
+    "${pipe_dir}/control" \
+    "${pipe_dir}/control_privileged" \
+    "${pipe_dir}/control_lock" \
+    "${pipe_dir}/log" \
+    "${pipe_dir}/nvidia-cuda-mps-control.pid" \
+    2>/dev/null || true
+}
+
 cleanup() {
   if [[ "${MPS_STARTED}" -eq 1 ]]; then
     # Ensure quit talks to this run's MPS daemon.
     export CUDA_MPS_PIPE_DIRECTORY="${MPS_PIPE_DIR}"
     echo quit | nvidia-cuda-mps-control >/dev/null 2>&1 || true
+    cleanup_mps_pipe_dir "${MPS_PIPE_DIR}"
   fi
 }
 trap cleanup EXIT
 
 if [[ "${NEEDS_MPS}" -eq 1 ]]; then
-  nvidia-cuda-mps-control -d
+  cleanup_mps_pipe_dir "${MPS_PIPE_DIR}"
+  # -d can return non-zero even after the daemon has started; do not
+  # delete sockets and retry blindly (that races the live daemon).
+  nvidia-cuda-mps-control -d || true
+  mps_ready=0
+  # Wait up to ~10s; daemon sometimes needs a few seconds after -d.
+  for _ in $(seq 1 50); do
+    if [[ -S "${MPS_PIPE_DIR}/control" ]]; then
+      mps_ready=1
+      break
+    fi
+    sleep 0.2
+  done
+  if [[ "${mps_ready}" -ne 1 ]]; then
+    echo "Failed to start MPS control daemon (missing ${MPS_PIPE_DIR}/control)" >&2
+    echo "--- control.log ---" >&2
+    cat "${MPS_LOG_DIR}/control.log" >&2 || true
+    echo "--- pipe dir ---" >&2
+    ls -la "${MPS_PIPE_DIR}" >&2 || true
+    exit 1
+  fi
   MPS_STARTED=1
 fi
 

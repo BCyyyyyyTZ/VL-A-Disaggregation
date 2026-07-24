@@ -20,11 +20,18 @@ def build_mps_process_envs(
         "CUDA_MPS_LOG_DIRECTORY": mps_log_dir,
     }
 
+    # sm_percent=0 means "no extra MPS SM quota limit" (omit/clear the env var),
+    # not "0% active threads". Clear inherited values too.
     ae_env = base_env | common_env
-    ae_env["CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"] = str(ae_sm_percent)
+    if ae_sm_percent != 0:
+        ae_env["CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"] = str(ae_sm_percent)
+    else:
+        ae_env.pop("CUDA_MPS_ACTIVE_THREAD_PERCENTAGE", None)
 
     vlm_env = base_env | common_env
     if vlm_sm_percent != 0:
         vlm_env["CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"] = str(vlm_sm_percent)
+    else:
+        vlm_env.pop("CUDA_MPS_ACTIVE_THREAD_PERCENTAGE", None)
 
     return ae_env, vlm_env

@@ -57,3 +57,19 @@ def test_build_mps_process_envs_omits_vlm_active_thread_percentage_when_zero():
     assert vlm_env["CUDA_VISIBLE_DEVICES"] == "2,3"
     assert ae_env["CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"] == "100"
     assert "CUDA_MPS_ACTIVE_THREAD_PERCENTAGE" not in vlm_env
+
+
+def test_build_mps_process_envs_omits_ae_active_thread_percentage_when_zero():
+    launcher = _load_launcher_module()
+
+    with mock.patch.dict(os.environ, {"CUDA_MPS_ACTIVE_THREAD_PERCENTAGE": "20"}, clear=True):
+        ae_env, vlm_env = launcher.build_mps_process_envs(
+            cuda_visible_devices="0",
+            mps_pipe_dir="/tmp/pipe",
+            mps_log_dir="/tmp/log",
+            ae_sm_percent=0,
+            vlm_sm_percent=0,
+        )
+
+    assert "CUDA_MPS_ACTIVE_THREAD_PERCENTAGE" not in ae_env
+    assert "CUDA_MPS_ACTIVE_THREAD_PERCENTAGE" not in vlm_env
