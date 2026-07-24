@@ -3,6 +3,7 @@ from __future__ import annotations
 import queue
 import time
 
+import pytest
 import torch
 
 from openpi.models_pytorch.pi0_split_types import PrefixFeature
@@ -86,6 +87,42 @@ def _request(request_id: str, *, prompt_len: int = 8, image_size: int = 224) -> 
     )
 
 
+def test_vlm_process_splits_request_queue_wait_and_transfer():
+    class OnlyBlockingGetQueue(SimpleQueue):
+        def get(self, timeout=None):
+            del timeout
+            time.sleep(0.01)
+            return super().get_nowait()
+
+        def get_nowait(self):
+            raise queue.Empty
+
+    request = RequestEnvelope(
+        request_id="req-1",
+        observation=_request_observation(),
+        sample_kwargs={"num_steps": 1},
+        enqueue_ns=time.monotonic_ns() - 5_000_000,
+    )
+    request_queue = OnlyBlockingGetQueue([request, Shutdown()])
+    prefix_queue = SimpleQueue()
+    process = VLMProcess(
+        model=FakeVLMModel(),
+        device="cpu",
+        request_queue=request_queue,
+        prefix_queue=prefix_queue,
+        release_queue=SimpleQueue(),
+        max_batch_size=1,
+        max_wait_ms=0.0,
+    )
+
+    process.run()
+
+    ready = next(item for item in prefix_queue.items if hasattr(item, "timing"))
+    assert ready.timing["vlm_request_queue_wait_ms"] >= 4.0
+    assert ready.timing["vlm_request_transfer_ms"] >= 8.0
+    assert ready.timing["vlm_request_transfer_ms"] <= 50.0
+
+
 def test_vlm_worker_publishes_prefix_and_releases_live_feature():
     worker = VLMWorker(model=FakeVLMModel(), device="cpu")
     request = RequestEnvelope(
@@ -93,6 +130,7 @@ def test_vlm_worker_publishes_prefix_and_releases_live_feature():
         observation=_request_observation(),
         sample_kwargs={"num_steps": 4},
         enqueue_ns=1_000_000,
+        dequeue_start_ns=2_500_000,
         dequeue_ns=3_000_000,
     )
 
@@ -103,7 +141,9 @@ def test_vlm_worker_publishes_prefix_and_releases_live_feature():
     assert ready.sample_kwargs == {"num_steps": 4}
     assert ready.timing is not None
     assert ready.timing["vlm_prefix_forward_ms"] >= 0.0
-    assert ready.timing["vlm_request_transfer_ms"] == 2.0
+    assert ready.timing["vlm_request_queue_wait_ms"] == 1.5
+    assert ready.timing["vlm_request_transfer_ms"] == 0.5
+    assert ready.timing["vlm_queue_wait_ms"] >= 0.0
     assert "req-1" in worker.live_features
     torch.testing.assert_close(ready.feature.prefix_pad_masks, torch.ones(1, 3, dtype=torch.bool))
 
@@ -143,6 +183,20 @@ def test_vlm_worker_handle_batch_builds_prefix_once_and_releases_by_refcount():
 
     assert worker.live_features == {}
     assert worker.live_batches == {}
+
+
+def test_vlm_worker_enforces_live_feature_capacity_until_release():
+    worker = VLMWorker(model=FakeVLMModel(), device="cpu", max_live_features=1)
+
+    worker.handle_request(_request("req-1"))
+
+    with pytest.raises(RuntimeError, match="VLM live prefix feature slots are full"):
+        worker.handle_request(_request("req-2"))
+
+    worker.release(ReleaseFeature(request_id="req-1", slot_id=-1))
+    ready = worker.handle_request(_request("req-2"))
+
+    assert ready.request_id == "req-2"
 
 
 def test_vlm_process_fcfs_collector_batches_compatible_ready_requests():

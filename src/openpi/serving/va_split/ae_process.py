@@ -1,17 +1,20 @@
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
+from dataclasses import replace
 import queue
 import time
 import traceback
 from typing import Any
 
 import torch
-from transformers.cache_utils import DynamicCache
 
 from openpi.models_pytorch.pi0_split_types import DenoiseState
-from openpi.models_pytorch.pi0_split_types import PrefixFeature
+from openpi.serving.va_split.prefix_cache_pool import PrefixCacheLanePool
+from openpi.serving.va_split.timing import queue_wait_and_transfer_ms
 from openpi.serving.va_split.timing import synchronize_cuda_if_needed
+from openpi.serving.va_split.timing import timed_queue_get
 from openpi.serving.va_split.types import ActionResult
 from openpi.serving.va_split.types import PrefixReady
 from openpi.serving.va_split.types import ReleaseFeature
@@ -22,7 +25,8 @@ from openpi.serving.va_split.types import WorkerError
 @dataclass
 class AERequestState:
     request_id: str
-    feature: PrefixFeature
+    lane_id: int
+    source_slot_id: int
     x_t: torch.Tensor
     step_idx: int
     num_steps: int
@@ -31,66 +35,71 @@ class AERequestState:
     timing: dict[str, float]
     ae_step_ms: list[float]
     ae_batch_sizes: list[int]
-
-
-def _cat_tree(values: list[Any]) -> Any:
-    first = values[0]
-    if isinstance(first, DynamicCache):
-        batched_cache = DynamicCache()
-        for layer_idx in range(len(first)):
-            keys = []
-            values_ = []
-            for cache in values:
-                key, value = cache[layer_idx]
-                keys.append(key)
-                values_.append(value)
-            batched_cache.update(torch.cat(keys, dim=0), torch.cat(values_, dim=0), layer_idx=layer_idx)
-        return batched_cache
-    if torch.is_tensor(first):
-        return torch.cat(values, dim=0)
-    if isinstance(first, tuple):
-        return tuple(_cat_tree([value[index] for value in values]) for index in range(len(first)))
-    if isinstance(first, list):
-        return [_cat_tree([value[index] for value in values]) for index in range(len(first))]
-    return first
-
-
-def _batch_prefix_features(features: list[PrefixFeature]) -> PrefixFeature:
-    # Basic tensor-sharing path: assemble per-request caches for each AE step.
-    # The slab/lane-pool version should replace this with dense views.
-    state = None
-    if all(feature.state is not None for feature in features):
-        state = torch.cat([feature.state for feature in features if feature.state is not None], dim=0)
-    return PrefixFeature(
-        past_key_values=_cat_tree([feature.past_key_values for feature in features]),
-        prefix_pad_masks=torch.cat([feature.prefix_pad_masks for feature in features], dim=0),
-        state=state,
-    )
+    lane_compact_ms: float = 0.0
 
 
 class AEWorker:
     """Runs step-level continuous batching over active AE requests."""
 
-    def __init__(self, model: Any, device: str, max_batch_size: int):
+    def __init__(self, model: Any, device: str, max_batch_size: int, max_prefix_slots: int | None = None):
+        if max_batch_size <= 0:
+            raise ValueError("max_batch_size must be positive")
+        if max_prefix_slots is None:
+            max_prefix_slots = max_batch_size
+        if max_prefix_slots <= 0:
+            raise ValueError("max_prefix_slots must be positive")
         self._model = model
         self._device = device
         self._max_batch_size = max_batch_size
+        self._max_prefix_slots = max_prefix_slots
+        self._prefix_lanes = PrefixCacheLanePool(max_lanes=max_prefix_slots)
+        self._lanes: list[AERequestState | None] = [None for _ in range(max_prefix_slots)]
+        self._active_count = 0
         self.active: dict[str, AERequestState] = {}
 
+    @property
+    def can_accept_prefix(self) -> bool:
+        return self._active_count < self._max_prefix_slots
+
     def add_prefix(self, ready: PrefixReady) -> None:
+        if self._active_count >= self._max_prefix_slots:
+            raise RuntimeError(f"AE prefix lane pool is full ({self._max_prefix_slots} active requests)")
         sample_kwargs = dict(ready.sample_kwargs)
         noise = sample_kwargs.get("noise")
         if torch.is_tensor(noise):
             noise = noise.to(self._device)
         timing = dict(ready.timing or {})
         prefix_enqueue_ns = timing.pop("_prefix_enqueue_ns", None)
-        if prefix_enqueue_ns is not None:
-            timing["prefix_transfer_ms"] = max(0.0, (time.monotonic_ns() - float(prefix_enqueue_ns)) / 1_000_000)
+        prefix_get_start_ns = timing.pop("_prefix_get_start_ns", None)
+        prefix_get_end_ns = timing.pop("_prefix_get_end_ns", None)
+        queue_wait_ms, transfer_ms = queue_wait_and_transfer_ms(
+            enqueue_ns=prefix_enqueue_ns,
+            get_start_ns=prefix_get_start_ns,
+            get_end_ns=prefix_get_end_ns,
+        )
+        timing["prefix_queue_wait_ms"] = queue_wait_ms
+        timing["prefix_transfer_ms"] = transfer_ms
+        if prefix_get_end_ns is not None:
+            timing["prefix_admit_wait_ms"] = max(0.0, (time.monotonic_ns() - float(prefix_get_end_ns)) / 1_000_000)
+        elif prefix_enqueue_ns is not None:
+            # Legacy path: no get split available; keep old single-gap accounting as queue wait.
+            timing["prefix_admit_wait_ms"] = 0.0
+            timing["prefix_queue_wait_ms"] = max(0.0, (time.monotonic_ns() - float(prefix_enqueue_ns)) / 1_000_000)
+            timing["prefix_transfer_ms"] = 0.0
+        else:
+            timing["prefix_admit_wait_ms"] = 0.0
         batch_size = ready.feature.prefix_pad_masks.shape[0]
         denoise_state = self._model.init_denoise_state(self._device, batch_size, noise, ready.num_steps)
-        self.active[ready.request_id] = AERequestState(
+        lane_id = self._active_count
+        synchronize_cuda_if_needed(self._device)
+        ingest_start_ns = time.monotonic_ns()
+        self._prefix_lanes.put_lane(lane_id, ready.feature)
+        synchronize_cuda_if_needed(self._device)
+        timing["prefix_lane_ingest_ms"] = (time.monotonic_ns() - ingest_start_ns) / 1_000_000
+        state = AERequestState(
             request_id=ready.request_id,
-            feature=ready.feature,
+            lane_id=lane_id,
+            source_slot_id=ready.slot_id,
             x_t=denoise_state.x_t,
             step_idx=int(denoise_state.step_idx.item()),
             num_steps=ready.num_steps,
@@ -100,13 +109,18 @@ class AEWorker:
             ae_step_ms=[],
             ae_batch_sizes=[],
         )
+        self.active[ready.request_id] = state
+        self._lanes[lane_id] = state
+        self._active_count += 1
 
     def select_ready_lanes(self) -> list[AERequestState]:
-        ordered = sorted(self.active.values(), key=lambda req: (req.step_idx, req.started_ns))
-        if not ordered:
+        if self._active_count == 0:
             return []
-        first_num_steps = ordered[0].num_steps
-        return [request for request in ordered if request.num_steps == first_num_steps][: self._max_batch_size]
+        batch_size = min(self._active_count, self._max_batch_size)
+        lanes = self._lanes[:batch_size]
+        if any(lane is None for lane in lanes):
+            raise RuntimeError("AE lane table is not dense")
+        return [lane for lane in lanes if lane is not None]
 
     def step_once(self) -> tuple[list[ActionResult], list[ReleaseFeature]]:
         batch = self.select_ready_lanes()
@@ -115,7 +129,7 @@ class AEWorker:
 
         synchronize_cuda_if_needed(self._device)
         step_start_ns = time.monotonic_ns()
-        prefix_batch = _batch_prefix_features([request.feature for request in batch])
+        prefix_batch = self._prefix_lanes.view_prefix_batch(len(batch))
         x_t = torch.cat([request.x_t for request in batch], dim=0)
         step_idx = torch.tensor([request.step_idx for request in batch], device=self._device, dtype=torch.int32)
         dt = torch.stack([request.dt.to(self._device) for request in batch])
@@ -141,9 +155,42 @@ class AEWorker:
                         timing=_finish_timing(request),
                     )
                 )
-                releases.append(ReleaseFeature(request_id=request.request_id, slot_id=-1))
-                del self.active[request.request_id]
+                releases.append(ReleaseFeature(request_id=request.request_id, slot_id=request.source_slot_id))
+        for lane_id in sorted(
+            (request.lane_id for request in batch if request.step_idx == request.num_steps), reverse=True
+        ):
+            self._remove_lane(lane_id)
         return results, releases
+
+    def _remove_lane(self, lane_id: int) -> None:
+        request = self._lanes[lane_id]
+        if request is None:
+            raise RuntimeError(f"Cannot remove empty AE lane {lane_id}")
+        del self.active[request.request_id]
+        last_lane = self._active_count - 1
+        if lane_id != last_lane:
+            moved = self._lanes[last_lane]
+            if moved is None:
+                raise RuntimeError(f"Cannot compact empty AE lane {last_lane}")
+            synchronize_cuda_if_needed(self._device)
+            compact_start_ns = time.monotonic_ns()
+            self._prefix_lanes.move_lane(last_lane, lane_id)
+            synchronize_cuda_if_needed(self._device)
+            moved.lane_compact_ms += (time.monotonic_ns() - compact_start_ns) / 1_000_000
+            moved.lane_id = lane_id
+            self._lanes[lane_id] = moved
+        self._lanes[last_lane] = None
+        self._active_count -= 1
+
+    def clear_active(self) -> list[ReleaseFeature]:
+        releases = [
+            ReleaseFeature(request_id=request_id, slot_id=request.source_slot_id)
+            for request_id, request in self.active.items()
+        ]
+        self.active.clear()
+        self._lanes = [None for _ in range(self._max_prefix_slots)]
+        self._active_count = 0
+        return releases
 
 
 class AEProcess:
@@ -158,11 +205,18 @@ class AEProcess:
         result_queue,
         release_queue,
         max_batch_size: int,
+        max_prefix_slots: int | None = None,
     ):
-        self.worker = AEWorker(model=model, device=device, max_batch_size=max_batch_size)
+        self.worker = AEWorker(
+            model=model,
+            device=device,
+            max_batch_size=max_batch_size,
+            max_prefix_slots=max_prefix_slots,
+        )
         self._prefix_queue = prefix_queue
         self._result_queue = result_queue
         self._release_queue = release_queue
+        self._prefix_backlog: deque[object] = deque()
 
     def run(self) -> None:
         while True:
@@ -188,7 +242,7 @@ class AEProcess:
     def drain_prefix_ready(self, *, block: bool) -> None:
         while True:
             try:
-                message = self._prefix_queue.get() if block else self._prefix_queue.get_nowait()
+                message = self._next_prefix_message(block=block)
             except queue.Empty:
                 return
             if isinstance(message, Shutdown):
@@ -200,6 +254,9 @@ class AEProcess:
             if not isinstance(message, PrefixReady):
                 self._result_queue.put(WorkerError(request_id=None, error=f"Unexpected AE message: {type(message)}"))
                 continue
+            if not self.worker.can_accept_prefix:
+                self._prefix_backlog.appendleft(message)
+                return
             try:
                 self.worker.add_prefix(message)
             except Exception as exc:  # pragma: no cover - exercised through integration/runtime failures.
@@ -213,12 +270,33 @@ class AEProcess:
                 self._release_queue.put(ReleaseFeature(request_id=message.request_id, slot_id=message.slot_id))
             if block:
                 block = False
+            if not self.worker.can_accept_prefix:
+                return
+
+    def _next_prefix_message(self, *, block: bool) -> object:
+        if self._prefix_backlog:
+            return self._prefix_backlog.popleft()
+        if not block and not self.worker.can_accept_prefix:
+            raise queue.Empty
+        message, get_start_ns, get_end_ns = timed_queue_get(self._prefix_queue, block=block)
+        return _stamp_prefix_get_timing(message, get_start_ns=get_start_ns, get_end_ns=get_end_ns)
 
     def _fail_active_requests(self, *, error: str, traceback_text: str) -> None:
-        for request_id in list(self.worker.active):
+        request_ids = list(self.worker.active)
+        releases = self.worker.clear_active()
+        for request_id in request_ids:
             self._result_queue.put(WorkerError(request_id=request_id, error=error, traceback=traceback_text))
-            self._release_queue.put(ReleaseFeature(request_id=request_id, slot_id=-1))
-            del self.worker.active[request_id]
+        for release in releases:
+            self._release_queue.put(release)
+
+
+def _stamp_prefix_get_timing(message: object, *, get_start_ns: int, get_end_ns: int) -> object:
+    if not isinstance(message, PrefixReady):
+        return message
+    timing = dict(message.timing or {})
+    timing["_prefix_get_start_ns"] = float(get_start_ns)
+    timing["_prefix_get_end_ns"] = float(get_end_ns)
+    return replace(message, timing=timing)
 
 
 def _finish_timing(request: AERequestState) -> dict[str, float]:
@@ -228,4 +306,8 @@ def _finish_timing(request: AERequestState) -> dict[str, float]:
         timing["ae_step_total_ms"] = sum(request.ae_step_ms)
     if request.ae_batch_sizes:
         timing["ae_effective_batch"] = sum(request.ae_batch_sizes) / len(request.ae_batch_sizes)
+    ingest_ms = float(timing.get("prefix_lane_ingest_ms", 0.0))
+    compact_ms = float(request.lane_compact_ms)
+    timing["prefix_lane_compact_ms"] = compact_ms
+    timing["prefix_lane_overhead_ms"] = ingest_ms + compact_ms
     return timing

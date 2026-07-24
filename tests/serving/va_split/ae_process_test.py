@@ -5,6 +5,7 @@ import queue
 import time
 from types import SimpleNamespace
 
+import pytest
 import torch
 from transformers.cache_utils import DynamicCache
 
@@ -77,6 +78,9 @@ class SimpleQueue:
     def put(self, item):
         self.items.append(item)
 
+    def remaining(self):
+        return list(self._messages)
+
 
 def _ready(request_id: str, *, num_steps: int = 1) -> PrefixReady:
     return PrefixReady(
@@ -131,26 +135,86 @@ def test_ae_worker_batches_two_ready_requests_for_one_denoise_step():
     assert worker.active == {}
 
 
-def test_ae_process_records_prefix_transfer_latency():
-    prefix_ready = _ready("req-1")
+def test_ae_worker_splits_prefix_queue_wait_transfer_and_admit():
+    worker = AEWorker(model=FakeAEModel(), device="cpu", max_batch_size=1)
+    get_end_ns = time.monotonic_ns() - 2_000_000
     prefix_ready = dataclasses.replace(
-        prefix_ready,
-        timing={**(prefix_ready.timing or {}), "_prefix_enqueue_ns": time.monotonic_ns() - 1_000_000},
+        _ready("req-1"),
+        timing={
+            "vlm_prefix_forward_ms": 1.5,
+            "_prefix_enqueue_ns": float(get_end_ns - 5_000_000),
+            "_prefix_get_start_ns": float(get_end_ns - 1_000_000),
+            "_prefix_get_end_ns": float(get_end_ns),
+        },
     )
+    time.sleep(0.005)
+    worker.add_prefix(prefix_ready)
+
+    timing = worker.active["req-1"].timing
+    assert timing["prefix_queue_wait_ms"] == pytest.approx(4.0, abs=0.1)
+    assert timing["prefix_transfer_ms"] == pytest.approx(1.0, abs=0.1)
+    assert timing["prefix_admit_wait_ms"] >= 4.0
+    assert timing["prefix_lane_ingest_ms"] >= 0.0
+    assert "_prefix_enqueue_ns" not in timing
+    assert "_prefix_get_start_ns" not in timing
+    assert "_prefix_get_end_ns" not in timing
+
+
+def test_ae_worker_records_lane_ingest_and_compact_overhead():
+    model = FakeAEModel()
+    worker = AEWorker(model=model, device="cpu", max_batch_size=2)
+    worker.add_prefix(_dynamic_cache_ready("req-1", 1.0))
+    worker.add_prefix(_dynamic_cache_ready("req-2", 2.0))
+    # Force req-1 to finish first so req-2 must compact into lane 0.
+    worker.active["req-1"].num_steps = 1
+    worker.active["req-2"].num_steps = 2
+
+    first_results, _ = worker.step_once()
+    assert [result.request_id for result in first_results] == ["req-1"]
+    assert first_results[0].timing is not None
+    assert first_results[0].timing["prefix_lane_ingest_ms"] >= 0.0
+    assert first_results[0].timing["prefix_lane_compact_ms"] == 0.0
+    assert first_results[0].timing["prefix_lane_overhead_ms"] == first_results[0].timing["prefix_lane_ingest_ms"]
+    assert worker.active["req-2"].lane_id == 0
+    assert worker.active["req-2"].lane_compact_ms >= 0.0
+
+    second_results, _ = worker.step_once()
+    assert [result.request_id for result in second_results] == ["req-2"]
+    assert second_results[0].timing is not None
+    assert second_results[0].timing["prefix_lane_ingest_ms"] >= 0.0
+    assert second_results[0].timing["prefix_lane_compact_ms"] >= 0.0
+    assert second_results[0].timing["prefix_lane_overhead_ms"] == (
+        second_results[0].timing["prefix_lane_ingest_ms"] + second_results[0].timing["prefix_lane_compact_ms"]
+    )
+
+
+def test_ae_process_waits_for_free_prefix_lane_before_draining_more_ready_messages():
+    prefix_queue = SimpleQueue([_ready("req-1", num_steps=2), _ready("req-2", num_steps=1)])
     process = AEProcess(
         model=FakeAEModel(),
         device="cpu",
-        prefix_queue=SimpleQueue([prefix_ready]),
+        prefix_queue=prefix_queue,
         result_queue=SimpleQueue(),
         release_queue=SimpleQueue(),
         max_batch_size=1,
+        max_prefix_slots=1,
     )
 
     process.drain_prefix_ready(block=True)
 
-    request_state = process.worker.active["req-1"]
-    assert request_state.timing["prefix_transfer_ms"] >= 0.0
-    assert "_prefix_enqueue_ns" not in request_state.timing
+    assert list(process.worker.active) == ["req-1"]
+    assert [message.request_id for message in prefix_queue.remaining()] == ["req-2"]
+
+    process.step_active_once()
+    process.drain_prefix_ready(block=False)
+
+    assert list(process.worker.active) == ["req-1"]
+    assert [message.request_id for message in prefix_queue.remaining()] == ["req-2"]
+
+    process.step_active_once()
+    process.drain_prefix_ready(block=True)
+
+    assert list(process.worker.active) == ["req-2"]
 
 
 def test_ae_worker_batches_huggingface_dynamic_cache_by_batch_dimension():
@@ -165,7 +229,7 @@ def test_ae_worker_batches_huggingface_dynamic_cache_by_batch_dimension():
     assert [release.request_id for release in releases] == ["req-1", "req-2"]
 
 
-def test_ae_worker_does_not_batch_requests_with_different_num_steps():
+def test_ae_worker_batches_mixed_num_steps_and_compacts_finished_lane():
     model = FakeAEModel()
     worker = AEWorker(model=model, device="cpu", max_batch_size=2)
     worker.add_prefix(_ready("req-1", num_steps=1))
@@ -173,10 +237,18 @@ def test_ae_worker_does_not_batch_requests_with_different_num_steps():
 
     results, releases = worker.step_once()
 
-    assert model.batch_sizes == [1]
+    assert model.batch_sizes == [2]
     assert [result.request_id for result in results] == ["req-1"]
     assert [release.request_id for release in releases] == ["req-1"]
     assert list(worker.active) == ["req-2"]
+    assert worker.active["req-2"].lane_id == 0
+
+    results, releases = worker.step_once()
+
+    assert model.batch_sizes == [2, 1]
+    assert [result.request_id for result in results] == ["req-2"]
+    assert [release.request_id for release in releases] == ["req-2"]
+    assert worker.active == {}
 
 
 def test_ae_process_releases_feature_when_add_prefix_fails():

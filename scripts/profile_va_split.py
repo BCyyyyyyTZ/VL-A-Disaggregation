@@ -238,11 +238,13 @@ async def run_benchmark_requests(
                 done, pending = await _wait_for_completed_requests(pending)
                 traces.extend(task.result() for task in done)
             submitted_abs_s = time.monotonic()
+            submitted_ns = time.monotonic_ns()
             task = asyncio.create_task(
                 _run_one_request(
                     policy,
                     request,
                     submitted_at_s=submitted_abs_s - start_s,
+                    submitted_ns=submitted_ns,
                     timeout_s=timeout_s,
                     start_s=start_s,
                     executor=executor,
@@ -290,11 +292,13 @@ async def run_benchmark_batch_requests(
                 for task in done:
                     traces.extend(task.result())
             submitted_abs_s = time.monotonic()
+            submitted_ns = time.monotonic_ns()
             task = asyncio.create_task(
                 _run_one_batch_request(
                     policy,
                     request,
                     submitted_at_s=submitted_abs_s - start_s,
+                    submitted_ns=submitted_ns,
                     timeout_s=timeout_s,
                     start_s=start_s,
                     executor=executor,
@@ -381,6 +385,7 @@ async def run_benchmark_runtime_batch_requests(
             return batch
 
         def start_batch(batch: list[SyntheticRequest]) -> tuple[asyncio.Task[list[RequestTrace]], int]:
+            submitted_ns = time.monotonic_ns()
             submitted_at_s = time.monotonic() - start_s
             batch_request = SyntheticBatchRequest(
                 request_ids=tuple(request.request_id for request in batch),
@@ -395,6 +400,7 @@ async def run_benchmark_runtime_batch_requests(
                         policy,
                         batch_request,
                         submitted_at_s=submitted_at_s,
+                        submitted_ns=submitted_ns,
                         timeout_s=timeout_s,
                         start_s=start_s,
                         executor=executor,
@@ -489,18 +495,48 @@ def summarize_traces(
         "baseline_ae_step_latency_p95_ms": _timing_percentile(completed, "baseline_ae_step_ms", 95),
         "baseline_ae_steps_mean": _timing_mean(completed, "baseline_ae_steps"),
         "baseline_effective_batch_mean": _timing_mean(completed, "baseline_effective_batch"),
+        "infer_queue_wait_mean_ms": _timing_mean(completed, "infer_queue_wait_ms"),
+        "infer_queue_wait_p50_ms": _timing_percentile(completed, "infer_queue_wait_ms", 50),
+        "infer_queue_wait_p95_ms": _timing_percentile(completed, "infer_queue_wait_ms", 95),
+        "vlm_request_queue_wait_mean_ms": _timing_mean(completed, "vlm_request_queue_wait_ms"),
+        "vlm_request_queue_wait_p50_ms": _timing_percentile(completed, "vlm_request_queue_wait_ms", 50),
+        "vlm_request_queue_wait_p95_ms": _timing_percentile(completed, "vlm_request_queue_wait_ms", 95),
         "vlm_request_transfer_mean_ms": _timing_mean(completed, "vlm_request_transfer_ms"),
         "vlm_request_transfer_p50_ms": _timing_percentile(completed, "vlm_request_transfer_ms", 50),
         "vlm_request_transfer_p95_ms": _timing_percentile(completed, "vlm_request_transfer_ms", 95),
+        "vlm_queue_wait_mean_ms": _timing_mean(completed, "vlm_queue_wait_ms"),
+        "vlm_queue_wait_p50_ms": _timing_percentile(completed, "vlm_queue_wait_ms", 50),
+        "vlm_queue_wait_p95_ms": _timing_percentile(completed, "vlm_queue_wait_ms", 95),
+        "prefix_queue_wait_mean_ms": _timing_mean(completed, "prefix_queue_wait_ms"),
+        "prefix_queue_wait_p50_ms": _timing_percentile(completed, "prefix_queue_wait_ms", 50),
+        "prefix_queue_wait_p95_ms": _timing_percentile(completed, "prefix_queue_wait_ms", 95),
         "prefix_transfer_mean_ms": _timing_mean(completed, "prefix_transfer_ms"),
         "prefix_transfer_p50_ms": _timing_percentile(completed, "prefix_transfer_ms", 50),
         "prefix_transfer_p95_ms": _timing_percentile(completed, "prefix_transfer_ms", 95),
+        "prefix_admit_wait_mean_ms": _timing_mean(completed, "prefix_admit_wait_ms"),
+        "prefix_admit_wait_p50_ms": _timing_percentile(completed, "prefix_admit_wait_ms", 50),
+        "prefix_admit_wait_p95_ms": _timing_percentile(completed, "prefix_admit_wait_ms", 95),
+        "ae_result_queue_wait_mean_ms": _timing_mean(completed, "ae_result_queue_wait_ms"),
+        "ae_result_queue_wait_p50_ms": _timing_percentile(completed, "ae_result_queue_wait_ms", 50),
+        "ae_result_queue_wait_p95_ms": _timing_percentile(completed, "ae_result_queue_wait_ms", 95),
         "ae_result_transfer_mean_ms": _timing_mean(completed, "ae_result_transfer_ms"),
         "ae_result_transfer_p50_ms": _timing_percentile(completed, "ae_result_transfer_ms", 50),
         "ae_result_transfer_p95_ms": _timing_percentile(completed, "ae_result_transfer_ms", 95),
         "va_split_transfer_mean_ms": _timing_mean(completed, "va_split_transfer_ms"),
         "va_split_transfer_p50_ms": _timing_percentile(completed, "va_split_transfer_ms", 50),
         "va_split_transfer_p95_ms": _timing_percentile(completed, "va_split_transfer_ms", 95),
+        "va_split_queue_wait_mean_ms": _timing_mean(completed, "va_split_queue_wait_ms"),
+        "va_split_queue_wait_p50_ms": _timing_percentile(completed, "va_split_queue_wait_ms", 50),
+        "va_split_queue_wait_p95_ms": _timing_percentile(completed, "va_split_queue_wait_ms", 95),
+        "prefix_lane_ingest_mean_ms": _timing_mean(completed, "prefix_lane_ingest_ms"),
+        "prefix_lane_ingest_p50_ms": _timing_percentile(completed, "prefix_lane_ingest_ms", 50),
+        "prefix_lane_ingest_p95_ms": _timing_percentile(completed, "prefix_lane_ingest_ms", 95),
+        "prefix_lane_compact_mean_ms": _timing_mean(completed, "prefix_lane_compact_ms"),
+        "prefix_lane_compact_p50_ms": _timing_percentile(completed, "prefix_lane_compact_ms", 50),
+        "prefix_lane_compact_p95_ms": _timing_percentile(completed, "prefix_lane_compact_ms", 95),
+        "prefix_lane_overhead_mean_ms": _timing_mean(completed, "prefix_lane_overhead_ms"),
+        "prefix_lane_overhead_p50_ms": _timing_percentile(completed, "prefix_lane_overhead_ms", 50),
+        "prefix_lane_overhead_p95_ms": _timing_percentile(completed, "prefix_lane_overhead_ms", 95),
         "ae_step_mean_ms": _timing_mean(completed, "ae_step_ms"),
         "ae_step_p50_ms": _timing_percentile(completed, "ae_step_ms", 50),
         "ae_effective_batch_mean": _timing_mean(completed, "ae_effective_batch"),
@@ -807,12 +843,13 @@ async def _run_one_request(
     request: SyntheticRequest,
     *,
     submitted_at_s: float,
+    submitted_ns: int,
     timeout_s: float,
     start_s: float,
     executor: ThreadPoolExecutor,
 ) -> RequestTrace:
     try:
-        result = await _infer_policy(policy, request, executor=executor)
+        result = await _infer_policy(policy, request, submitted_ns=submitted_ns, executor=executor)
         completed_at_s = time.monotonic() - start_s
         if completed_at_s - submitted_at_s > timeout_s:
             return _timeout_trace(request, submitted_at_s, completed_at_s, timeout_s)
@@ -837,12 +874,13 @@ async def _run_one_batch_request(
     request: SyntheticBatchRequest,
     *,
     submitted_at_s: float,
+    submitted_ns: int,
     timeout_s: float,
     start_s: float,
     executor: ThreadPoolExecutor,
 ) -> list[RequestTrace]:
     try:
-        result = await _infer_policy_batch(policy, request, executor=executor)
+        result = await _infer_policy_batch(policy, request, submitted_ns=submitted_ns, executor=executor)
         completed_at_s = time.monotonic() - start_s
         if completed_at_s - submitted_at_s > timeout_s:
             return _timeout_batch_trace(request, submitted_at_s, completed_at_s, timeout_s)
@@ -864,35 +902,51 @@ async def _infer_policy(
     policy: Any,
     request: SyntheticRequest,
     *,
+    submitted_ns: int,
     executor: ThreadPoolExecutor,
 ) -> Any:
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(executor, _call_policy_infer, policy, request)
+    return await loop.run_in_executor(executor, _call_policy_infer, policy, request, submitted_ns)
 
 
 async def _infer_policy_batch(
     policy: Any,
     request: SyntheticBatchRequest,
     *,
+    submitted_ns: int,
     executor: ThreadPoolExecutor,
 ) -> Any:
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(executor, _call_policy_infer_batch, policy, request)
+    return await loop.run_in_executor(executor, _call_policy_infer_batch, policy, request, submitted_ns)
 
 
-def _call_policy_infer(policy: Any, request: SyntheticRequest) -> Any:
+def _call_policy_infer(policy: Any, request: SyntheticRequest, submitted_ns: int | None = None) -> Any:
+    started_ns = time.monotonic_ns()
     if request.noise is None:
-        return policy.infer(request.observation)
-    return policy.infer(request.observation, noise=request.noise)
+        result = policy.infer(request.observation)
+    else:
+        result = policy.infer(request.observation, noise=request.noise)
+    return _attach_infer_queue_wait(result, submitted_ns=submitted_ns, started_ns=started_ns)
 
 
-def _call_policy_infer_batch(policy: Any, request: SyntheticBatchRequest) -> Any:
+def _call_policy_infer_batch(policy: Any, request: SyntheticBatchRequest, submitted_ns: int | None = None) -> Any:
+    started_ns = time.monotonic_ns()
     infer_batch = getattr(policy, "infer_batch", None)
     if not callable(infer_batch):
         raise AttributeError("policy does not support infer_batch")
     if request.noise is None:
-        return infer_batch(request.observation)
-    return infer_batch(request.observation, noise=request.noise)
+        result = infer_batch(request.observation)
+    else:
+        result = infer_batch(request.observation, noise=request.noise)
+    return _attach_infer_queue_wait(result, submitted_ns=submitted_ns, started_ns=started_ns)
+
+
+def _attach_infer_queue_wait(result: Any, *, submitted_ns: int | None, started_ns: int) -> Any:
+    if submitted_ns is None or not isinstance(result, dict):
+        return result
+    timing = dict(result.get("policy_timing") or {})
+    timing["infer_queue_wait_ms"] = max(0.0, (started_ns - submitted_ns) / 1_000_000)
+    return {**result, "policy_timing": timing}
 
 
 def _extract_policy_result(result: Any) -> tuple[Any | None, dict[str, float]]:

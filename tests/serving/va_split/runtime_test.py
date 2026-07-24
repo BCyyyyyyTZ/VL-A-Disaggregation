@@ -107,24 +107,29 @@ def test_local_va_split_runtime_infer_batch_builds_prefix_once_and_returns_row_o
 
 
 class _ResultQueue:
-    def __init__(self, messages):
+    def __init__(self, messages, *, get_delay_s: float = 0.0):
         self._messages = list(messages)
+        self._get_delay_s = get_delay_s
 
     def get(self):
+        if self._get_delay_s:
+            time.sleep(self._get_delay_s)
         return self._messages.pop(0)
 
 
 def test_process_runtime_collect_results_records_ae_result_transfer_latency():
+    enqueue_ns = time.monotonic_ns() - 5_000_000
     runtime = object.__new__(ProcessVASplitRuntime)
     runtime._result_queue = _ResultQueue(
         [
             ActionResult(
                 request_id="req-1",
                 actions=torch.zeros(1, 2, 1),
-                timing={"_ae_result_enqueue_ns": time.monotonic_ns() - 1_000_000},
+                timing={"_ae_result_enqueue_ns": float(enqueue_ns)},
             ),
             Shutdown(),
-        ]
+        ],
+        get_delay_s=0.01,
     )
     runtime._condition = threading.Condition()
     runtime._pending_results = {}
@@ -135,5 +140,8 @@ def test_process_runtime_collect_results_records_ae_result_transfer_latency():
 
     timing = runtime._pending_results["req-1"].timing
     assert timing is not None
-    assert timing["ae_result_transfer_ms"] >= 0.0
+    assert timing["ae_result_queue_wait_ms"] >= 4.0
+    assert timing["ae_result_transfer_ms"] >= 8.0
+    assert timing["va_split_transfer_ms"] == timing["ae_result_transfer_ms"]
+    assert timing["va_split_queue_wait_ms"] == timing["ae_result_queue_wait_ms"]
     assert "_ae_result_enqueue_ns" not in timing

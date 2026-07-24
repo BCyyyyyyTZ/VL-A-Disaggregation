@@ -15,6 +15,7 @@ from transformers.cache_utils import DynamicCache
 from openpi.models import model as _model
 from openpi.models_pytorch.pi0_split_types import PrefixFeature
 from openpi.serving.va_split.timing import synchronize_cuda_if_needed
+from openpi.serving.va_split.timing import timed_queue_get
 from openpi.serving.va_split.types import BatchRequestEnvelope
 from openpi.serving.va_split.types import PrefixReady
 from openpi.serving.va_split.types import ReleaseFeature
@@ -32,12 +33,29 @@ class BatchLiveFeature:
 class VLMWorker:
     """Builds prefix features and keeps producer-side tensor references alive."""
 
-    def __init__(self, model: Any, device: str):
+    def __init__(self, model: Any, device: str, max_live_features: int | None = None):
+        if max_live_features is not None and max_live_features <= 0:
+            raise ValueError("max_live_features must be positive")
         self._model = model
         self._device = device
+        self._max_live_features = max_live_features
         self.live_features: dict[str, PrefixFeature] = {}
         self.live_batches: dict[str, BatchLiveFeature] = {}
         self._request_to_batch: dict[str, str] = {}
+
+    @property
+    def available_live_feature_slots(self) -> int | None:
+        if self._max_live_features is None:
+            return None
+        return self._max_live_features - len(self.live_features)
+
+    @property
+    def max_live_features(self) -> int | None:
+        return self._max_live_features
+
+    def has_live_feature_capacity(self, batch_size: int) -> bool:
+        available = self.available_live_feature_slots
+        return available is None or batch_size <= available
 
     def handle_request(self, request: RequestEnvelope) -> PrefixReady:
         return self.handle_batch([request])[0]
@@ -45,6 +63,8 @@ class VLMWorker:
     def handle_batch(self, requests: list[RequestEnvelope]) -> list[PrefixReady]:
         if not requests:
             raise ValueError("VLMWorker.handle_batch requires at least one request")
+        if not self.has_live_feature_capacity(len(requests)):
+            raise RuntimeError(f"VLM live prefix feature slots are full ({len(self.live_features)} active features)")
         request_ids = tuple(request.request_id for request in requests)
         sample_kwargs = _stack_request_sample_kwargs(requests)
         observation = _stack_request_observations([request.observation for request in requests])
@@ -55,9 +75,12 @@ class VLMWorker:
             sample_kwargs=sample_kwargs,
             enqueue_ns_by_row=tuple(request.enqueue_ns for request in requests),
             dequeue_ns_by_row=tuple(request.dequeue_ns for request in requests),
+            dequeue_start_ns_by_row=tuple(request.dequeue_start_ns for request in requests),
         )
 
     def handle_batch_request(self, request: BatchRequestEnvelope) -> list[PrefixReady]:
+        if not self.has_live_feature_capacity(len(request.request_ids)):
+            raise RuntimeError(f"VLM live prefix feature slots are full ({len(self.live_features)} active features)")
         return self._handle_batched_observation(
             batch_id=request.batch_id,
             request_ids=request.request_ids,
@@ -65,6 +88,7 @@ class VLMWorker:
             sample_kwargs=dict(request.sample_kwargs),
             enqueue_ns_by_row=tuple(request.enqueue_ns for _ in request.request_ids),
             dequeue_ns_by_row=tuple(request.dequeue_ns for _ in request.request_ids),
+            dequeue_start_ns_by_row=tuple(request.dequeue_start_ns for _ in request.request_ids),
         )
 
     def _handle_batched_observation(
@@ -76,8 +100,13 @@ class VLMWorker:
         sample_kwargs: dict[str, Any],
         enqueue_ns_by_row: tuple[int, ...],
         dequeue_ns_by_row: tuple[int | None, ...],
+        dequeue_start_ns_by_row: tuple[int | None, ...],
     ) -> list[PrefixReady]:
-        if len(enqueue_ns_by_row) != len(request_ids) or len(dequeue_ns_by_row) != len(request_ids):
+        if (
+            len(enqueue_ns_by_row) != len(request_ids)
+            or len(dequeue_ns_by_row) != len(request_ids)
+            or len(dequeue_start_ns_by_row) != len(request_ids)
+        ):
             raise ValueError("enqueue/dequeue timing must have one entry per request id")
         synchronize_cuda_if_needed(self._device)
         start_ns = time.monotonic_ns()
@@ -94,6 +123,12 @@ class VLMWorker:
         for row, request_id in enumerate(request_ids):
             enqueue_ns = enqueue_ns_by_row[row]
             dequeue_ns = dequeue_ns_by_row[row] or enqueue_ns
+            dequeue_start_ns = dequeue_start_ns_by_row[row]
+            queue_wait_ms, transfer_ms = _vlm_request_queue_timings(
+                enqueue_ns=enqueue_ns,
+                dequeue_start_ns=dequeue_start_ns,
+                dequeue_ns=dequeue_ns,
+            )
             self.live_features[request_id] = feature
             self._request_to_batch[request_id] = batch_id
             row_kwargs = _sample_kwargs_for_row(sample_kwargs, row, batch_size)
@@ -106,7 +141,8 @@ class VLMWorker:
                     timing={
                         "vlm_prefix_forward_ms": elapsed_ms,
                         "vlm_effective_batch": float(batch_size),
-                        "vlm_request_transfer_ms": max(0.0, (dequeue_ns - enqueue_ns) / 1_000_000),
+                        "vlm_request_queue_wait_ms": queue_wait_ms,
+                        "vlm_request_transfer_ms": transfer_ms,
                         "vlm_queue_wait_ms": max(0.0, (start_ns - dequeue_ns) / 1_000_000),
                     },
                 )
@@ -144,12 +180,13 @@ class VLMProcess:
         release_queue,
         max_batch_size: int = 8,
         max_wait_ms: float = 2.0,
+        max_live_features: int | None = None,
     ):
         if max_batch_size <= 0:
             raise ValueError("max_batch_size must be positive")
         if max_wait_ms < 0:
             raise ValueError("max_wait_ms must be non-negative")
-        self.worker = VLMWorker(model=model, device=device)
+        self.worker = VLMWorker(model=model, device=device, max_live_features=max_live_features)
         self._request_queue = request_queue
         self._prefix_queue = prefix_queue
         self._release_queue = release_queue
@@ -169,6 +206,8 @@ class VLMProcess:
                 self._prefix_queue.put(message)
                 return
             if isinstance(message, BatchRequestEnvelope):
+                if not self._defer_until_live_feature_capacity(message, len(message.request_ids)):
+                    continue
                 try:
                     for ready in self.worker.handle_batch_request(message):
                         self._put_prefix_ready(ready)
@@ -184,6 +223,8 @@ class VLMProcess:
                 continue
             if not isinstance(message, RequestEnvelope):
                 self._prefix_queue.put(WorkerError(request_id=None, error=f"Unexpected VLM message: {type(message)}"))
+                continue
+            if not self._defer_until_live_feature_capacity(message, 1):
                 continue
             requests = [message]
             shutdown_after_batch = False
@@ -222,10 +263,12 @@ class VLMProcess:
         requests = [first_request]
         compatibility_key = _request_compatibility_key(first_request)
         shutdown_after_batch = False
-        self._prefetch_request_backlog(max_messages=self._max_batch_size - len(requests))
+        available_slots = self.worker.available_live_feature_slots
+        max_batch_size = self._max_batch_size if available_slots is None else min(self._max_batch_size, available_slots)
+        self._prefetch_request_backlog(max_messages=max_batch_size - len(requests))
         deadline_ns = time.monotonic_ns() + int(self._max_wait_ms * 1_000_000)
 
-        while len(requests) < self._max_batch_size:
+        while len(requests) < max_batch_size:
             try:
                 message = self._next_fcfs_candidate(deadline_ns)
             except queue.Empty:
@@ -246,7 +289,8 @@ class VLMProcess:
     def _prefetch_request_backlog(self, *, max_messages: int) -> None:
         for _ in range(max(0, max_messages)):
             try:
-                self._backlog.append(_mark_dequeued_message(self._request_queue.get_nowait()))
+                message, get_start_ns, get_end_ns = timed_queue_get(self._request_queue, block=False)
+                self._backlog.append(_mark_dequeued_message(message, get_start_ns=get_start_ns, get_end_ns=get_end_ns))
             except queue.Empty:
                 return
 
@@ -261,18 +305,54 @@ class VLMProcess:
     def _next_request_message(self, *, timeout: float) -> Any:
         if self._backlog:
             return self._backlog.popleft()
-        return _mark_dequeued_message(self._request_queue.get(timeout=timeout))
+        message, get_start_ns, get_end_ns = timed_queue_get(self._request_queue, timeout=timeout)
+        return _mark_dequeued_message(message, get_start_ns=get_start_ns, get_end_ns=get_end_ns)
 
     def _next_request_message_nowait(self) -> Any:
         if self._backlog:
             return self._backlog.popleft()
-        return _mark_dequeued_message(self._request_queue.get_nowait())
+        message, get_start_ns, get_end_ns = timed_queue_get(self._request_queue, block=False)
+        return _mark_dequeued_message(message, get_start_ns=get_start_ns, get_end_ns=get_end_ns)
+
+    def _defer_until_live_feature_capacity(self, message: Any, batch_size: int) -> bool:
+        available = self.worker.available_live_feature_slots
+        if available is None or batch_size <= available:
+            return True
+        max_live_features = self.worker.max_live_features
+        if max_live_features is not None and batch_size > max_live_features:
+            request_ids = message.request_ids if isinstance(message, BatchRequestEnvelope) else (message.request_id,)
+            for request_id in request_ids:
+                self._prefix_queue.put(
+                    WorkerError(
+                        request_id=request_id,
+                        error=f"Prefix batch size {batch_size} exceeds VLM live feature capacity {max_live_features}",
+                    )
+                )
+            return False
+        self._backlog.appendleft(message)
+        time.sleep(0.001)
+        return False
 
 
-def _mark_dequeued_message(message: Any) -> Any:
+def _mark_dequeued_message(message: Any, *, get_start_ns: int, get_end_ns: int) -> Any:
     if isinstance(message, RequestEnvelope | BatchRequestEnvelope):
-        return replace(message, dequeue_ns=time.monotonic_ns())
+        return replace(message, dequeue_start_ns=get_start_ns, dequeue_ns=get_end_ns)
     return message
+
+
+def _vlm_request_queue_timings(
+    *,
+    enqueue_ns: int,
+    dequeue_start_ns: int | None,
+    dequeue_ns: int,
+) -> tuple[float, float]:
+    if dequeue_start_ns is None:
+        # Direct in-process calls have no queue get()/IPC; treat the gap as queue wait.
+        return max(0.0, (dequeue_ns - enqueue_ns) / 1_000_000), 0.0
+    return (
+        max(0.0, (dequeue_start_ns - enqueue_ns) / 1_000_000),
+        max(0.0, (dequeue_ns - dequeue_start_ns) / 1_000_000),
+    )
 
 
 def _move_tensors_to_device(value: Any, device: str) -> Any:

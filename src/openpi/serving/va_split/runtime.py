@@ -17,6 +17,8 @@ from openpi.serving.va_split.types import BatchRequestEnvelope
 from openpi.serving.va_split.types import RequestEnvelope
 from openpi.serving.va_split.types import Shutdown
 from openpi.serving.va_split.types import WorkerError
+from openpi.serving.va_split.timing import queue_wait_and_transfer_ms
+from openpi.serving.va_split.timing import timed_queue_get
 from openpi.serving.va_split.vlm_process import VLMProcess
 from openpi.serving.va_split.vlm_process import VLMWorker
 
@@ -24,9 +26,14 @@ from openpi.serving.va_split.vlm_process import VLMWorker
 class LocalVASplitRuntime:
     """In-process runtime that exercises the same VLM/AE worker split."""
 
-    def __init__(self, *, model, device: str, max_ae_batch_size: int = 8):
-        self.vlm_worker = VLMWorker(model=model, device=device)
-        self.ae_worker = AEWorker(model=model, device=device, max_batch_size=max_ae_batch_size)
+    def __init__(self, *, model, device: str, max_ae_batch_size: int = 8, max_prefix_slots: int | None = None):
+        self.vlm_worker = VLMWorker(model=model, device=device, max_live_features=max_prefix_slots)
+        self.ae_worker = AEWorker(
+            model=model,
+            device=device,
+            max_batch_size=max_ae_batch_size,
+            max_prefix_slots=max_prefix_slots,
+        )
 
     def infer(self, observation: dict, sample_kwargs: dict) -> ActionResult:
         request_id = str(uuid.uuid4())
@@ -99,6 +106,7 @@ def _run_vlm_process(
     release_queue,
     max_vlm_batch_size,
     max_vlm_wait_ms,
+    max_live_features,
     env_updates=None,
 ) -> None:
     _apply_env_updates(env_updates)
@@ -111,11 +119,19 @@ def _run_vlm_process(
         release_queue=release_queue,
         max_batch_size=max_vlm_batch_size,
         max_wait_ms=max_vlm_wait_ms,
+        max_live_features=max_live_features,
     ).run()
 
 
 def _run_ae_process(
-    model_factory, device, prefix_queue, result_queue, release_queue, max_ae_batch_size, env_updates=None
+    model_factory,
+    device,
+    prefix_queue,
+    result_queue,
+    release_queue,
+    max_ae_batch_size,
+    max_prefix_slots,
+    env_updates=None,
 ) -> None:
     _apply_env_updates(env_updates)
     model = _prepare_model(model_factory, device)
@@ -126,6 +142,7 @@ def _run_ae_process(
         result_queue=result_queue,
         release_queue=release_queue,
         max_batch_size=max_ae_batch_size,
+        max_prefix_slots=max_prefix_slots,
     ).run()
 
 
@@ -140,16 +157,20 @@ class ProcessVASplitRuntime:
         max_ae_batch_size: int = 8,
         max_vlm_batch_size: int = 8,
         max_vlm_wait_ms: float = 2.0,
+        max_prefix_slots: int | None = None,
         start_method: str = "spawn",
         result_timeout_s: float = 120.0,
         vlm_env_updates: dict[str, str | None] | None = None,
         ae_env_updates: dict[str, str | None] | None = None,
     ):
+        if max_prefix_slots is None:
+            max_prefix_slots = max_vlm_batch_size * 3
         self._model_factory = model_factory
         self._device = device
         self._max_ae_batch_size = max_ae_batch_size
         self._max_vlm_batch_size = max_vlm_batch_size
         self._max_vlm_wait_ms = max_vlm_wait_ms
+        self._max_prefix_slots = max_prefix_slots
         self._result_timeout_s = result_timeout_s
         self._pending_results: dict[str, ActionResult] = {}
         self._pending_errors: dict[str | None, WorkerError] = {}
@@ -172,6 +193,7 @@ class ProcessVASplitRuntime:
                 self._release_queue,
                 max_vlm_batch_size,
                 max_vlm_wait_ms,
+                max_prefix_slots,
                 vlm_env_updates,
             ),
             daemon=True,
@@ -185,6 +207,7 @@ class ProcessVASplitRuntime:
                 self._result_queue,
                 self._release_queue,
                 max_ae_batch_size,
+                max_prefix_slots,
                 ae_env_updates,
             ),
             daemon=True,
@@ -246,12 +269,16 @@ class ProcessVASplitRuntime:
     def _collect_results(self) -> None:
         while True:
             try:
-                message = self._result_queue.get()
+                message, get_start_ns, get_end_ns = timed_queue_get(self._result_queue)
             except (EOFError, OSError):
                 return
             with self._condition:
                 if isinstance(message, ActionResult):
-                    self._pending_results[message.request_id] = _mark_collected_result(message)
+                    self._pending_results[message.request_id] = _mark_collected_result(
+                        message,
+                        get_start_ns=get_start_ns,
+                        get_end_ns=get_end_ns,
+                    )
                 elif isinstance(message, WorkerError):
                     self._pending_errors[message.request_id] = message
                 elif isinstance(message, Shutdown):
@@ -301,7 +328,21 @@ def _aggregate_batch_timing(row_timings: list[dict[str, float]], *, batch_size: 
         values = [float(row[key]) for row in row_timings if key in row]
         if values:
             timing[key] = sum(values) / len(values)
-    for key in ("vlm_request_transfer_ms", "prefix_transfer_ms", "ae_result_transfer_ms", "va_split_transfer_ms"):
+    for key in (
+        "vlm_request_queue_wait_ms",
+        "vlm_request_transfer_ms",
+        "prefix_queue_wait_ms",
+        "prefix_transfer_ms",
+        "prefix_admit_wait_ms",
+        "ae_result_queue_wait_ms",
+        "ae_result_transfer_ms",
+        "va_split_transfer_ms",
+        "va_split_queue_wait_ms",
+        "prefix_lane_ingest_ms",
+        "prefix_lane_compact_ms",
+        "prefix_lane_overhead_ms",
+        "infer_queue_wait_ms",
+    ):
         values = [float(row[key]) for row in row_timings if key in row]
         if values:
             timing[key] = sum(values) / len(values)
@@ -312,13 +353,38 @@ def _aggregate_batch_timing(row_timings: list[dict[str, float]], *, batch_size: 
     return timing
 
 
-def _mark_collected_result(result: ActionResult) -> ActionResult:
+def _mark_collected_result(
+    result: ActionResult,
+    *,
+    get_start_ns: int | None = None,
+    get_end_ns: int | None = None,
+) -> ActionResult:
     timing = dict(result.timing or {})
     result_enqueue_ns = timing.pop("_ae_result_enqueue_ns", None)
-    if result_enqueue_ns is not None:
-        timing["ae_result_transfer_ms"] = max(0.0, (time.monotonic_ns() - float(result_enqueue_ns)) / 1_000_000)
+    queue_wait_ms, transfer_ms = queue_wait_and_transfer_ms(
+        enqueue_ns=result_enqueue_ns,
+        get_start_ns=get_start_ns,
+        get_end_ns=get_end_ns,
+    )
+    if result_enqueue_ns is not None and get_start_ns is not None and get_end_ns is not None:
+        timing["ae_result_queue_wait_ms"] = queue_wait_ms
+        timing["ae_result_transfer_ms"] = transfer_ms
+    elif result_enqueue_ns is not None:
+        # Legacy fallback when get split is unavailable.
+        timing["ae_result_queue_wait_ms"] = max(0.0, (time.monotonic_ns() - float(result_enqueue_ns)) / 1_000_000)
+        timing["ae_result_transfer_ms"] = 0.0
     transfer_keys = ("vlm_request_transfer_ms", "prefix_transfer_ms", "ae_result_transfer_ms")
     transfer_values = [float(timing[key]) for key in transfer_keys if key in timing]
     if transfer_values:
         timing["va_split_transfer_ms"] = sum(transfer_values)
+    queue_wait_keys = (
+        "vlm_request_queue_wait_ms",
+        "vlm_queue_wait_ms",
+        "prefix_queue_wait_ms",
+        "prefix_admit_wait_ms",
+        "ae_result_queue_wait_ms",
+    )
+    queue_wait_values = [float(timing[key]) for key in queue_wait_keys if key in timing]
+    if queue_wait_values:
+        timing["va_split_queue_wait_ms"] = sum(queue_wait_values)
     return replace(result, timing=timing)

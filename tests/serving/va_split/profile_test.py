@@ -130,10 +130,19 @@ class _ConcurrentFakePolicy:
             "actions": np.asarray([obs["value"]], dtype=np.float32),
             "policy_timing": {
                 "vlm_prefix_forward_ms": 1.0,
-                "vlm_request_transfer_ms": 0.25,
-                "prefix_transfer_ms": 0.5,
-                "ae_result_transfer_ms": 0.75,
-                "va_split_transfer_ms": 1.5,
+                "vlm_request_queue_wait_ms": 0.2,
+                "vlm_request_transfer_ms": 0.05,
+                "vlm_queue_wait_ms": 0.1,
+                "prefix_queue_wait_ms": 0.3,
+                "prefix_transfer_ms": 0.2,
+                "prefix_admit_wait_ms": 0.15,
+                "ae_result_queue_wait_ms": 0.4,
+                "ae_result_transfer_ms": 0.35,
+                "va_split_transfer_ms": 0.6,
+                "va_split_queue_wait_ms": 1.15,
+                "prefix_lane_ingest_ms": 0.4,
+                "prefix_lane_compact_ms": 0.1,
+                "prefix_lane_overhead_ms": 0.5,
                 "ae_step_ms": 2.0,
                 "ae_effective_batch": 3.0,
             },
@@ -207,10 +216,21 @@ def test_run_benchmark_allows_concurrent_policy_overlap():
     assert summary["end_to_end_latency_mean_ms"] is not None
     assert summary["vlm_prefix_forward_mean_ms"] == 1.0
     assert summary["vlm_prefix_forward_p50_ms"] == 1.0
-    assert summary["vlm_request_transfer_mean_ms"] == 0.25
-    assert summary["prefix_transfer_mean_ms"] == 0.5
-    assert summary["ae_result_transfer_mean_ms"] == 0.75
-    assert summary["va_split_transfer_mean_ms"] == 1.5
+    assert summary["infer_queue_wait_mean_ms"] is not None
+    assert summary["infer_queue_wait_mean_ms"] >= 0.0
+    assert summary["vlm_request_queue_wait_mean_ms"] == 0.2
+    assert summary["vlm_request_transfer_mean_ms"] == 0.05
+    assert summary["vlm_queue_wait_mean_ms"] == 0.1
+    assert summary["prefix_queue_wait_mean_ms"] == 0.3
+    assert summary["prefix_transfer_mean_ms"] == 0.2
+    assert summary["prefix_admit_wait_mean_ms"] == 0.15
+    assert summary["ae_result_queue_wait_mean_ms"] == 0.4
+    assert summary["ae_result_transfer_mean_ms"] == 0.35
+    assert summary["va_split_transfer_mean_ms"] == 0.6
+    assert summary["va_split_queue_wait_mean_ms"] == 1.15
+    assert summary["prefix_lane_ingest_mean_ms"] == 0.4
+    assert summary["prefix_lane_compact_mean_ms"] == 0.1
+    assert summary["prefix_lane_overhead_mean_ms"] == 0.5
     assert summary["ae_step_mean_ms"] == 2.0
     assert summary["ae_step_p50_ms"] == 2.0
     assert summary["ae_effective_batch_mean"] == 3.0

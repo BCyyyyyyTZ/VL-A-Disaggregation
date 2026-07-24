@@ -19,7 +19,7 @@ def test_run_va_split_mps_defaults_to_libero_env_python():
     assert 'BATCH_SIZE="${BATCH_SIZE:-${MAX_VLM_BATCH_SIZE}}"' in script
     assert 'ENABLE_POLICY_BATCH="${ENABLE_POLICY_BATCH:-true}"' in script
     assert 'VA_SPLIT_MAX_VLM_BATCH_SIZE="${VA_SPLIT_MAX_VLM_BATCH_SIZE:-8}"' in script
-    assert 'VA_SPLIT_MAX_VLM_WAIT_MS="${VA_SPLIT_MAX_VLM_WAIT_MS:-2.0}"' in script
+    assert 'VA_SPLIT_MAX_VLM_WAIT_MS="${VA_SPLIT_MAX_VLM_WAIT_MS:-1.0}"' in script
     assert 'PYTORCH_COMPILE_MODE="${PYTORCH_COMPILE_MODE:-}"' in script
 
 
