@@ -1,0 +1,42 @@
+[2026-07-24 18:39:09.729 Other 190573] Startup
+[2026-07-24 18:39:09.729 Other 190573] Connecting to control daemon on socket: /data1/gaobowen/tianze/logs/V-A/sm0-0-new/r8_ours/mps-pipe/control
+[2026-07-24 18:39:09.729 Other 190573] Initializing server process
+[2026-07-24 18:39:09.971 Server 190573] Creating server context on device 0 (NVIDIA A800-SXM4-80GB)
+[2026-07-24 18:39:10.044 Server 190573] Created anonymous shared memory region mps.shm.1003.190573
+[2026-07-24 18:39:10.044 Server 190573] CUDA MPS Server for Linux/Unix. Binary version: 13000
+[2026-07-24 18:39:10.044 Server 190573] Display Driver version: 580
+[2026-07-24 18:39:10.044 Server 190573] Active Threads Percentage set to 100.0
+[2026-07-24 18:39:10.044 Server 190573] Server Priority set to 0
+[2026-07-24 18:39:10.044 Server 190573] Server has started
+[2026-07-24 18:39:10.044 Server 190573] Received new client request for {PID: 0, Context ID: 0}
+[2026-07-24 18:39:10.044 Server 190573] Client {PID: 190483, Context ID: 0} connected
+[2026-07-24 18:39:10.044 Server 190573] Creating worker thread for client {PID: 190483, Context ID: 0}
+[2026-07-24 18:39:16.766 Server 190573] Received new client request for {PID: 190483, Context ID: 0}
+[2026-07-24 18:39:16.766 Server 190573] Client {PID: 190664, Context ID: 0} connected
+[2026-07-24 18:39:16.766 Server 190573] Creating worker thread for client {PID: 190664, Context ID: 0}
+[2026-07-24 18:39:16.782 Server 190573] Received new client request for {PID: 190664, Context ID: 0}
+[2026-07-24 18:39:16.782 Server 190573] Client {PID: 190665, Context ID: 0} connected
+[2026-07-24 18:39:16.782 Server 190573] Creating worker thread for client {PID: 190665, Context ID: 0}
+[2026-07-24 18:40:12.500 Server 190573] Received new client request for {PID: 190665, Context ID: 0}
+[2026-07-24 18:40:12.500 Server 190573] Client {PID: 190664, Context ID: 1} connected
+[2026-07-24 18:40:12.500 Server 190573] Creating worker thread for client {PID: 190664, Context ID: 1}
+[2026-07-24 18:40:12.500 Server 190573] Device NVIDIA A800-SXM4-80GB (uuid GPU-bc6f6460-c6ce-5737-1d7c-e745c8771862) is associated
+[2026-07-24 18:40:12.500 Server 190573] Status of client {PID: 190664, Context ID: 1} is ACTIVE
+[2026-07-24 18:40:12.687 Server 190573] Received new client request for {PID: 190664, Context ID: 1}
+[2026-07-24 18:40:12.687 Server 190573] Client {PID: 190665, Context ID: 1} connected
+[2026-07-24 18:40:12.687 Server 190573] Creating worker thread for client {PID: 190665, Context ID: 1}
+[2026-07-24 18:40:12.687 Server 190573] Device NVIDIA A800-SXM4-80GB (uuid GPU-bc6f6460-c6ce-5737-1d7c-e745c8771862) is associated
+[2026-07-24 18:40:12.687 Server 190573] Status of client {PID: 190665, Context ID: 1} is ACTIVE
+[2026-07-24 18:40:45.683 Server 190573] Server failed to recevie command with status 806, assuming client {PID: 190665, Context ID: 1} exit
+[2026-07-24 18:40:45.683 Server 190573] Client {PID: 190665, Context ID: 1} exiting. Number of active client contexts is 1.
+[2026-07-24 18:40:45.710 Server 190573] Server failed to recevie command with status 806, assuming client {PID: 190665, Context ID: 0} exit
+[2026-07-24 18:40:45.710 Server 190573] Client process 190665 disconnected
+[2026-07-24 18:40:45.892 Server 190573] Server failed to recevie command with status 806, assuming client {PID: 190664, Context ID: 1} exit
+[2026-07-24 18:40:45.892 Server 190573] Client {PID: 190664, Context ID: 1} exiting. Number of active client contexts is 0.
+[2026-07-24 18:40:45.924 Server 190573] Server failed to recevie command with status 806, assuming client {PID: 190664, Context ID: 0} exit
+[2026-07-24 18:40:45.924 Server 190573] Client process 190664 disconnected
+[2026-07-24 18:40:47.347 Server 190573] Server failed to recevie command with status 806, assuming client {PID: 190483, Context ID: 0} exit
+[2026-07-24 18:40:47.347 Server 190573] Client process 190483 disconnected
+[2026-07-24 18:40:47.371 Server 190573] Server has been notified to shutdown
+[2026-07-24 18:40:47.372 Server 190573] Waiting for current clients to finish
+[2026-07-24 18:40:47.372 Server 190573] Exiting

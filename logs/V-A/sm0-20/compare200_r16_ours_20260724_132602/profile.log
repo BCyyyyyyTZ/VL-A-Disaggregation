@@ -1,0 +1,83 @@
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+I0000 00:00:1784871053.072332  226473 port.cc:153] oneDNN custom operations are on. You may see slightly different numerical results due to floating-point round-off errors from different computation orders. To turn them off, set the environment variable `TF_ENABLE_ONEDNN_OPTS=0`.
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+I0000 00:00:1784871054.291715  226473 port.cc:153] oneDNN custom operations are on. You may see slightly different numerical results due to floating-point round-off errors from different computation orders. To turn them off, set the environment variable `TF_ENABLE_ONEDNN_OPTS=0`.
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+I0000 00:00:1784871060.226564  226635 port.cc:153] oneDNN custom operations are on. You may see slightly different numerical results due to floating-point round-off errors from different computation orders. To turn them off, set the environment variable `TF_ENABLE_ONEDNN_OPTS=0`.
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+I0000 00:00:1784871060.226895  226636 port.cc:153] oneDNN custom operations are on. You may see slightly different numerical results due to floating-point round-off errors from different computation orders. To turn them off, set the environment variable `TF_ENABLE_ONEDNN_OPTS=0`.
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+I0000 00:00:1784871061.265932  226635 port.cc:153] oneDNN custom operations are on. You may see slightly different numerical results due to floating-point round-off errors from different computation orders. To turn them off, set the environment variable `TF_ENABLE_ONEDNN_OPTS=0`.
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+I0000 00:00:1784871061.286462  226636 port.cc:153] oneDNN custom operations are on. You may see slightly different numerical results due to floating-point round-off errors from different computation orders. To turn them off, set the environment variable `TF_ENABLE_ONEDNN_OPTS=0`.
+target_request_rate_hz: 16.000
+target_requests_per_second: 16.000
+realized_offered_requests_per_second: 14.212
+throughput_requests_per_second: 13.969
+slo_ms: 200.000
+slo_good_requests: 17
+slo_goodput_requests_per_second: 1.208
+num_requests: 200
+completed_requests: 200
+failed_requests: 0
+timeout_requests: 0
+submit_lateness_mean_ms: 0.669
+submit_lateness_p50_ms: 0.565
+submit_lateness_p95_ms: 1.714
+action_latency_mean_ms: 297.705
+action_latency_p50_ms: 288.197
+action_latency_p95_ms: 428.853
+action_latency_p99_ms: 486.884
+end_to_end_latency_mean_ms: 298.375
+end_to_end_latency_p50_ms: 288.494
+end_to_end_latency_p95_ms: 429.338
+vlm_prefix_forward_mean_ms: 101.232
+vlm_prefix_forward_p50_ms: 97.678
+baseline_vlm_latency_mean_ms: null
+baseline_vlm_latency_p50_ms: null
+baseline_vlm_latency_p95_ms: null
+baseline_ae_latency_mean_ms: null
+baseline_ae_latency_p50_ms: null
+baseline_ae_latency_p95_ms: null
+baseline_ae_step_latency_mean_ms: null
+baseline_ae_step_latency_p50_ms: null
+baseline_ae_step_latency_p95_ms: null
+baseline_ae_steps_mean: null
+baseline_effective_batch_mean: null
+vlm_request_transfer_mean_ms: 39.178
+vlm_request_transfer_p50_ms: 37.134
+vlm_request_transfer_p95_ms: 87.908
+prefix_transfer_mean_ms: 15.630
+prefix_transfer_p50_ms: 17.367
+prefix_transfer_p95_ms: 28.887
+ae_result_transfer_mean_ms: 0.956
+ae_result_transfer_p50_ms: 0.788
+ae_result_transfer_p95_ms: 2.048
+va_split_transfer_mean_ms: 55.763
+va_split_transfer_p50_ms: 57.194
+va_split_transfer_p95_ms: 105.036
+prefix_lane_ingest_mean_ms: 0.671
+prefix_lane_ingest_p50_ms: 0.650
+prefix_lane_ingest_p95_ms: 0.806
+prefix_lane_compact_mean_ms: 0.525
+prefix_lane_compact_p50_ms: 0.519
+prefix_lane_compact_p95_ms: 2.027
+prefix_lane_overhead_mean_ms: 1.197
+prefix_lane_overhead_p50_ms: 1.163
+prefix_lane_overhead_p95_ms: 2.683
+ae_step_mean_ms: 24.316
+ae_step_p50_ms: 22.724
+ae_effective_batch_mean: 2.894
+vlm_effective_batch_mean: 2.100
+policy_effective_batch_mean: null
+batch_wait_mean_ms: null
+batch_wait_p50_ms: null
+batch_wait_p95_ms: null
+effective_batch_mean: 2.894
+effective_batch_p50: 2.700
+effective_batch_p95: 6.200
+effective_batch_p99: 6.400
+effective_batch_max: 6.400
+inflight_peak: 12
+gpu_sm_util_mean: 66.333
+gpu_mem_bw_util_mean: 18.569

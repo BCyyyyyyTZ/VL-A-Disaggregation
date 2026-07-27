@@ -1,0 +1,52 @@
+[2026-07-26 01:18:51.824 Other 1968762] Startup
+[2026-07-26 01:18:51.824 Other 1968762] Connecting to control daemon on socket: /data1/gaobowen/tianze/logs/V-A/sm0-0-torch-new/r32_ours/mps-pipe/control
+[2026-07-26 01:18:51.824 Other 1968762] Initializing server process
+[2026-07-26 01:18:51.997 Server 1968762] Creating server context on device 0 (NVIDIA A800-SXM4-80GB)
+[2026-07-26 01:18:52.077 Server 1968762] Created anonymous shared memory region mps.shm.1003.1968762
+[2026-07-26 01:18:52.077 Server 1968762] CUDA MPS Server for Linux/Unix. Binary version: 13000
+[2026-07-26 01:18:52.077 Server 1968762] Display Driver version: 580
+[2026-07-26 01:18:52.077 Server 1968762] Active Threads Percentage set to 100.0
+[2026-07-26 01:18:52.077 Server 1968762] Server Priority set to 0
+[2026-07-26 01:18:52.077 Server 1968762] Server has started
+[2026-07-26 01:18:52.077 Server 1968762] Received new client request for {PID: 0, Context ID: 0}
+[2026-07-26 01:18:52.077 Server 1968762] Client {PID: 1968673, Context ID: 0} connected
+[2026-07-26 01:18:52.077 Server 1968762] Creating worker thread for client {PID: 1968673, Context ID: 0}
+[2026-07-26 01:18:58.894 Server 1968762] Received new client request for {PID: 1968673, Context ID: 0}
+[2026-07-26 01:18:58.894 Server 1968762] Client {PID: 1968892, Context ID: 0} connected
+[2026-07-26 01:18:58.894 Server 1968762] Creating worker thread for client {PID: 1968892, Context ID: 0}
+[2026-07-26 01:18:58.932 Server 1968762] Received new client request for {PID: 1968892, Context ID: 0}
+[2026-07-26 01:18:58.933 Server 1968762] Client {PID: 1968891, Context ID: 0} connected
+[2026-07-26 01:18:58.933 Server 1968762] Creating worker thread for client {PID: 1968891, Context ID: 0}
+[2026-07-26 01:19:54.111 Server 1968762] Received new client request for {PID: 1968891, Context ID: 0}
+[2026-07-26 01:19:54.111 Server 1968762] Client {PID: 1968891, Context ID: 1} connected
+[2026-07-26 01:19:54.112 Server 1968762] Creating worker thread for client {PID: 1968891, Context ID: 1}
+[2026-07-26 01:19:54.112 Server 1968762] Device NVIDIA A800-SXM4-80GB (uuid GPU-4179945d-3a58-f278-d14a-d866b6c7fb7e) is associated
+[2026-07-26 01:19:54.112 Server 1968762] Status of client {PID: 1968891, Context ID: 1} is ACTIVE
+[2026-07-26 01:19:54.454 Server 1968762] Received new client request for {PID: 1968891, Context ID: 1}
+[2026-07-26 01:19:54.454 Server 1968762] Client {PID: 1979735, Context ID: 0} connected
+[2026-07-26 01:19:54.454 Server 1968762] Creating worker thread for client {PID: 1979735, Context ID: 0}
+[2026-07-26 01:19:55.891 Server 1968762] Received new client request for {PID: 1979735, Context ID: 0}
+[2026-07-26 01:19:55.891 Server 1968762] Client {PID: 1968892, Context ID: 1} connected
+[2026-07-26 01:19:55.891 Server 1968762] Creating worker thread for client {PID: 1968892, Context ID: 1}
+[2026-07-26 01:19:55.891 Server 1968762] Device NVIDIA A800-SXM4-80GB (uuid GPU-4179945d-3a58-f278-d14a-d866b6c7fb7e) is associated
+[2026-07-26 01:19:55.891 Server 1968762] Status of client {PID: 1968892, Context ID: 1} is ACTIVE
+[2026-07-26 01:19:56.256 Server 1968762] Received new client request for {PID: 1968892, Context ID: 1}
+[2026-07-26 01:19:56.256 Server 1968762] Client {PID: 1979815, Context ID: 0} connected
+[2026-07-26 01:19:56.256 Server 1968762] Creating worker thread for client {PID: 1979815, Context ID: 0}
+[2026-07-26 01:23:30.948 Server 1968762] Server failed to recevie command with status 806, assuming client {PID: 1968892, Context ID: 1} exit
+[2026-07-26 01:23:30.948 Server 1968762] Client {PID: 1968892, Context ID: 1} exiting. Number of active client contexts is 1.
+[2026-07-26 01:23:30.981 Server 1968762] Server failed to recevie command with status 806, assuming client {PID: 1968892, Context ID: 0} exit
+[2026-07-26 01:23:30.981 Server 1968762] Client process 1968892 disconnected
+[2026-07-26 01:23:31.041 Server 1968762] Server failed to recevie command with status 806, assuming client {PID: 1979815, Context ID: 0} exit
+[2026-07-26 01:23:31.041 Server 1968762] Client process 1979815 disconnected
+[2026-07-26 01:23:31.812 Server 1968762] Server failed to recevie command with status 806, assuming client {PID: 1968891, Context ID: 1} exit
+[2026-07-26 01:23:31.812 Server 1968762] Client {PID: 1968891, Context ID: 1} exiting. Number of active client contexts is 0.
+[2026-07-26 01:23:31.840 Server 1968762] Server failed to recevie command with status 806, assuming client {PID: 1968891, Context ID: 0} exit
+[2026-07-26 01:23:31.840 Server 1968762] Client process 1968891 disconnected
+[2026-07-26 01:23:32.283 Server 1968762] Server failed to recevie command with status 806, assuming client {PID: 1979735, Context ID: 0} exit
+[2026-07-26 01:23:32.283 Server 1968762] Client process 1979735 disconnected
+[2026-07-26 01:23:33.442 Server 1968762] Server failed to recevie command with status 806, assuming client {PID: 1968673, Context ID: 0} exit
+[2026-07-26 01:23:33.443 Server 1968762] Client process 1968673 disconnected
+[2026-07-26 01:23:33.467 Server 1968762] Server has been notified to shutdown
+[2026-07-26 01:23:33.467 Server 1968762] Waiting for current clients to finish
+[2026-07-26 01:23:33.467 Server 1968762] Exiting

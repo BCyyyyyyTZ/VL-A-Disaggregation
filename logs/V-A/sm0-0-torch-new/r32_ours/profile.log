@@ -1,0 +1,110 @@
+/data1/gaobowen/RLinf/.venv-libero-openpi/lib/python3.11/site-packages/transformers/utils/hub.py:111: FutureWarning: Using `TRANSFORMERS_CACHE` is deprecated and will be removed in v5 of Transformers. Use `HF_HOME` instead.
+  warnings.warn(
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+I0000 00:00:1784999932.865133 1968673 port.cc:153] oneDNN custom operations are on. You may see slightly different numerical results due to floating-point round-off errors from different computation orders. To turn them off, set the environment variable `TF_ENABLE_ONEDNN_OPTS=0`.
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+I0000 00:00:1784999934.113812 1968673 port.cc:153] oneDNN custom operations are on. You may see slightly different numerical results due to floating-point round-off errors from different computation orders. To turn them off, set the environment variable `TF_ENABLE_ONEDNN_OPTS=0`.
+/data1/gaobowen/RLinf/.venv-libero-openpi/lib/python3.11/site-packages/transformers/utils/hub.py:111: FutureWarning: Using `TRANSFORMERS_CACHE` is deprecated and will be removed in v5 of Transformers. Use `HF_HOME` instead.
+  warnings.warn(
+/data1/gaobowen/RLinf/.venv-libero-openpi/lib/python3.11/site-packages/transformers/utils/hub.py:111: FutureWarning: Using `TRANSFORMERS_CACHE` is deprecated and will be removed in v5 of Transformers. Use `HF_HOME` instead.
+  warnings.warn(
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+I0000 00:00:1784999939.887256 1968892 port.cc:153] oneDNN custom operations are on. You may see slightly different numerical results due to floating-point round-off errors from different computation orders. To turn them off, set the environment variable `TF_ENABLE_ONEDNN_OPTS=0`.
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+I0000 00:00:1784999939.912374 1968891 port.cc:153] oneDNN custom operations are on. You may see slightly different numerical results due to floating-point round-off errors from different computation orders. To turn them off, set the environment variable `TF_ENABLE_ONEDNN_OPTS=0`.
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+I0000 00:00:1784999940.925963 1968892 port.cc:153] oneDNN custom operations are on. You may see slightly different numerical results due to floating-point round-off errors from different computation orders. To turn them off, set the environment variable `TF_ENABLE_ONEDNN_OPTS=0`.
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+I0000 00:00:1784999940.949187 1968891 port.cc:153] oneDNN custom operations are on. You may see slightly different numerical results due to floating-point round-off errors from different computation orders. To turn them off, set the environment variable `TF_ENABLE_ONEDNN_OPTS=0`.
+target_request_rate_hz: 32.000
+target_requests_per_second: 32.000
+realized_offered_requests_per_second: 28.425
+throughput_requests_per_second: 27.456
+slo_ms: 200.000
+slo_good_requests: 44
+slo_goodput_requests_per_second: 6.253
+num_requests: 200
+completed_requests: 200
+failed_requests: 0
+timeout_requests: 0
+submit_lateness_mean_ms: 0.681
+submit_lateness_p50_ms: 0.634
+submit_lateness_p95_ms: 1.657
+action_latency_mean_ms: 311.451
+action_latency_p50_ms: 284.060
+action_latency_p95_ms: 525.164
+action_latency_p99_ms: 619.041
+end_to_end_latency_mean_ms: 312.132
+end_to_end_latency_p50_ms: 284.680
+end_to_end_latency_p95_ms: 525.728
+vlm_prefix_forward_mean_ms: 143.697
+vlm_prefix_forward_p50_ms: 139.348
+baseline_vlm_latency_mean_ms: null
+baseline_vlm_latency_p50_ms: null
+baseline_vlm_latency_p95_ms: null
+baseline_ae_latency_mean_ms: null
+baseline_ae_latency_p50_ms: null
+baseline_ae_latency_p95_ms: null
+baseline_ae_step_latency_mean_ms: null
+baseline_ae_step_latency_p50_ms: null
+baseline_ae_step_latency_p95_ms: null
+baseline_ae_steps_mean: null
+baseline_effective_batch_mean: null
+infer_queue_wait_mean_ms: 0.075
+infer_queue_wait_p50_ms: 0.054
+infer_queue_wait_p95_ms: 0.151
+vlm_request_queue_wait_mean_ms: 69.504
+vlm_request_queue_wait_p50_ms: 55.021
+vlm_request_queue_wait_p95_ms: 184.832
+vlm_request_transfer_mean_ms: 2.182
+vlm_request_transfer_p50_ms: 1.477
+vlm_request_transfer_p95_ms: 4.068
+vlm_queue_wait_mean_ms: 9.080
+vlm_queue_wait_p50_ms: 4.618
+vlm_queue_wait_p95_ms: 32.972
+prefix_queue_wait_mean_ms: 8.091
+prefix_queue_wait_p50_ms: 6.484
+prefix_queue_wait_p95_ms: 21.813
+prefix_transfer_mean_ms: 21.358
+prefix_transfer_p50_ms: 1.055
+prefix_transfer_p95_ms: 123.652
+prefix_admit_wait_mean_ms: 0.067
+prefix_admit_wait_p50_ms: 0.063
+prefix_admit_wait_p95_ms: 0.086
+ae_result_queue_wait_mean_ms: 1.372
+ae_result_queue_wait_p50_ms: 1.022
+ae_result_queue_wait_p95_ms: 4.066
+ae_result_transfer_mean_ms: 36.707
+ae_result_transfer_p50_ms: 0.678
+ae_result_transfer_p95_ms: 192.730
+va_split_transfer_mean_ms: 60.247
+va_split_transfer_p50_ms: 3.262
+va_split_transfer_p95_ms: 316.496
+va_split_queue_wait_mean_ms: 88.114
+va_split_queue_wait_p50_ms: 73.095
+va_split_queue_wait_p95_ms: 218.950
+prefix_lane_ingest_mean_ms: 0.665
+prefix_lane_ingest_p50_ms: 0.644
+prefix_lane_ingest_p95_ms: 0.807
+prefix_lane_compact_mean_ms: 0.050
+prefix_lane_compact_p50_ms: 0.000
+prefix_lane_compact_p95_ms: 0.000
+prefix_lane_overhead_mean_ms: 0.715
+prefix_lane_overhead_p50_ms: 0.646
+prefix_lane_overhead_p95_ms: 0.834
+ae_step_mean_ms: 12.228
+ae_step_p50_ms: 10.340
+ae_effective_batch_mean: 4.896
+vlm_effective_batch_mean: 4.840
+policy_effective_batch_mean: null
+batch_wait_mean_ms: null
+batch_wait_p50_ms: null
+batch_wait_p95_ms: null
+effective_batch_mean: 4.896
+effective_batch_p50: 5.000
+effective_batch_p95: 8.000
+effective_batch_p99: 8.000
+effective_batch_max: 8.000
+inflight_peak: 19
+gpu_sm_util_mean: 83.405
+gpu_mem_bw_util_mean: 22.459

@@ -1,0 +1,42 @@
+[2026-07-24 19:21:09.724 Other 215425] Startup
+[2026-07-24 19:21:09.724 Other 215425] Connecting to control daemon on socket: /data1/gaobowen/tianze/logs/V-A/sm0-0-4/r8_ours/mps-pipe/control
+[2026-07-24 19:21:09.724 Other 215425] Initializing server process
+[2026-07-24 19:21:09.955 Server 215425] Creating server context on device 0 (NVIDIA A800-SXM4-80GB)
+[2026-07-24 19:21:10.025 Server 215425] Created anonymous shared memory region mps.shm.1003.215425
+[2026-07-24 19:21:10.025 Server 215425] CUDA MPS Server for Linux/Unix. Binary version: 13000
+[2026-07-24 19:21:10.025 Server 215425] Display Driver version: 580
+[2026-07-24 19:21:10.025 Server 215425] Active Threads Percentage set to 100.0
+[2026-07-24 19:21:10.025 Server 215425] Server Priority set to 0
+[2026-07-24 19:21:10.025 Server 215425] Server has started
+[2026-07-24 19:21:10.025 Server 215425] Received new client request for {PID: 0, Context ID: 0}
+[2026-07-24 19:21:10.026 Server 215425] Client {PID: 215330, Context ID: 0} connected
+[2026-07-24 19:21:10.026 Server 215425] Creating worker thread for client {PID: 215330, Context ID: 0}
+[2026-07-24 19:21:16.770 Server 215425] Received new client request for {PID: 215330, Context ID: 0}
+[2026-07-24 19:21:16.770 Server 215425] Client {PID: 215526, Context ID: 0} connected
+[2026-07-24 19:21:16.770 Server 215425] Creating worker thread for client {PID: 215526, Context ID: 0}
+[2026-07-24 19:21:16.794 Server 215425] Received new client request for {PID: 215526, Context ID: 0}
+[2026-07-24 19:21:16.794 Server 215425] Client {PID: 215525, Context ID: 0} connected
+[2026-07-24 19:21:16.794 Server 215425] Creating worker thread for client {PID: 215525, Context ID: 0}
+[2026-07-24 19:22:09.367 Server 215425] Received new client request for {PID: 215525, Context ID: 0}
+[2026-07-24 19:22:09.367 Server 215425] Client {PID: 215526, Context ID: 1} connected
+[2026-07-24 19:22:09.367 Server 215425] Creating worker thread for client {PID: 215526, Context ID: 1}
+[2026-07-24 19:22:09.367 Server 215425] Device NVIDIA A800-SXM4-80GB (uuid GPU-bc6f6460-c6ce-5737-1d7c-e745c8771862) is associated
+[2026-07-24 19:22:09.367 Server 215425] Status of client {PID: 215526, Context ID: 1} is ACTIVE
+[2026-07-24 19:22:11.650 Server 215425] Received new client request for {PID: 215526, Context ID: 1}
+[2026-07-24 19:22:11.650 Server 215425] Client {PID: 215525, Context ID: 1} connected
+[2026-07-24 19:22:11.650 Server 215425] Creating worker thread for client {PID: 215525, Context ID: 1}
+[2026-07-24 19:22:11.650 Server 215425] Device NVIDIA A800-SXM4-80GB (uuid GPU-bc6f6460-c6ce-5737-1d7c-e745c8771862) is associated
+[2026-07-24 19:22:11.650 Server 215425] Status of client {PID: 215525, Context ID: 1} is ACTIVE
+[2026-07-24 19:22:44.035 Server 215425] Server failed to recevie command with status 806, assuming client {PID: 215526, Context ID: 1} exit
+[2026-07-24 19:22:44.035 Server 215425] Client {PID: 215526, Context ID: 1} exiting. Number of active client contexts is 1.
+[2026-07-24 19:22:44.066 Server 215425] Server failed to recevie command with status 806, assuming client {PID: 215526, Context ID: 0} exit
+[2026-07-24 19:22:44.066 Server 215425] Client process 215526 disconnected
+[2026-07-24 19:22:44.120 Server 215425] Server failed to recevie command with status 806, assuming client {PID: 215525, Context ID: 1} exit
+[2026-07-24 19:22:44.120 Server 215425] Client {PID: 215525, Context ID: 1} exiting. Number of active client contexts is 0.
+[2026-07-24 19:22:44.158 Server 215425] Server failed to recevie command with status 806, assuming client {PID: 215525, Context ID: 0} exit
+[2026-07-24 19:22:44.158 Server 215425] Client process 215525 disconnected
+[2026-07-24 19:22:45.535 Server 215425] Server failed to recevie command with status 806, assuming client {PID: 215330, Context ID: 0} exit
+[2026-07-24 19:22:45.535 Server 215425] Client process 215330 disconnected
+[2026-07-24 19:22:45.563 Server 215425] Server has been notified to shutdown
+[2026-07-24 19:22:45.564 Server 215425] Waiting for current clients to finish
+[2026-07-24 19:22:45.564 Server 215425] Exiting
