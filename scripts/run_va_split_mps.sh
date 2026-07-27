@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Start OpenPI VA-split policy server under NVIDIA MPS.
-# All logs for one run go under: /data1/tianze/V-A schedule/logs/<timestamp>/*.log
+# All logs for one run go under: /data1/gaobowen/tianze/logs/v-a/<timestamp>/*.log
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -10,13 +10,13 @@ cd "${REPO_ROOT}"
 GPU_ID="${GPU_ID:-1}"
 PORT="${PORT:-8000}"
 POLICY_CONFIG="${POLICY_CONFIG:-pi05_libero}"
-POLICY_DIR="${POLICY_DIR:-/data2/gaobowen/model/RLinf-Pi05-LIBERO-SFT}"
+POLICY_DIR="${POLICY_DIR:-/data1/gaobowen/model/RLinf-Pi05-LIBERO-SFT}"
 RUN_MODE="${RUN_MODE:-server}"
 # ours mode : PROFILE_MODE=split-mps
 # baseline mode : PROFILE_MODE=monolithic
 PROFILE_MODE="${PROFILE_MODE:-split-mps}"
 RUN_TS="${RUN_TS:-$(date +%Y%m%d_%H%M%S)}"
-LOG_ROOT="${LOG_ROOT:-/data1/tianze/V-A schedule/logs}"
+LOG_ROOT="${LOG_ROOT:-/data1/gaobowen/tianze/logs/V-A}"
 RUN_LOG_DIR="${RUN_LOG_DIR:-${LOG_ROOT}/${RUN_TS}}"
 # MPS pipe sockets stay under the run dir but are not *.log files.
 MPS_PIPE_DIR="${MPS_PIPE_DIR:-${RUN_LOG_DIR}/mps-pipe}"
@@ -51,7 +51,7 @@ fi
 SEED="${SEED:-0}"
 PROFILE_LOG="${PROFILE_LOG:-${RUN_LOG_DIR}/profile.log}"
 JSON_OUTPUT="${JSON_OUTPUT:-${RUN_LOG_DIR}/profile.json}"
-PYTHON_BIN="${PYTHON_BIN:-/data1/tianze/RLinf-tianze/openpi05_libero_env/bin/python}"
+PYTHON_BIN="${PYTHON_BIN:-/data1/gaobowen/RLinf/.venv-libero-openpi/bin/python}"
 PYTORCH_COMPILE_MODE="${PYTORCH_COMPILE_MODE:-}"
 
 append_pytorch_compile_mode_arg() {

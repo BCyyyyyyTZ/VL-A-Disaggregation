@@ -21,6 +21,19 @@ CompileMode = Literal["default", "reduce-overhead", "max-autotune", "max-autotun
 TraceStatus = Literal["ok", "error", "timeout"]
 DEFAULT_PROFILE_CHECKPOINT_CONFIG = "pi05_libero"
 DEFAULT_PROFILE_CHECKPOINT_DIR = "/data2/gaobowen/model/RLinf-Pi05-LIBERO-SFT"
+# When torch.compile is enabled, warm these batch shapes before timed measurement.
+# Actual warmup sizes are clamped to profile_warmup_max_batch_size(), which for
+# VA-split follows runtime prefix capacity (max_vlm_batch_size * 3, typically 24).
+COMPILE_WARMUP_MAX_BATCH_SIZE = 32
+COMPILE_WARMUP_BATCH_PLAN: tuple[tuple[int, int], ...] = (
+    (1, 2),
+    (4, 1),
+    (8, 2),
+    (16, 1),
+    (20, 2),
+    (24, 1),
+    (32, 1),
+)
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -633,18 +646,8 @@ def run_profile(args: Args) -> BenchmarkResult:
     sampler = GpuUtilizationSampler(device_index=resolve_gpu_device_index(policy_device, args.gpu_device_index))
     try:
         if args.mode == "monolithic" and args.batch_size > 1:
-            warmup_batch_requests = make_fcfs_batched_synthetic_requests(
-                requests,
-                max_batch_size=args.batch_size,
-                max_wait_ms=args.max_vlm_wait_ms,
-            )
             with ThreadPoolExecutor(max_workers=1, thread_name_prefix="va-profile-baseline-model") as executor:
-                warmup_policy_batch(
-                    policy,
-                    warmup_batch_requests[0],
-                    num_requests=args.warmup_requests,
-                    executor=executor,
-                )
+                _warmup_before_timed_workload(policy, requests, args=args, executor=executor)
                 sampler.start()
                 traces = asyncio.run(
                     run_benchmark_runtime_batch_requests(
@@ -661,12 +664,7 @@ def run_profile(args: Args) -> BenchmarkResult:
             supports_concurrent_infer = bool(getattr(policy, "supports_concurrent_infer", False))
             max_workers = args.max_inflight if supports_concurrent_infer else 1
             with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="va-profile") as executor:
-                warmup_policy(
-                    policy,
-                    requests[0],
-                    num_requests=args.warmup_requests,
-                    executor=executor,
-                )
+                _warmup_before_timed_workload(policy, requests, args=args, executor=executor)
                 sampler.start()
                 traces = asyncio.run(
                     run_benchmark_requests(
@@ -717,6 +715,95 @@ def warmup_policy_batch(
         raise ValueError("warmup_requests must be non-negative")
     for _ in range(num_requests):
         executor.submit(_call_policy_infer_batch, policy, request).result()
+
+
+def pytorch_compile_warmup_batch_plan(max_batch_size: int) -> tuple[tuple[int, int], ...]:
+    """Return compile warmup (batch_size, repeats), clamped to max_batch_size."""
+    if max_batch_size <= 0:
+        raise ValueError("max_batch_size must be positive")
+    return tuple((min(batch_size, max_batch_size), repeats) for batch_size, repeats in COMPILE_WARMUP_BATCH_PLAN)
+
+
+def make_fixed_size_batch_request(
+    requests: Sequence[SyntheticRequest],
+    *,
+    batch_size: int,
+) -> SyntheticBatchRequest:
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+    if not requests:
+        raise ValueError("requests must be non-empty")
+    selected = [requests[index % len(requests)] for index in range(batch_size)]
+    return SyntheticBatchRequest(
+        request_ids=tuple(request.request_id for request in selected),
+        scheduled_at_s=float(selected[-1].scheduled_at_s),
+        original_scheduled_at_s=tuple(request.scheduled_at_s for request in selected),
+        observation=_stack_observation_batch([request.observation for request in selected]),
+        noise=_stack_noise_batch([request.noise for request in selected]),
+    )
+
+
+def warmup_pytorch_compile_shapes(
+    policy: Any,
+    requests: Sequence[SyntheticRequest],
+    *,
+    max_batch_size: int,
+    executor: ThreadPoolExecutor,
+) -> None:
+    """Warm torch.compile paths with explicit batch shapes before timed runs."""
+    for batch_size, repeats in pytorch_compile_warmup_batch_plan(max_batch_size):
+        batch_request = make_fixed_size_batch_request(requests, batch_size=batch_size)
+        warmup_policy_batch(policy, batch_request, num_requests=repeats, executor=executor)
+
+
+def profile_warmup_max_batch_size(args: Args) -> int:
+    """Compile-shape warmup ceiling.
+
+    For VA-split this follows runtime prefix/live-feature capacity
+    (`max_vlm_batch_size * 3` in VASplitRuntime), not the VLM FCFS cap alone.
+    """
+    absolute_cap = COMPILE_WARMUP_MAX_BATCH_SIZE
+    if args.mode == "monolithic":
+        return min(absolute_cap, max(1, int(args.batch_size)))
+    # Keep in sync with openpi.serving.va_split.runtime.VASplitRuntime default slots.
+    prefix_capacity = max(1, int(args.max_vlm_batch_size) * 3)
+    return min(absolute_cap, prefix_capacity, max(1, int(args.max_ae_batch_size)))
+
+
+def _warmup_before_timed_workload(
+    policy: Any,
+    requests: Sequence[SyntheticRequest],
+    *,
+    args: Args,
+    executor: ThreadPoolExecutor,
+) -> None:
+    if args.pytorch_compile_mode is not None:
+        warmup_pytorch_compile_shapes(
+            policy,
+            requests,
+            max_batch_size=profile_warmup_max_batch_size(args),
+            executor=executor,
+        )
+        return
+    if args.mode == "monolithic" and args.batch_size > 1:
+        warmup_batch_requests = make_fcfs_batched_synthetic_requests(
+            requests,
+            max_batch_size=args.batch_size,
+            max_wait_ms=args.max_vlm_wait_ms,
+        )
+        warmup_policy_batch(
+            policy,
+            warmup_batch_requests[0],
+            num_requests=args.warmup_requests,
+            executor=executor,
+        )
+        return
+    warmup_policy(
+        policy,
+        requests[0],
+        num_requests=args.warmup_requests,
+        executor=executor,
+    )
 
 
 def _with_pytorch_compile_mode(train_config, compile_mode: CompileMode | None):

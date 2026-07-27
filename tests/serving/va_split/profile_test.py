@@ -404,6 +404,110 @@ def test_run_profile_warms_up_policy_before_timed_workload(monkeypatch):
     assert worker_thread_ids[0] != threading.get_ident()
 
 
+def test_pytorch_compile_warmup_batch_plan_matches_requested_shapes():
+    assert profile_va_split.COMPILE_WARMUP_MAX_BATCH_SIZE == 32
+    assert profile_va_split.COMPILE_WARMUP_BATCH_PLAN == (
+        (1, 2),
+        (4, 1),
+        (8, 2),
+        (16, 1),
+        (20, 2),
+        (24, 1),
+        (32, 1),
+    )
+    assert profile_va_split.pytorch_compile_warmup_batch_plan(32) == (
+        (1, 2),
+        (4, 1),
+        (8, 2),
+        (16, 1),
+        (20, 2),
+        (24, 1),
+        (32, 1),
+    )
+    assert profile_va_split.pytorch_compile_warmup_batch_plan(24) == (
+        (1, 2),
+        (4, 1),
+        (8, 2),
+        (16, 1),
+        (20, 2),
+        (24, 1),
+        (24, 1),
+    )
+    # VA-split default: max_vlm_batch_size=8 -> prefix capacity 24.
+    assert profile_va_split.profile_warmup_max_batch_size(
+        profile_va_split.Args(mode="split-mps", max_vlm_batch_size=8, max_ae_batch_size=999)
+    ) == 24
+    assert profile_va_split.profile_warmup_max_batch_size(
+        profile_va_split.Args(mode="monolithic", batch_size=8)
+    ) == 8
+
+
+def test_make_fixed_size_batch_request_tiles_when_needed():
+    requests = _fake_requests(3)
+    batch = profile_va_split.make_fixed_size_batch_request(requests, batch_size=8)
+
+    assert len(batch.request_ids) == 8
+    assert batch.request_ids[:3] == ("req-000000", "req-000001", "req-000002")
+    assert batch.request_ids[3:6] == ("req-000000", "req-000001", "req-000002")
+    np.testing.assert_array_equal(batch.observation["value"], [0, 1, 2, 0, 1, 2, 0, 1])
+
+
+def test_run_profile_compile_warmup_uses_batch_shapes_for_baseline(monkeypatch):
+    policy = _SerialFakePolicy(sleep_s=0.0)
+    monkeypatch.setattr(profile_va_split, "create_policy_for_mode", lambda args, mode: policy)
+    monkeypatch.setattr(profile_va_split, "make_synthetic_libero_requests", lambda **kwargs: _fake_requests(8))
+
+    result = profile_va_split.run_profile(
+        profile_va_split.Args(
+            mode="monolithic",
+            policy=profile_va_split.Checkpoint(config="dummy", dir="/tmp/checkpoint"),
+            num_requests=8,
+            request_rate_hz=1000.0,
+            batch_size=8,
+            max_vlm_wait_ms=2.0,
+            warmup_requests=2,
+            pytorch_compile_mode="default",
+            pytorch_device="cpu",
+        )
+    )
+
+    # monolithic clamps warmup to batch_size=8
+    expected_warmup = [1, 1, 4, 8, 8, 8, 8, 8, 8, 8]
+    assert policy.infer_calls == 0
+    assert policy.observed_batch_sizes[: len(expected_warmup)] == expected_warmup
+    assert policy.infer_batch_calls >= len(expected_warmup)
+    assert [trace.request_id for trace in result.traces] == [f"req-{idx:06d}" for idx in range(8)]
+
+
+def test_run_profile_compile_warmup_uses_batch_shapes_for_ours(monkeypatch):
+    policy = _ConcurrentFakePolicy(sleep_s=0.0)
+    monkeypatch.setattr(profile_va_split, "create_policy_for_mode", lambda args, mode: policy)
+    monkeypatch.setattr(profile_va_split, "make_synthetic_libero_requests", lambda **kwargs: _fake_requests(8))
+
+    result = profile_va_split.run_profile(
+        profile_va_split.Args(
+            mode="split-mps",
+            policy=profile_va_split.Checkpoint(config="dummy", dir="/tmp/checkpoint"),
+            num_requests=8,
+            request_rate_hz=1000.0,
+            batch_size=8,
+            max_vlm_batch_size=8,
+            max_ae_batch_size=999,
+            warmup_requests=2,
+            pytorch_compile_mode="default",
+            pytorch_device="cpu",
+            require_mps_env=False,
+        )
+    )
+
+    # prefix capacity = 8*3 = 24, so planned 32 is clamped to 24
+    expected_warmup = [1, 1, 4, 8, 8, 16, 20, 20, 24, 24]
+    assert policy.observed_batch_sizes[: len(expected_warmup)] == expected_warmup
+    assert policy.infer_batch_calls == len(expected_warmup)
+    assert policy.infer_calls == 8
+    assert [trace.request_id for trace in result.traces] == [f"req-{idx:06d}" for idx in range(8)]
+
+
 def test_run_profile_uses_baseline_fcfs_batching_only_for_monolithic(monkeypatch):
     policy = _SerialFakePolicy(sleep_s=0.0)
     monkeypatch.setattr(profile_va_split, "create_policy_for_mode", lambda args, mode: policy)
