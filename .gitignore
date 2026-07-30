@@ -2,6 +2,7 @@
 assets/
 checkpoints/
 data/
+logs/
 wandb/
 
 # Byte-compiled / optimized / DLL files
@@ -63,8 +64,6 @@ cover/
 
 # Django stuff:
 *.log
-# Keep VA-split experiment profile logs tracked in-repo.
-!logs/V-A/**/*.log
 local_settings.py
 db.sqlite3
 db.sqlite3-journal

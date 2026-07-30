@@ -11,9 +11,12 @@ GPU_ID="${GPU_ID:-3}"
 MODE="${MODE:-split-mps}"
 # MODE="${MODE:-monolithic}"
 POLICY_CONFIG="${POLICY_CONFIG:-pi05_libero}"
-POLICY_DIR="${POLICY_DIR:-/data2/gaobowen/model/RLinf-Pi05-LIBERO-SFT}"
-MPS_PIPE_DIR="${MPS_PIPE_DIR:-/tmp/openpi-mps-${USER}-gpu${GPU_ID}}"
-MPS_LOG_DIR="${MPS_LOG_DIR:-/tmp/openpi-mps-log-${USER}-gpu${GPU_ID}}"
+POLICY_DIR="${POLICY_DIR:-/data1/miliang/models/RLinf-Pi05-LIBERO-SFT}"
+LOG_ROOT="${LOG_ROOT:-/data1/miliang/VL-A-Disaggregation/logs}"
+RUN_TS="${RUN_TS:-$(date +%Y%m%d_%H%M%S)}"
+RUN_LOG_DIR="${RUN_LOG_DIR:-${LOG_ROOT}/${RUN_TS}}"
+MPS_PIPE_DIR="${MPS_PIPE_DIR:-${RUN_LOG_DIR}/mps-pipe}"
+MPS_LOG_DIR="${MPS_LOG_DIR:-${RUN_LOG_DIR}}"
 AE_SM_PERCENT="${AE_SM_PERCENT:-20}"
 VLM_SM_PERCENT="${VLM_SM_PERCENT:-0}"
 MAX_AE_BATCH_SIZE="${MAX_AE_BATCH_SIZE:-8}"
@@ -23,9 +26,9 @@ MAX_INFLIGHT="${MAX_INFLIGHT:-64}"
 SEED="${SEED:-0}"
 NUM_STEPS="${NUM_STEPS:-10}"
 TIMEOUT_S="${TIMEOUT_S:-60}"
-JSON_OUTPUT="${JSON_OUTPUT:-}"
+JSON_OUTPUT="${JSON_OUTPUT:-${RUN_LOG_DIR}/profile.json}"
 CHECK_CONSISTENCY="${CHECK_CONSISTENCY:-0}"
-PYTHON_BIN="${PYTHON_BIN:-python}"
+PYTHON_BIN="${PYTHON_BIN:-/data1/miliang/RLinf/openpi_libero/bin/python}"
 
 # Prefer the local editable source over any site-packages openpi install.
 export PYTHONPATH="${REPO_ROOT}/src:${REPO_ROOT}/packages/openpi-client/src${PYTHONPATH:+:${PYTHONPATH}}"
@@ -48,6 +51,8 @@ case "${MODE}" in
     exit 1
     ;;
 esac
+
+mkdir -p "${RUN_LOG_DIR}"
 
 if [[ "${MODE}" == "split-mps" ]]; then
   mkdir -p "${MPS_PIPE_DIR}" "${MPS_LOG_DIR}"
@@ -89,4 +94,7 @@ fi
 cmd+=("$@")
 
 echo "Running V-A profile: mode=${MODE} gpu=${GPU_ID} policy_dir=${POLICY_DIR}"
+echo "  python:  ${PYTHON_BIN}"
+echo "  logs:    ${RUN_LOG_DIR}"
+echo "  json:    ${JSON_OUTPUT}"
 "${cmd[@]}"

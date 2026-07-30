@@ -20,7 +20,7 @@ Mode = Literal["monolithic", "split-no-mps", "split-mps"]
 CompileMode = Literal["default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"]
 TraceStatus = Literal["ok", "error", "timeout"]
 DEFAULT_PROFILE_CHECKPOINT_CONFIG = "pi05_libero"
-DEFAULT_PROFILE_CHECKPOINT_DIR = "/data2/gaobowen/model/RLinf-Pi05-LIBERO-SFT"
+DEFAULT_PROFILE_CHECKPOINT_DIR = "/data1/miliang/models/RLinf-Pi05-LIBERO-SFT"
 # When torch.compile is enabled, warm these batch shapes before timed measurement.
 # Actual warmup sizes are clamped to profile_warmup_max_batch_size(), which for
 # VA-split follows runtime prefix capacity (max_vlm_batch_size * 3, typically 24).

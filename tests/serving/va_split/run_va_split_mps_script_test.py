@@ -14,7 +14,7 @@ def test_run_va_split_mps_defaults_to_libero_env_python():
     repo_root = pathlib.Path(__file__).resolve().parents[3]
     script = (repo_root / "scripts/run_va_split_mps.sh").read_text(encoding="utf-8")
 
-    assert 'PYTHON_BIN="${PYTHON_BIN:-/data1/tianze/RLinf-tianze/openpi05_libero_env/bin/python}"' in script
+    assert 'PYTHON_BIN="${PYTHON_BIN:-/data1/miliang/RLinf/openpi_libero/bin/python}"' in script
     assert 'WARMUP_REQUESTS="${WARMUP_REQUESTS:-2}"' in script
     assert 'BATCH_SIZE="${BATCH_SIZE:-${MAX_VLM_BATCH_SIZE}}"' in script
     assert 'ENABLE_POLICY_BATCH="${ENABLE_POLICY_BATCH:-true}"' in script
@@ -70,7 +70,7 @@ def test_run_va_split_mps_profile_mode_invokes_profile_workload(tmp_path):
     assert result.returncode == 0, result.stderr
     args = python_arg_log.read_text(encoding="utf-8").splitlines()
     assert args[:2] == ["scripts/profile_va_split.py", "--policy.config"]
-    assert _flag_value(args, "--policy.dir") == "/data2/gaobowen/model/RLinf-Pi05-LIBERO-SFT"
+    assert _flag_value(args, "--policy.dir") == "/data1/miliang/models/RLinf-Pi05-LIBERO-SFT"
     assert _flag_value(args, "--mode") == "split-mps"
     assert _flag_value(args, "--num-requests") == "3"
     assert _flag_value(args, "--request-rate-hz") == "7"
