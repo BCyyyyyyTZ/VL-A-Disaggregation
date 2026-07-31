@@ -1,0 +1,31 @@
+{
+  "consumer_devices": [
+    "cuda:0",
+    "cuda:1",
+    "cuda:2",
+    "cuda:3",
+    "cuda:4",
+    "cuda:5",
+    "cuda:6",
+    "cuda:7"
+  ],
+  "elapsed_ms": 9240.966320037842,
+  "payload_dtype": "float32",
+  "payload_shape": [
+    16,
+    64
+  ],
+  "producer_devices": [
+    "cuda:0",
+    "cuda:1",
+    "cuda:2",
+    "cuda:3",
+    "cuda:4",
+    "cuda:5",
+    "cuda:6",
+    "cuda:7"
+  ],
+  "reason": "producer_exit=0, consumer_exit=0",
+  "status": "passed",
+  "transport": "device-ipc"
+}
