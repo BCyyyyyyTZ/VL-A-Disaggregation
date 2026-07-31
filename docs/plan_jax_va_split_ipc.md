@@ -1007,7 +1007,7 @@ git commit -m "feat: add JAX prefix cache lane pool"
 - Create: `src/openpi/serving/va_split_jax/__init__.py`
 - Test: `tests/serving/va_split_jax/test_types.py`
 
-- [ ] **Step 1: 写消息类型**
+- [x] **Step 1: 写消息类型**
 
 Create `src/openpi/serving/va_split_jax/types.py`:
 
@@ -1095,7 +1095,7 @@ class JaxShutdown:
     pass
 ```
 
-- [ ] **Step 2: 写 timing helper**
+- [x] **Step 2: 写 timing helper**
 
 Create `src/openpi/serving/va_split_jax/timing.py`，复制 PyTorch 版 `src/openpi/serving/va_split/timing.py` 的 public function 名称，并把 CUDA sync 改成 JAX：
 
@@ -1139,7 +1139,7 @@ def queue_wait_and_transfer_ms(
     )
 ```
 
-- [ ] **Step 3: 写 package marker**
+- [x] **Step 3: 写 package marker**
 
 Create `src/openpi/serving/va_split_jax/__init__.py`:
 
@@ -1147,7 +1147,7 @@ Create `src/openpi/serving/va_split_jax/__init__.py`:
 """JAX V-A split serving runtime."""
 ```
 
-- [ ] **Step 4: 写 round-trip 测试**
+- [x] **Step 4: 写 round-trip 测试**
 
 Create `tests/serving/va_split_jax/test_types.py`:
 
@@ -1201,7 +1201,7 @@ def test_jax_request_envelope_has_enqueue_timestamp():
     assert request.enqueue_ns > 0
 ```
 
-- [ ] **Step 5: 运行测试**
+- [x] **Step 5: 运行测试**
 
 Run:
 
@@ -1211,7 +1211,7 @@ PYTHONPATH=src:packages/openpi-client/src /data1/miliang/RLinf/openpi_libero/bin
 
 Expected: `2 passed`。
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add src/openpi/serving/va_split_jax/types.py src/openpi/serving/va_split_jax/timing.py src/openpi/serving/va_split_jax/__init__.py tests/serving/va_split_jax/test_types.py
