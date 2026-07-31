@@ -98,6 +98,13 @@ def test_args_defaults_to_two_warmup_requests():
     assert profile_va_split.Args().warmup_requests == 2
 
 
+def test_args_defaults_to_jax_compile_enabled():
+    args = profile_va_split.Args()
+    assert args.jax_compile is True
+    assert args.jax_compile_warmup is True
+    assert args.jax_compile_warmup_max_batch_size == 32
+
+
 def test_args_disables_pytorch_compile_by_default():
     assert profile_va_split.Args().pytorch_compile_mode is None
 

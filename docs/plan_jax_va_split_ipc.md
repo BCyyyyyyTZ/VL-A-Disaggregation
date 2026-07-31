@@ -1649,7 +1649,7 @@ git commit -m "feat: add JAX VA split policy"
 - Modify: `scripts/profile_va_split.py`
 - Test: `tests/serving/va_split_jax/test_compile_warmup.py`
 
-- [ ] **Step 1: 定义 compile 配置**
+- [x] **Step 1: 定义 compile 配置**
 
 Create `src/openpi/serving/va_split_jax/compile.py`:
 
@@ -1709,7 +1709,7 @@ def planned_warmup_batches(*, max_batch_size: int, warmup_max_batch_size: int) -
 - 所有 NNX model method compile 必须走 `nnx_utils.module_jit`，禁止裸 `jax.jit(model.bound_method)` 或 `nnx.jit(model.bound_method)`。
 - 默认 `enabled=True`，CLI 可关闭。
 
-- [ ] **Step 2: 实现 split warmup helper**
+- [x] **Step 2: 实现 split warmup helper**
 
 在 `compile.py` 增加：
 
@@ -1752,7 +1752,7 @@ def warmup_split_model(
 - AE warmup 至少覆盖 `max_ae_batch_size` 以内的 single-step denoise shape。
 - warmup 上限受 `max_prefix_slots` 限制，行为对齐 PyTorch `COMPILE_WARMUP_BATCH_PLAN` 的 clamp 逻辑。
 
-- [ ] **Step 3: 实现 monolithic baseline warmup helper**
+- [x] **Step 3: 实现 monolithic baseline warmup helper**
 
 在 `compile.py` 增加：
 
@@ -1785,7 +1785,7 @@ def warmup_monolithic_model(
 
 baseline warmup 编译完整 VLA 推理图，不拆 VLM/AE。
 
-- [ ] **Step 4: 接入 policy/runtime 创建**
+- [x] **Step 4: 接入 policy/runtime 创建**
 
 在 `create_trained_jax_va_split_policy()` 增加参数：
 
@@ -1801,7 +1801,7 @@ jax_compile_warmup_max_batch_size: int = 32
 - `jax-monolithic`：创建 baseline policy 时调用 `maybe_jit_monolithic_model()` 并执行 monolithic warmup。
 - `jax_compile=False` 时不调用 `jax.jit`，warmup 只跑 1 个 batch size 1 的 functional request，避免首次正式请求才初始化模型。
 
-- [ ] **Step 5: 扩展 profile CLI**
+- [x] **Step 5: 扩展 profile CLI**
 
 在 `scripts/profile_va_split.py` 的 args 增加：
 
@@ -1820,7 +1820,7 @@ jax_compile_warmup_max_batch_size: int = 32
   - `jax_compile_warmup_enabled`
   - `jax_warmup_batches`
 
-- [ ] **Step 6: 写 compile/warmup 测试**
+- [x] **Step 6: 写 compile/warmup 测试**
 
 Create `tests/serving/va_split_jax/test_compile_warmup.py`:
 
@@ -1876,7 +1876,7 @@ def test_compile_helpers_use_module_jit(monkeypatch):
     assert calls[-1][2] == {"static_argnames": ("num_steps",)}
 ```
 
-- [ ] **Step 7: 运行测试**
+- [x] **Step 7: 运行测试**
 
 Run:
 
@@ -1886,7 +1886,7 @@ PYTHONPATH=src:packages/openpi-client/src /data1/miliang/RLinf/openpi_libero/bin
 
 Expected: `3 passed`。
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add src/openpi/serving/va_split_jax/compile.py src/openpi/policies/jax_va_split_policy.py scripts/profile_va_split.py tests/serving/va_split_jax/test_compile_warmup.py

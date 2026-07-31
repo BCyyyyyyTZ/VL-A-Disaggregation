@@ -14,6 +14,8 @@ import numpy as np
 
 from openpi.serving.va_split_jax.ae_process import JaxAEProcess
 from openpi.serving.va_split_jax.ae_process import JaxAEWorker
+from openpi.serving.va_split_jax.compile import JaxCompileConfig
+from openpi.serving.va_split_jax.compile import maybe_jit_split_model
 from openpi.serving.va_split_jax.device_slab import make_default_device_slab_backend
 from openpi.serving.va_split_jax.prefix_cache_pool import JaxVlmPrefixCacheLanePool
 from openpi.serving.va_split_jax.timing import queue_wait_and_transfer_ms
@@ -113,10 +115,13 @@ def _run_jax_vlm_process(
     max_vlm_batch_size,
     max_vlm_wait_ms,
     max_prefix_slots,
+    compile_config=None,
     env_updates=None,
 ) -> None:
     _apply_env_updates(env_updates)
     model = model_factory()
+    if compile_config is not None:
+        model = maybe_jit_split_model(model, compile_config)
     backend = make_default_device_slab_backend()
     prefix_pool = JaxVlmPrefixCacheLanePool(max_lanes=max_prefix_slots, backend=backend)
     JaxVLMProcess(
@@ -138,10 +143,13 @@ def _run_jax_ae_process(
     release_queue,
     max_ae_batch_size,
     max_prefix_slots,
+    compile_config=None,
     env_updates=None,
 ) -> None:
     _apply_env_updates(env_updates)
     model = model_factory()
+    if compile_config is not None:
+        model = maybe_jit_split_model(model, compile_config)
     JaxAEProcess(
         model=model,
         prefix_queue=prefix_queue,
@@ -165,6 +173,7 @@ class JaxProcessVASplitRuntime:
         result_timeout_s: float = 120.0,
         vlm_env_updates: dict[str, str | None] | None = None,
         ae_env_updates: dict[str, str | None] | None = None,
+        compile_config: JaxCompileConfig | None = None,
     ):
         if max_prefix_slots is None:
             max_prefix_slots = max_vlm_batch_size * 3
@@ -190,6 +199,7 @@ class JaxProcessVASplitRuntime:
                 max_vlm_batch_size,
                 max_vlm_wait_ms,
                 max_prefix_slots,
+                compile_config,
                 vlm_env_updates,
             ),
             daemon=True,
@@ -203,6 +213,7 @@ class JaxProcessVASplitRuntime:
                 self._release_queue,
                 max_ae_batch_size,
                 max_prefix_slots,
+                compile_config,
                 ae_env_updates,
             ),
             daemon=True,

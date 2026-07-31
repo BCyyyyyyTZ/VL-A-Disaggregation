@@ -100,6 +100,9 @@ class Args:
     fixed_noise: bool = True
     timeout_s: float = 60.0
     warmup_requests: int = 2
+    jax_compile: bool = True
+    jax_compile_warmup: bool = True
+    jax_compile_warmup_max_batch_size: int = 32
     slo_ms: float = 200.0
     pytorch_device: str | None = None
     pytorch_compile_mode: CompileMode | None = None
@@ -687,6 +690,9 @@ def run_profile(args: Args) -> BenchmarkResult:
         gpu_sm_util_mean=sampler.gpu_sm_util_mean,
         gpu_mem_bw_util_mean=sampler.gpu_mem_bw_util_mean,
     )
+    summary["jax_compile_enabled"] = bool(args.jax_compile)
+    summary["jax_compile_warmup_enabled"] = bool(args.jax_compile_warmup)
+    summary["jax_warmup_batches"] = 0.0
     consistency = _run_consistency_check(args, requests) if args.check_consistency else None
     return BenchmarkResult(traces=traces, summary=summary, consistency=consistency)
 

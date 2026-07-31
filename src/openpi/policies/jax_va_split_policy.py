@@ -16,6 +16,7 @@ from openpi import transforms as _transforms
 from openpi.models import model as _model
 from openpi.policies import batch_inference as _batch
 from openpi.policies import policy as _policy
+from openpi.serving.va_split_jax.compile import JaxCompileConfig
 from openpi.serving.va_split_jax.runtime import JaxProcessVASplitRuntime
 from openpi.serving.va_split_jax.types import JaxActionResult
 from openpi.shared import download
@@ -167,6 +168,9 @@ def create_trained_jax_va_split_policy(
     ae_sm_percent: int = 20,
     vlm_sm_percent: int = 0,
     result_timeout_s: float = 120.0,
+    jax_compile: bool = True,
+    jax_compile_warmup: bool = True,
+    jax_compile_warmup_max_batch_size: int = 32,
 ) -> JaxVASplitPolicy:
     repack_transforms = repack_transforms or _transforms.Group()
     checkpoint_dir = pathlib.Path(download.maybe_download(str(checkpoint_dir)))
@@ -193,6 +197,11 @@ def create_trained_jax_va_split_policy(
         result_timeout_s=result_timeout_s,
         vlm_env_updates=_mps_env_updates(vlm_sm_percent),
         ae_env_updates=_mps_env_updates(ae_sm_percent),
+        compile_config=JaxCompileConfig(
+            enabled=jax_compile,
+            warmup_enabled=jax_compile_warmup,
+            warmup_max_batch_size=jax_compile_warmup_max_batch_size,
+        ),
     )
     return JaxVASplitPolicy(
         runtime=runtime,
