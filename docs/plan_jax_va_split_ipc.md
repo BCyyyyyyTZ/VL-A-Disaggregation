@@ -1439,7 +1439,7 @@ git commit -m "feat: add JAX AE continuous batching worker"
 - Create: `src/openpi/serving/va_split_jax/runtime.py`
 - Test: `tests/serving/va_split_jax/test_runtime.py`
 
-- [ ] **Step 1: 实现 local runtime 仅用于数值对齐**
+- [x] **Step 1: 实现 local runtime 仅用于数值对齐**
 
 `JaxLocalVASplitRuntime` 只用于数值和调度单元测试，不作为 ours profile 主线。它必须复用 `JaxVLMWorker` 与 `JaxAEWorker`，执行流程如下：
 
@@ -1470,7 +1470,7 @@ class JaxLocalVASplitRuntime:
         raise RuntimeError(f"Request {request_id} finished without an action result")
 ```
 
-- [ ] **Step 2: 实现 JAX launcher 环境**
+- [x] **Step 2: 实现 JAX launcher 环境**
 
 Create `src/openpi/serving/va_split_jax/launcher.py`：
 
@@ -1515,7 +1515,7 @@ def build_jax_mps_process_envs(
 - `ae_sm_percent=20` 时 AE env 设置 `CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=20`。
 - `vlm_sm_percent=0` 时 VLM env 不包含 `CUDA_MPS_ACTIVE_THREAD_PERCENTAGE`，与 PyTorch 语义一致。
 
-- [ ] **Step 3: 实现 process runtime**
+- [x] **Step 3: 实现 process runtime**
 
 `JaxProcessVASplitRuntime` 同构 PyTorch `ProcessVASplitRuntime`：
 
@@ -1530,7 +1530,7 @@ def build_jax_mps_process_envs(
 - `shutdown()` 发 `JaxShutdown` 并 join/terminate。
 - 子进程启动前使用 `build_jax_mps_process_envs()` 构造 env，并在 child target 内先应用 env，再 import/初始化 JAX model。
 
-- [ ] **Step 4: 确保模型加载在子进程内发生**
+- [x] **Step 4: 确保模型加载在子进程内发生**
 
 进程 target：
 
@@ -1547,7 +1547,7 @@ def _run_jax_ae_process(model_factory, prefix_queue, result_queue, release_queue
 
 不要在 parent 中创建 JAX model 后 pickle 给 child。
 
-- [ ] **Step 5: 写 runtime 测试**
+- [x] **Step 5: 写 runtime 测试**
 
 测试用 fake model：
 
@@ -1556,7 +1556,7 @@ def _run_jax_ae_process(model_factory, prefix_queue, result_queue, release_queue
 - result timing 包含 `vlm_effective_batch`、`ae_effective_batch_mean`。
 - `shutdown()` 后再 `infer()` 抛 `RuntimeError`。
 
-- [ ] **Step 6: 运行测试**
+- [x] **Step 6: 运行测试**
 
 Run:
 
@@ -1566,7 +1566,7 @@ PYTHONPATH=src:packages/openpi-client/src /data1/miliang/RLinf/openpi_libero/bin
 
 Expected: 全部 PASS。
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add src/openpi/serving/va_split_jax/launcher.py src/openpi/serving/va_split_jax/runtime.py tests/serving/va_split_jax/test_runtime.py
