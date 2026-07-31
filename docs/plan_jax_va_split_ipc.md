@@ -1354,7 +1354,7 @@ git commit -m "feat: add JAX VLM split worker"
 - Create: `src/openpi/serving/va_split_jax/ae_process.py`
 - Test: `tests/serving/va_split_jax/test_ae_process.py`
 
-- [ ] **Step 1: 实现 AERequestState**
+- [x] **Step 1: 实现 AERequestState**
 
 ```python
 from dataclasses import dataclass
@@ -1378,7 +1378,7 @@ class JaxAERequestState:
     lane_compact_ms: float = 0.0
 ```
 
-- [ ] **Step 2: 实现 JaxAEWorker**
+- [x] **Step 2: 实现 JaxAEWorker**
 
 同构 PyTorch `AEWorker` 的 continuous batching，但不维护 prefix/KV lane pool：
 
@@ -1389,7 +1389,7 @@ class JaxAERequestState:
 - 完成请求立即返回 `JaxActionResult` 和 `JaxReleaseFeature`。
 - `_remove_active_lane()` 只 compact AE 本地 denoise state table，不移动 prefix/KV feature。
 
-- [ ] **Step 3: 实现 JaxAEProcess**
+- [x] **Step 3: 实现 JaxAEProcess**
 
 同构 PyTorch `AEProcess`：
 
@@ -1401,7 +1401,7 @@ class JaxAERequestState:
 - release_queue 通知 VLM 释放 slot；VLM 完成 compaction 后通过 `JaxSlotMoved` 更新 AE。
 - error 时清空 active 并 release。
 
-- [ ] **Step 4: 写 AE continuous batching 测试**
+- [x] **Step 4: 写 AE continuous batching 测试**
 
 Create `tests/serving/va_split_jax/test_ae_process.py`，覆盖：
 
@@ -1410,7 +1410,7 @@ Create `tests/serving/va_split_jax/test_ae_process.py`，覆盖：
 - 先完成的 request 释放 slot 后，VLM compaction 发送 `JaxSlotMoved`，AE 更新对应 active request 的 `prefix_slot_id`。
 - `ae_effective_batch`、`prefix_pool_write_ms`、`prefix_pool_compact_ms`、`prefix_slab_map_ms` 有值。
 
-- [ ] **Step 5: 运行测试**
+- [x] **Step 5: 运行测试**
 
 Run:
 
@@ -1420,7 +1420,7 @@ PYTHONPATH=src:packages/openpi-client/src /data1/miliang/RLinf/openpi_libero/bin
 
 Expected: 全部 PASS。
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add src/openpi/serving/va_split_jax/ae_process.py tests/serving/va_split_jax/test_ae_process.py

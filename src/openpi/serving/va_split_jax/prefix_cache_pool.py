@@ -85,6 +85,15 @@ class JaxVlmPrefixCacheLanePool:
             raise RuntimeError("Cannot export prefix slab handles before initialization")
         return _export_slab_handle_tree(self._past_slabs, self._prefix_pad_masks, self._state)
 
+    def local_slab_tree(self) -> dict[str, Any]:
+        if self._past_slabs is None or self._prefix_pad_masks is None:
+            raise RuntimeError("Cannot access prefix slab tree before initialization")
+        return {
+            "past_key_values": self._past_slabs,
+            "prefix_pad_masks": self._prefix_pad_masks,
+            "state": self._state,
+        }
+
     def view_prefix_batch(self, batch_size: int) -> JaxPrefixFeature:
         if batch_size <= 0:
             raise ValueError("batch_size must be positive")
