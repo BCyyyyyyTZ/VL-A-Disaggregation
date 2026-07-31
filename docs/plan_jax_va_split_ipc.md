@@ -1584,7 +1584,7 @@ git commit -m "feat: add JAX VA split process runtime"
 - Create: `src/openpi/policies/jax_va_split_policy.py`
 - Test: `tests/policies/jax_va_split_policy_test.py`
 
-- [ ] **Step 1: 实现 policy wrapper**
+- [x] **Step 1: 实现 policy wrapper**
 
 接口对齐 `VASplitPolicy`：
 
@@ -1598,7 +1598,7 @@ git commit -m "feat: add JAX VA split process runtime"
 
 JAX 输入保持 JAX/NumPy，不转 PyTorch。
 
-- [ ] **Step 2: 实现** `create_trained_jax_va_split_policy`
+- [x] **Step 2: 实现** `create_trained_jax_va_split_policy`
 
 要求：
 
@@ -1609,7 +1609,7 @@ JAX 输入保持 JAX/NumPy，不转 PyTorch。
 - 构造 `JaxProcessVASplitRuntime`。
 - transforms / norm_stats 路线与 `create_trained_va_split_policy` 对齐。
 
-- [ ] **Step 3: 写 policy contract 测试**
+- [x] **Step 3: 写 policy contract 测试**
 
 覆盖：
 
@@ -1619,7 +1619,7 @@ JAX 输入保持 JAX/NumPy，不转 PyTorch。
 - timing 透传。
 - shutdown 委托 runtime。
 
-- [ ] **Step 4: 运行测试**
+- [x] **Step 4: 运行测试**
 
 Run:
 
@@ -1629,7 +1629,7 @@ PYTHONPATH=src:packages/openpi-client/src /data1/miliang/RLinf/openpi_libero/bin
 
 Expected: 全部 PASS。
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/openpi/policies/jax_va_split_policy.py tests/policies/jax_va_split_policy_test.py
