@@ -13,10 +13,13 @@ def synchronize_jax_if_needed() -> None:
         del device
 
 
-def timed_queue_get(q, *args, **kwargs) -> tuple[Any, int, int]:
+def timed_queue_get(q, *, block: bool = True, timeout: float | None = None) -> tuple[Any, int, int]:
     start_ns = time.monotonic_ns()
     try:
-        message = q.get(*args, **kwargs)
+        if block:
+            message = q.get() if timeout is None else q.get(timeout=timeout)
+        else:
+            message = q.get_nowait()
     except queue.Empty:
         raise
     end_ns = time.monotonic_ns()

@@ -1229,7 +1229,7 @@ git commit -m "feat: add JAX VA split message types"
 - Create: `src/openpi/serving/va_split_jax/vlm_process.py`
 - Test: `tests/serving/va_split_jax/test_vlm_process.py`
 
-- [ ] **Step 1: 实现 VLMWorker**
+- [x] **Step 1: 实现 VLMWorker**
 
 VLMWorker 同构 PyTorch `VLMWorker` 的 FCFS batching，但 JAX 版额外拥有唯一 prefix/KV lane pool。输出 `JaxPrefixReady` 只带 `slot_handle`，真实 prefix 始终只保留在 VLM 进程的 device slab 中。
 
@@ -1265,7 +1265,7 @@ class JaxVLMWorker:
 - 返回对应 row 的 `JaxPrefixReady(slot_handle=...)`。
 - slot handle 中只包含 slot id、shape/dtype tree 和必要的 view/open metadata；不包含 prefix/KV array。
 
-- [ ] **Step 2: 实现 JaxVLMProcess queue loop**
+- [x] **Step 2: 实现 JaxVLMProcess queue loop**
 
 同构 `src/openpi/serving/va_split/vlm_process.py`：
 
@@ -1297,7 +1297,7 @@ FCFS 行为必须与当前 PyTorch `VLMProcess._collect_fcfs_batch()` 对齐：
 - 窗口外可 prefetch backlog，遇到不兼容 request 放回 backlog 头部，不跳过。
 - live slot 不足时 defer 当前 message 并短 sleep，不丢请求。
 
-- [ ] **Step 3: 写 VLM 测试 fake model**
+- [x] **Step 3: 写 VLM 测试 fake model**
 
 Create `tests/serving/va_split_jax/test_vlm_process.py`，fake model 返回小型 JAX prefix tree：
 
@@ -1316,7 +1316,7 @@ class FakeJaxSplitModel:
         )
 ```
 
-- [ ] **Step 4: 覆盖 batch 与 release**
+- [x] **Step 4: 覆盖 batch 与 release**
 
 测试内容：
 
@@ -1326,7 +1326,7 @@ class FakeJaxSplitModel:
 - release 后 slot 回收。
 - release 导致 compaction 时，prefix/control queue 收到 `JaxSlotMoved(request_id="...", old_slot_id=..., new_slot_id=...)`。
 
-- [ ] **Step 5: 运行测试**
+- [x] **Step 5: 运行测试**
 
 Run:
 
@@ -1336,7 +1336,7 @@ PYTHONPATH=src:packages/openpi-client/src /data1/miliang/RLinf/openpi_libero/bin
 
 Expected: 全部 PASS。
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add src/openpi/serving/va_split_jax/vlm_process.py tests/serving/va_split_jax/test_vlm_process.py
