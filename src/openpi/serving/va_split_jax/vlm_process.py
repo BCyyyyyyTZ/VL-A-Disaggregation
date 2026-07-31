@@ -401,21 +401,21 @@ def _to_jax_tree(value: Any) -> Any:
 
 def _prefix_feature_row_view(feature: JaxPrefixFeature, row: int) -> JaxPrefixFeature:
     return JaxPrefixFeature(
-        past_key_values=_row_view_tree(feature.past_key_values, row),
+        past_key_values=_row_view_tree(feature.past_key_values, row, axis=1),
         prefix_pad_masks=feature.prefix_pad_masks[row : row + 1],
         state=feature.state[row : row + 1] if feature.state is not None else None,
     )
 
 
-def _row_view_tree(value: Any, row: int) -> Any:
+def _row_view_tree(value: Any, row: int, *, axis: int) -> Any:
     if isinstance(value, jax.Array):
-        return value[row : row + 1]
+        return jax.lax.dynamic_slice_in_dim(value, row, 1, axis=axis)
     if isinstance(value, tuple):
-        return tuple(_row_view_tree(item, row) for item in value)
+        return tuple(_row_view_tree(item, row, axis=axis) for item in value)
     if isinstance(value, list):
-        return [_row_view_tree(item, row) for item in value]
+        return [_row_view_tree(item, row, axis=axis) for item in value]
     if isinstance(value, dict):
-        return {key: _row_view_tree(item, row) for key, item in value.items()}
+        return {key: _row_view_tree(item, row, axis=axis) for key, item in value.items()}
     return value
 
 

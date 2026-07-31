@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import queue
 
+import jax
 import jax.numpy as jnp
 
 from openpi.models.jax_split_types import JaxPrefixFeature
@@ -27,8 +28,8 @@ class FakeJaxSplitModel:
         self.prefix_batch_sizes.append(batch)
         return JaxPrefixFeature(
             past_key_values=(
-                jnp.ones((batch, 3, 2, 4), dtype=jnp.float32),
-                jnp.full((batch, 3, 2, 4), 2.0, dtype=jnp.float32),
+                jnp.ones((3, batch, 2, 4), dtype=jnp.float32),
+                jnp.full((3, batch, 2, 4), 2.0, dtype=jnp.float32),
             ),
             prefix_pad_masks=jnp.ones((batch, 3), dtype=jnp.bool_),
             state=observation.state,
@@ -169,3 +170,18 @@ def test_jax_vlm_process_fcfs_splits_incompatible_prompt_lengths():
     assert model.prefix_batch_sizes == [1, 1]
     ready = [item for item in process._prefix_queue.items if isinstance(item, JaxPrefixReady)]
     assert [item.request_id for item in ready] == ["req-1", "req-2"]
+
+
+def test_jax_prefix_feature_is_valid_jit_output():
+    @jax.jit
+    def make_feature(x):
+        return JaxPrefixFeature(
+            past_key_values=(x[None, :, :], x[None, :, :] + 1),
+            prefix_pad_masks=jnp.ones((x.shape[0], x.shape[1]), dtype=jnp.bool_),
+            state=x,
+        )
+
+    feature = make_feature(jnp.ones((2, 3), dtype=jnp.float32))
+
+    assert isinstance(feature, JaxPrefixFeature)
+    assert feature.state.shape == (2, 3)

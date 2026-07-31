@@ -109,7 +109,7 @@ class JaxVlmPrefixCacheLanePool:
 
     def _move_lane(self, src_lane: int, dst_lane: int) -> None:
         batch = self.view_prefix_batch(src_lane + 1)
-        row = _row_view_tree(batch.past_key_values, src_lane)
+        row = _row_view_tree(batch.past_key_values, src_lane, axis=1)
         assert self._prefix_pad_masks is not None
         mask_row = self._backend.view_batch(self._prefix_pad_masks, src_lane + 1)[src_lane : src_lane + 1]
         state_row = None
@@ -124,7 +124,9 @@ class JaxVlmPrefixCacheLanePool:
 
     def _ensure_initialized(self, feature: JaxPrefixFeature) -> None:
         if self._past_slabs is None:
-            self._past_slabs = _make_tree_slabs(self._backend, "past", feature.past_key_values, self.max_lanes)
+            self._past_slabs = _make_tree_slabs(
+                self._backend, "past", feature.past_key_values, self.max_lanes, lane_axis=1
+            )
         else:
             _validate_tree_compatible(self._past_slabs, feature.past_key_values)
         if self._prefix_pad_masks is None:
@@ -147,21 +149,50 @@ class JaxVlmPrefixCacheLanePool:
             _validate_slab_compatible(self._state, feature.state)
 
 
-def _make_slab(backend: DeviceSlabBackend, name: str, value: jax.Array, max_lanes: int) -> DeviceSlab:
+def _make_slab(
+    backend: DeviceSlabBackend,
+    name: str,
+    value: jax.Array,
+    max_lanes: int,
+    *,
+    lane_axis: int = 0,
+) -> DeviceSlab:
     return backend.create_slab(
-        DeviceSlabSpec(name=name, shape=tuple(value.shape), dtype=str(value.dtype), max_lanes=max_lanes)
+        DeviceSlabSpec(
+            name=name,
+            shape=tuple(value.shape),
+            dtype=str(value.dtype),
+            max_lanes=max_lanes,
+            lane_axis=lane_axis,
+        )
     )
 
 
-def _make_tree_slabs(backend: DeviceSlabBackend, prefix: str, value: Any, max_lanes: int) -> Any:
+def _make_tree_slabs(
+    backend: DeviceSlabBackend,
+    prefix: str,
+    value: Any,
+    max_lanes: int,
+    *,
+    lane_axis: int,
+) -> Any:
     if isinstance(value, jax.Array):
-        return _make_slab(backend, prefix, value, max_lanes)
+        return _make_slab(backend, prefix, value, max_lanes, lane_axis=lane_axis)
     if isinstance(value, tuple):
-        return tuple(_make_tree_slabs(backend, f"{prefix}.{idx}", item, max_lanes) for idx, item in enumerate(value))
+        return tuple(
+            _make_tree_slabs(backend, f"{prefix}.{idx}", item, max_lanes, lane_axis=lane_axis)
+            for idx, item in enumerate(value)
+        )
     if isinstance(value, list):
-        return [_make_tree_slabs(backend, f"{prefix}.{idx}", item, max_lanes) for idx, item in enumerate(value)]
+        return [
+            _make_tree_slabs(backend, f"{prefix}.{idx}", item, max_lanes, lane_axis=lane_axis)
+            for idx, item in enumerate(value)
+        ]
     if isinstance(value, dict):
-        return {key: _make_tree_slabs(backend, f"{prefix}.{key}", item, max_lanes) for key, item in value.items()}
+        return {
+            key: _make_tree_slabs(backend, f"{prefix}.{key}", item, max_lanes, lane_axis=lane_axis)
+            for key, item in value.items()
+        }
     raise TypeError(f"Unsupported JAX prefix tree node: {type(value)}")
 
 
@@ -215,15 +246,15 @@ def _export_slab_tree_handles(slabs: Any) -> Any:
     raise TypeError(f"Unsupported JAX slab tree node: {type(slabs)}")
 
 
-def _row_view_tree(value: Any, row: int) -> Any:
+def _row_view_tree(value: Any, row: int, *, axis: int) -> Any:
     if isinstance(value, jax.Array):
-        return value[row : row + 1]
+        return jax.lax.dynamic_slice_in_dim(value, row, 1, axis=axis)
     if isinstance(value, tuple):
-        return tuple(_row_view_tree(item, row) for item in value)
+        return tuple(_row_view_tree(item, row, axis=axis) for item in value)
     if isinstance(value, list):
-        return [_row_view_tree(item, row) for item in value]
+        return [_row_view_tree(item, row, axis=axis) for item in value]
     if isinstance(value, dict):
-        return {key: _row_view_tree(item, row) for key, item in value.items()}
+        return {key: _row_view_tree(item, row, axis=axis) for key, item in value.items()}
     raise TypeError(f"Unsupported JAX prefix tree node: {type(value)}")
 
 
@@ -237,8 +268,8 @@ def _validate_single_row_feature(feature: JaxPrefixFeature) -> None:
 
 def _validate_single_row_tree(value: Any) -> None:
     if isinstance(value, jax.Array):
-        if value.shape[0] != 1:
-            raise ValueError(f"prefix tree array must have batch size 1, got {value.shape}")
+        if value.ndim < 2 or value.shape[1] != 1:
+            raise ValueError(f"prefix tree array must have batch size 1 on axis 1, got {value.shape}")
         return
     if isinstance(value, (tuple, list)):
         for item in value:

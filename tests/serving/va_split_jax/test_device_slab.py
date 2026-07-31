@@ -24,12 +24,24 @@ def test_device_slab_put_lane_and_view_batch():
     slab.close()
 
 
+def test_device_slab_preserves_bfloat16_logical_dtype():
+    backend = make_default_device_slab_backend()
+    slab = backend.create_slab(DeviceSlabSpec(name="x", shape=(1, 2, 3), dtype="bfloat16", max_lanes=4))
+    try:
+        slab = backend.copy_lane_from_array(slab, 0, jnp.ones((1, 2, 3), dtype=jnp.bfloat16))
+        batch = backend.view_batch(slab, 1)
+        assert batch.dtype == jnp.bfloat16
+        np.testing.assert_allclose(np.asarray(batch[0]), np.ones((2, 3), dtype=np.float32))
+    finally:
+        slab.close()
+
+
 def _producer(control_queue: mp.Queue, result_queue: mp.Queue) -> None:
     backend = CudaIpcDeviceSlabBackend()
-    slab = backend.create_slab(DeviceSlabSpec(name="ipc", shape=(1, 2, 3), dtype="float32", max_lanes=4))
+    slab = backend.create_slab(DeviceSlabSpec(name="ipc", shape=(1, 2, 3), dtype="bfloat16", max_lanes=4))
     try:
-        slab = backend.copy_lane_from_array(slab, 0, jnp.ones((1, 2, 3), dtype=jnp.float32))
-        slab = backend.copy_lane_from_array(slab, 1, jnp.full((1, 2, 3), 2.0, dtype=jnp.float32))
+        slab = backend.copy_lane_from_array(slab, 0, jnp.ones((1, 2, 3), dtype=jnp.bfloat16))
+        slab = backend.copy_lane_from_array(slab, 1, jnp.full((1, 2, 3), 2.0, dtype=jnp.bfloat16))
         control_queue.put(slab.handle)
         ack = result_queue.get(timeout=30)
         if ack != "ok":
@@ -50,6 +62,7 @@ def _consumer(control_queue: mp.Queue, result_queue: mp.Queue) -> None:
         slab = CudaIpcDeviceSlabBackend().open_slab(message)
         try:
             batch = CudaIpcDeviceSlabBackend().slice_lanes(slab, (0, 1))
+            assert batch.dtype == jnp.bfloat16
             np.testing.assert_allclose(np.asarray(batch[0]), np.ones((2, 3), dtype=np.float32))
             np.testing.assert_allclose(np.asarray(batch[1]), np.full((2, 3), 2.0, dtype=np.float32))
         finally:

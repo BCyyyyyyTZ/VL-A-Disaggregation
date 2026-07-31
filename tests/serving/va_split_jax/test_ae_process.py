@@ -77,8 +77,8 @@ class SimpleQueue:
 def _feature(fill: float) -> JaxPrefixFeature:
     return JaxPrefixFeature(
         past_key_values=(
-            jnp.full((1, 3, 2, 4), fill, dtype=jnp.float32),
-            jnp.full((1, 3, 2, 4), fill + 1, dtype=jnp.float32),
+            jnp.full((3, 1, 2, 4), fill, dtype=jnp.float32),
+            jnp.full((3, 1, 2, 4), fill + 1, dtype=jnp.float32),
         ),
         prefix_pad_masks=jnp.ones((1, 3), dtype=jnp.bool_),
         state=jnp.full((1, 8), fill, dtype=jnp.float32),

@@ -13,6 +13,13 @@ class JaxPrefixFeature:
     state: jax.Array | None
 
 
+jax.tree_util.register_dataclass(
+    JaxPrefixFeature,
+    data_fields=["past_key_values", "prefix_pad_masks", "state"],
+    meta_fields=[],
+)
+
+
 @dataclass(frozen=True, slots=True)
 class JaxDenoiseState:
     x_t: jax.Array

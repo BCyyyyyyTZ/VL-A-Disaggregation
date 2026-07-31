@@ -1905,7 +1905,7 @@ git commit -m "feat: add JAX VA split compile warmup"
 - Create: `scripts/run_profile_va_split_jax.sh`
 - Test: `tests/serving/va_split_jax/test_profile_script.py`
 
-- [ ] **Step 1: 扩展 mode**
+- [x] **Step 1: 扩展 mode**
 
 在 `scripts/profile_va_split.py` 中把 mode 扩展为：
 
@@ -1913,7 +1913,7 @@ git commit -m "feat: add JAX VA split compile warmup"
 Mode = Literal["monolithic", "split-no-mps", "split-mps", "jax-monolithic", "jax-split-ipc"]
 ```
 
-- [ ] **Step 2: 增加 JAX policy 创建分支**
+- [x] **Step 2: 增加 JAX policy 创建分支**
 
 在创建 policy 的函数中：
 
@@ -1922,7 +1922,7 @@ Mode = Literal["monolithic", "split-no-mps", "split-mps", "jax-monolithic", "jax
 - 默认 config/dir 仍可通过 CLI 覆盖。
 - profile 默认只跑 Pi0.5。
 
-- [ ] **Step 3: 确保 summary key 可比较**
+- [x] **Step 3: 确保 summary key 可比较**
 
 JAX split 输出 timing key 与 PyTorch 版保持一致：
 
@@ -1943,7 +1943,7 @@ JAX split 输出 timing key 与 PyTorch 版保持一致：
 
 为便于复用现有 summary 代码，第一版可以把 `prefix_pool_write_ms` 同时写入兼容 key `prefix_lane_ingest_ms`，把 `prefix_pool_compact_ms` 同时写入 `prefix_lane_compact_ms`，把 `prefix_pool_overhead_ms` 同时写入 `prefix_lane_overhead_ms`；报告中优先使用 `prefix_pool_*` 名称。
 
-- [ ] **Step 4: 写 JAX profile 脚本**
+- [x] **Step 4: 写 JAX profile 脚本**
 
 Create `scripts/run_profile_va_split_jax.sh`:
 
@@ -2041,7 +2041,7 @@ echo "  mps:    pipe=${MPS_PIPE_DIR} ae_sm=${AE_SM_PERCENT} vlm_sm=${VLM_SM_PERC
 "${cmd[@]}" "$@"
 ```
 
-- [ ] **Step 5: 写脚本测试**
+- [x] **Step 5: 写脚本测试**
 
 测试：
 
@@ -2054,7 +2054,7 @@ echo "  mps:    pipe=${MPS_PIPE_DIR} ae_sm=${AE_SM_PERCENT} vlm_sm=${VLM_SM_PERC
 - 默认 `AE_SM_PERCENT=20`、`VLM_SM_PERCENT=0`；`0` 表示不设置上限。
 - 脚本导出 `XLA_PYTHON_CLIENT_PREALLOCATE=false`。
 
-- [ ] **Step 6: 运行 profile smoke**
+- [x] **Step 6: 运行 profile smoke**
 
 Run:
 
@@ -2069,7 +2069,11 @@ Expected:
 - timing 中存在 `vlm_prefix_forward_mean_ms` 和 `ae_step_mean_ms`。
 - summary 中 `jax_compile_enabled == 1`，`jax_compile_warmup_enabled == 1`，`jax_warmup_batches > 0`。
 
-- [ ] **Step 7: Commit**
+Verified 2026-07-31 with `POLICY_DIR=/data1/miliang/models/pi05_libero`:
+`logs/jax-task11_smoke_jaxckpt_20260731_194751/profile.json` wrote `completed_requests=4`, `failed_requests=0`,
+`vlm_prefix_forward_mean_ms=49.81369975`, `ae_step_mean_ms=258.845365925`, and `jax_warmup_batches=9.0`.
+
+- [x] **Step 7: Commit**
 
 ```bash
 git add scripts/profile_va_split.py scripts/run_profile_va_split_jax.sh tests/serving/va_split_jax/test_profile_script.py

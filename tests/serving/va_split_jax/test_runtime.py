@@ -31,8 +31,8 @@ class FakeJaxSplitModel:
         self.prefix_batch_sizes.append(batch)
         return JaxPrefixFeature(
             past_key_values=(
-                jnp.ones((batch, 3, 2, 4), dtype=jnp.float32),
-                jnp.full((batch, 3, 2, 4), 2.0, dtype=jnp.float32),
+                jnp.ones((3, batch, 2, 4), dtype=jnp.float32),
+                jnp.full((3, batch, 2, 4), 2.0, dtype=jnp.float32),
             ),
             prefix_pad_masks=jnp.ones((batch, 3), dtype=jnp.bool_),
             state=observation.state,

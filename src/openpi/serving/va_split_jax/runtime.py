@@ -16,6 +16,7 @@ from openpi.serving.va_split_jax.ae_process import JaxAEProcess
 from openpi.serving.va_split_jax.ae_process import JaxAEWorker
 from openpi.serving.va_split_jax.compile import JaxCompileConfig
 from openpi.serving.va_split_jax.compile import maybe_jit_split_model
+from openpi.serving.va_split_jax.compile import planned_warmup_batches
 from openpi.serving.va_split_jax.device_slab import make_default_device_slab_backend
 from openpi.serving.va_split_jax.prefix_cache_pool import JaxVlmPrefixCacheLanePool
 from openpi.serving.va_split_jax.timing import queue_wait_and_transfer_ms
@@ -97,6 +98,10 @@ class JaxLocalVASplitRuntime:
             for result in results:
                 results_by_id[result.request_id] = result
         return _combine_ordered_results(batch_id, request_ids, results_by_id)
+
+    @property
+    def compile_timing(self) -> dict[str, float]:
+        return {"jax_warmup_batches": 0.0}
 
 
 def _apply_env_updates(env_updates: dict[str, str | None] | None) -> None:
@@ -183,6 +188,14 @@ class JaxProcessVASplitRuntime:
         self._shutdown_seen = False
         self._closed = False
         self._condition = threading.Condition()
+        warmup_batches = 0.0
+        if compile_config is not None and compile_config.warmup_enabled:
+            planned = planned_warmup_batches(
+                max_batch_size=max(max_vlm_batch_size, max_ae_batch_size, max_prefix_slots),
+                warmup_max_batch_size=compile_config.warmup_max_batch_size,
+            )
+            warmup_batches = float(sum(repeats for _, repeats in planned))
+        self._compile_timing = {"jax_warmup_batches": warmup_batches}
 
         ctx = mp.get_context(start_method)
         self._request_queue = ctx.Queue()
@@ -307,6 +320,10 @@ class JaxProcessVASplitRuntime:
 
     def reset(self) -> None:
         pass
+
+    @property
+    def compile_timing(self) -> dict[str, float]:
+        return dict(self._compile_timing)
 
 
 def _worker_error_to_runtime_error(error: JaxWorkerError) -> RuntimeError:

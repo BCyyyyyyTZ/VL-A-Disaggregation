@@ -16,6 +16,7 @@ class FakeRuntime:
     def __init__(self):
         self.sample_kwargs = None
         self.shutdown_called = False
+        self.compile_timing = {"jax_warmup_batches": 3.0}
 
     def infer(self, observation: dict, sample_kwargs: dict) -> JaxActionResult:
         self.sample_kwargs = sample_kwargs
@@ -64,6 +65,7 @@ def test_jax_va_split_policy_preserves_infer_output_contract():
     np.testing.assert_allclose(result["actions"], np.ones((2, 3), dtype=np.float32))
     np.testing.assert_allclose(result["state"], np.array([0.25, -0.5], dtype=np.float32))
     assert result["policy_timing"]["runtime_ms"] == 2.0
+    assert result["policy_timing"]["jax_warmup_batches"] == 3.0
     assert result["policy_timing"]["infer_ms"] >= 0.0
     assert runtime.sample_kwargs == {"num_steps": 4}
     assert policy.metadata == {"model": "fake"}

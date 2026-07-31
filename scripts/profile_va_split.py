@@ -16,7 +16,7 @@ from typing import Any, Literal
 import numpy as np
 import tyro
 
-Mode = Literal["monolithic", "split-no-mps", "split-mps"]
+Mode = Literal["monolithic", "split-no-mps", "split-mps", "jax-monolithic", "jax-split-ipc"]
 CompileMode = Literal["default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"]
 TraceStatus = Literal["ok", "error", "timeout"]
 DEFAULT_PROFILE_CHECKPOINT_CONFIG = "pi05_libero"
@@ -553,6 +553,18 @@ def summarize_traces(
         "prefix_lane_overhead_mean_ms": _timing_mean(completed, "prefix_lane_overhead_ms"),
         "prefix_lane_overhead_p50_ms": _timing_percentile(completed, "prefix_lane_overhead_ms", 50),
         "prefix_lane_overhead_p95_ms": _timing_percentile(completed, "prefix_lane_overhead_ms", 95),
+        "prefix_pool_write_mean_ms": _timing_mean(completed, "prefix_pool_write_ms"),
+        "prefix_pool_write_p50_ms": _timing_percentile(completed, "prefix_pool_write_ms", 50),
+        "prefix_pool_write_p95_ms": _timing_percentile(completed, "prefix_pool_write_ms", 95),
+        "prefix_pool_compact_mean_ms": _timing_mean(completed, "prefix_pool_compact_ms"),
+        "prefix_pool_compact_p50_ms": _timing_percentile(completed, "prefix_pool_compact_ms", 50),
+        "prefix_pool_compact_p95_ms": _timing_percentile(completed, "prefix_pool_compact_ms", 95),
+        "prefix_pool_overhead_mean_ms": _timing_mean(completed, "prefix_pool_overhead_ms"),
+        "prefix_pool_overhead_p50_ms": _timing_percentile(completed, "prefix_pool_overhead_ms", 50),
+        "prefix_pool_overhead_p95_ms": _timing_percentile(completed, "prefix_pool_overhead_ms", 95),
+        "prefix_slab_map_mean_ms": _timing_mean(completed, "prefix_slab_map_ms"),
+        "prefix_slab_map_p50_ms": _timing_percentile(completed, "prefix_slab_map_ms", 50),
+        "prefix_slab_map_p95_ms": _timing_percentile(completed, "prefix_slab_map_ms", 95),
         "ae_step_mean_ms": _timing_mean(completed, "ae_step_ms"),
         "ae_step_p50_ms": _timing_percentile(completed, "ae_step_ms", 50),
         "ae_effective_batch_mean": _timing_mean(completed, "ae_effective_batch"),
@@ -648,7 +660,7 @@ def run_profile(args: Args) -> BenchmarkResult:
     policy_device = getattr(policy, "_pytorch_device", args.pytorch_device)
     sampler = GpuUtilizationSampler(device_index=resolve_gpu_device_index(policy_device, args.gpu_device_index))
     try:
-        if args.mode == "monolithic" and args.batch_size > 1:
+        if args.mode in ("monolithic", "jax-monolithic") and args.batch_size > 1:
             with ThreadPoolExecutor(max_workers=1, thread_name_prefix="va-profile-baseline-model") as executor:
                 _warmup_before_timed_workload(policy, requests, args=args, executor=executor)
                 sampler.start()
@@ -692,7 +704,9 @@ def run_profile(args: Args) -> BenchmarkResult:
     )
     summary["jax_compile_enabled"] = bool(args.jax_compile)
     summary["jax_compile_warmup_enabled"] = bool(args.jax_compile_warmup)
-    summary["jax_warmup_batches"] = 0.0
+    summary["jax_warmup_batches"] = _timing_max([trace for trace in traces if trace.status == "ok"], "jax_warmup_batches")
+    if summary["jax_warmup_batches"] is None:
+        summary["jax_warmup_batches"] = 0.0
     consistency = _run_consistency_check(args, requests) if args.check_consistency else None
     return BenchmarkResult(traces=traces, summary=summary, consistency=consistency)
 
@@ -769,7 +783,7 @@ def profile_warmup_max_batch_size(args: Args) -> int:
     (`max_vlm_batch_size * 3` in VASplitRuntime), not the VLM FCFS cap alone.
     """
     absolute_cap = COMPILE_WARMUP_MAX_BATCH_SIZE
-    if args.mode == "monolithic":
+    if args.mode in ("monolithic", "jax-monolithic"):
         return min(absolute_cap, max(1, int(args.batch_size)))
     # Keep in sync with openpi.serving.va_split.runtime.VASplitRuntime default slots.
     prefix_capacity = max(1, int(args.max_vlm_batch_size) * 3)
@@ -791,7 +805,7 @@ def _warmup_before_timed_workload(
             executor=executor,
         )
         return
-    if args.mode == "monolithic" and args.batch_size > 1:
+    if args.mode in ("monolithic", "jax-monolithic") and args.batch_size > 1:
         warmup_batch_requests = make_fcfs_batched_synthetic_requests(
             requests,
             max_batch_size=args.batch_size,
@@ -825,6 +839,7 @@ def create_policy_for_mode(args: Args, mode: Mode):
     validate_mps_environment(mode, require_mps_env=args.require_mps_env)
 
     from openpi.policies import policy_config as _policy_config  # noqa: PLC0415
+    from openpi.policies import jax_va_split_policy as _jax_va_split_policy  # noqa: PLC0415
     from openpi.policies import va_split_policy as _va_split_policy  # noqa: PLC0415
     from openpi.training import config as _config  # noqa: PLC0415
 
@@ -836,6 +851,27 @@ def create_policy_for_mode(args: Args, mode: Mode):
             args.policy.dir,
             sample_kwargs=sample_kwargs,
             pytorch_device=args.pytorch_device,
+        )
+    if mode == "jax-monolithic":
+        return _policy_config.create_trained_policy(
+            train_config,
+            args.policy.dir,
+            sample_kwargs=sample_kwargs,
+        )
+    if mode == "jax-split-ipc":
+        return _jax_va_split_policy.create_trained_jax_va_split_policy(
+            train_config,
+            args.policy.dir,
+            sample_kwargs=sample_kwargs,
+            max_ae_batch_size=args.max_ae_batch_size,
+            max_vlm_batch_size=args.max_vlm_batch_size,
+            max_vlm_wait_ms=args.max_vlm_wait_ms,
+            ae_sm_percent=args.ae_sm_percent,
+            vlm_sm_percent=args.vlm_sm_percent,
+            result_timeout_s=args.timeout_s,
+            jax_compile=args.jax_compile,
+            jax_compile_warmup=args.jax_compile_warmup,
+            jax_compile_warmup_max_batch_size=args.jax_compile_warmup_max_batch_size,
         )
     ae_sm_percent = args.ae_sm_percent if mode == "split-mps" else 0
     vlm_sm_percent = args.vlm_sm_percent if mode == "split-mps" else 0
@@ -1226,6 +1262,10 @@ def _timing_mean(traces: list[RequestTrace], key: str) -> float | None:
     return _mean(_timing_values(traces, key))
 
 
+def _timing_max(traces: list[RequestTrace], key: str) -> float | None:
+    return _max(_timing_values(traces, key))
+
+
 def _effective_batch_values(traces: list[RequestTrace]) -> list[float]:
     values = []
     for trace in traces:
@@ -1286,12 +1326,12 @@ def _throughput_requests_per_second(completed: list[RequestTrace]) -> float | No
 
 
 def validate_mps_environment(mode: Mode, *, require_mps_env: bool) -> None:
-    if mode != "split-mps" or not require_mps_env:
+    if mode not in ("split-mps", "jax-split-ipc") or not require_mps_env:
         return
     if os.environ.get("CUDA_MPS_PIPE_DIRECTORY"):
         return
     raise RuntimeError(
-        "split-mps requires an active MPS environment. Start MPS with scripts/run_va_split_mps.sh "
+        f"{mode} requires an active MPS environment. Start MPS with scripts/run_va_split_mps.sh "
         "or set CUDA_MPS_PIPE_DIRECTORY, or pass --no-require-mps-env to run without this guard."
     )
 

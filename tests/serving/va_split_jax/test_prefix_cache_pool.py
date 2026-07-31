@@ -12,8 +12,8 @@ from openpi.serving.va_split_jax.prefix_cache_pool import JaxVlmPrefixCacheLaneP
 def _feature(fill: float) -> JaxPrefixFeature:
     return JaxPrefixFeature(
         past_key_values=(
-            jnp.full((1, 3, 2, 4), fill, dtype=jnp.bfloat16),
-            jnp.full((1, 3, 2, 4), fill + 1, dtype=jnp.bfloat16),
+            jnp.full((3, 1, 2, 4), fill, dtype=jnp.bfloat16),
+            jnp.full((3, 1, 2, 4), fill + 1, dtype=jnp.bfloat16),
         ),
         prefix_pad_masks=jnp.ones((1, 3), dtype=jnp.bool_),
         state=jnp.full((1, 8), fill, dtype=jnp.float32),
@@ -25,8 +25,9 @@ def test_vlm_owned_prefix_cache_lane_pool_exports_dense_batch():
     pool.put_lane("req-1", _feature(1.0))
     pool.put_lane("req-2", _feature(2.0))
     batch = pool.export_batch_view(("req-1", "req-2"))
-    np.testing.assert_allclose(np.asarray(batch.past_key_values[0][0]), np.full((3, 2, 4), 1.0, dtype=np.float32))
-    np.testing.assert_allclose(np.asarray(batch.past_key_values[0][1]), np.full((3, 2, 4), 2.0, dtype=np.float32))
+    assert batch.past_key_values[0].shape == (3, 2, 2, 4)
+    np.testing.assert_allclose(np.asarray(batch.past_key_values[0][:, 0]), np.full((3, 2, 4), 1.0, dtype=np.float32))
+    np.testing.assert_allclose(np.asarray(batch.past_key_values[0][:, 1]), np.full((3, 2, 4), 2.0, dtype=np.float32))
     assert batch.prefix_pad_masks.shape == (2, 3)
     assert batch.state.shape == (2, 8)
 

@@ -72,6 +72,7 @@ class JaxAEWorker:
         self._lanes: list[JaxAERequestState | None] = [None for _ in range(max_prefix_slots)]
         self._active_count = 0
         self.active: dict[str, JaxAERequestState] = {}
+        self._rng = jax.random.key(0)
 
     @property
     def can_accept_prefix(self) -> bool:
@@ -129,7 +130,8 @@ class JaxAEWorker:
         else:
             timing["prefix_admit_wait_ms"] = 0.0
 
-        denoise_state = self._model.init_denoise_state(None, ready.slot_handle.batch_rows, noise, ready.num_steps)
+        self._rng, request_rng = jax.random.split(self._rng)
+        denoise_state = self._model.init_denoise_state(request_rng, ready.slot_handle.batch_rows, noise, ready.num_steps)
         lane_id = self._active_count
         state = JaxAERequestState(
             request_id=ready.request_id,
@@ -432,4 +434,7 @@ def _finish_timing(request: JaxAERequestState) -> dict[str, float]:
     compact_ms = float(request.lane_compact_ms)
     timing["prefix_pool_compact_ms"] = compact_ms
     timing["prefix_pool_overhead_ms"] = float(timing.get("prefix_pool_write_ms", 0.0)) + compact_ms
+    timing["prefix_lane_ingest_ms"] = float(timing.get("prefix_pool_write_ms", 0.0))
+    timing["prefix_lane_compact_ms"] = compact_ms
+    timing["prefix_lane_overhead_ms"] = timing["prefix_pool_overhead_ms"]
     return timing

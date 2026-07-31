@@ -66,7 +66,7 @@ class WarmupFakeModel:
         batch = int(observation.state.shape[0])
         self.split_batches.append(batch)
         return JaxPrefixFeature(
-            past_key_values=(jnp.ones((batch, 3, 2, 4), dtype=jnp.float32),),
+            past_key_values=(jnp.ones((3, batch, 2, 4), dtype=jnp.float32),),
             prefix_pad_masks=jnp.ones((batch, 3), dtype=jnp.bool_),
             state=observation.state,
         )

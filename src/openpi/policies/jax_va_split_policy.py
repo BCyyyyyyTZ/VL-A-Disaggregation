@@ -64,6 +64,7 @@ class JaxVASplitPolicy(_policy.BasePolicy):
         else:
             actions = runtime_result
             runtime_timing = {}
+        runtime_timing = {**self._runtime_compile_timing(), **runtime_timing}
 
         outputs = {
             "state": inputs["state"],
@@ -99,6 +100,7 @@ class JaxVASplitPolicy(_policy.BasePolicy):
         else:
             actions = runtime_result
             runtime_timing = {}
+        runtime_timing = {**self._runtime_compile_timing(), **runtime_timing}
 
         outputs = _batch.apply_output_transform_batch(
             {
@@ -130,6 +132,12 @@ class JaxVASplitPolicy(_policy.BasePolicy):
 
     def close(self) -> None:
         self.shutdown()
+
+    def _runtime_compile_timing(self) -> dict[str, float]:
+        compile_timing = getattr(self._runtime, "compile_timing", None)
+        if isinstance(compile_timing, dict):
+            return dict(compile_timing)
+        return {}
 
 
 def _load_jax_model(train_config: _config.TrainConfig, checkpoint_dir: pathlib.Path | str):

@@ -22,10 +22,22 @@ class DeviceSlabSpec:
     shape: tuple[int, ...]
     dtype: str
     max_lanes: int
+    lane_axis: int = 0
 
     @property
     def slab_shape(self) -> tuple[int, ...]:
-        return (self.max_lanes, *self.shape[1:])
+        shape = list(self.shape)
+        shape[self.normalized_lane_axis] = self.max_lanes
+        return tuple(shape)
+
+    @property
+    def normalized_lane_axis(self) -> int:
+        lane_axis = self.lane_axis
+        if lane_axis < 0:
+            lane_axis += len(self.shape)
+        if lane_axis < 0 or lane_axis >= len(self.shape):
+            raise ValueError(f"lane_axis {self.lane_axis} outside shape rank {len(self.shape)}")
+        return lane_axis
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,14 +89,18 @@ class DeviceSlabBackend:
 
     def copy_lane_from_array(self, slab: DeviceSlab, lane_id: int, value: jax.Array) -> DeviceSlab:
         _validate_lane_update(slab, lane_id, value)
-        update = jax.lax.dynamic_update_slice_in_dim(slab.array, value, lane_id, axis=0)
+        update = jax.lax.dynamic_update_slice_in_dim(
+            slab.array, value, lane_id, axis=slab.spec.normalized_lane_axis
+        )
         update.block_until_ready()
         return DeviceSlab(slab.spec, update, slab.handle, slab._close_stack)
 
     def view_batch(self, slab: DeviceSlab, batch_size: int) -> jax.Array:
         if batch_size < 0 or batch_size > slab.spec.max_lanes:
             raise ValueError(f"batch_size {batch_size} outside slab capacity {slab.spec.max_lanes}")
-        return jax.lax.dynamic_slice_in_dim(slab.array, 0, batch_size, axis=0)
+        return _logical_view_for_spec(
+            jax.lax.dynamic_slice_in_dim(slab.array, 0, batch_size, axis=slab.spec.normalized_lane_axis), slab.spec
+        )
 
     def slice_lanes(self, slab: DeviceSlab, slot_ids: tuple[int, ...]) -> jax.Array:
         """Return a dense-prefix device-side view for already-mapped lanes without reopening IPC."""
@@ -102,7 +118,7 @@ class CudaIpcDeviceSlabBackend(DeviceSlabBackend):
     def create_slab(self, spec: DeviceSlabSpec) -> DeviceSlab:
         if spec.max_lanes <= 0:
             raise ValueError("max_lanes must be positive")
-        dtype = np.dtype(spec.dtype)
+        dtype = _storage_dtype_for_spec(spec)
         if self._device_ordinal is not None:
             device = jax.devices("gpu")[self._device_ordinal]
             array = jax.device_put(jnp.zeros(spec.slab_shape, dtype=dtype), device)
@@ -124,7 +140,7 @@ class CudaIpcDeviceSlabBackend(DeviceSlabBackend):
                 cuda.open_ipc_array(
                     tuple(handle.handle_bytes),
                     handle.spec.slab_shape,
-                    np.dtype(handle.spec.dtype),
+                    _storage_dtype_for_spec(handle.spec),
                     strides=handle.strides,
                     offset=handle.offset,
                 )
@@ -145,9 +161,10 @@ class CudaIpcDeviceSlabBackend(DeviceSlabBackend):
         value.block_until_ready()
         slab.array.block_until_ready()
         cuda.select_device(slab.handle.device_ordinal)
-        dst = cuda.from_cuda_array_interface(_cuda_array_interface_for_lane(slab.array, slab.spec, lane_id), owner=slab)
+        dst = cuda.from_cuda_array_interface(_cuda_array_interface_for_array(slab.array), owner=slab)
         src = cuda.from_cuda_array_interface(_cuda_array_interface_for_array(value), owner=value)
-        dst.copy_to_device(src)
+        _copy_lane_with_kernel(dst, src, lane_id, slab.spec)
+        cuda.synchronize()
         slab.array.block_until_ready()
         return slab
 
@@ -156,7 +173,7 @@ class LocalDeviceSlabBackend(DeviceSlabBackend):
     transport = "local-device"
 
     def create_slab(self, spec: DeviceSlabSpec) -> DeviceSlab:
-        array = jnp.zeros(spec.slab_shape, dtype=np.dtype(spec.dtype))
+        array = jnp.zeros(spec.slab_shape, dtype=_storage_dtype_for_spec(spec))
         array.block_until_ready()
         handle = DeviceSlabHandle(
             spec=spec,
@@ -204,14 +221,14 @@ def _export_cuda_ipc_handle(spec: DeviceSlabSpec, array: jax.Array) -> DeviceSla
         handle_bytes=handle_bytes,
         ready_event_bytes=None,
         offset=int(ipc_handle.offset),
-        strides=_c_contiguous_strides(spec.slab_shape, np.dtype(spec.dtype)),
+        strides=_c_contiguous_strides(spec.slab_shape, _storage_dtype_for_spec(spec)),
     )
 
 
 def _validate_lane_update(slab: DeviceSlab, lane_id: int, value: jax.Array) -> None:
     if lane_id < 0 or lane_id >= slab.spec.max_lanes:
         raise ValueError(f"lane_id {lane_id} outside slab capacity {slab.spec.max_lanes}")
-    expected_shape = (1, *slab.spec.shape[1:])
+    expected_shape = slab.spec.shape
     if tuple(value.shape) != expected_shape:
         raise ValueError(f"lane update shape must be {expected_shape}, got {tuple(value.shape)}")
     if np.dtype(value.dtype) != np.dtype(slab.spec.dtype):
@@ -240,8 +257,25 @@ def _c_contiguous_strides(shape: tuple[int, ...], dtype: np.dtype) -> tuple[int,
     return tuple(reversed(strides))
 
 
+def _storage_dtype_for_spec(spec: DeviceSlabSpec) -> np.dtype:
+    return _storage_dtype_for_jax_dtype(spec.dtype)
+
+
+def _storage_dtype_for_jax_dtype(dtype: Any) -> np.dtype:
+    dtype = np.dtype(dtype)
+    if dtype == np.dtype(jnp.bfloat16):
+        return np.dtype(np.uint16)
+    return dtype
+
+
+def _logical_view_for_spec(array: jax.Array, spec: DeviceSlabSpec) -> jax.Array:
+    if np.dtype(spec.dtype) == np.dtype(jnp.bfloat16):
+        return jax.lax.bitcast_convert_type(array, jnp.bfloat16)
+    return array
+
+
 def _cuda_array_interface_for_array(array: jax.Array) -> dict[str, Any]:
-    dtype = np.dtype(array.dtype)
+    dtype = _storage_dtype_for_jax_dtype(array.dtype)
     return {
         "shape": tuple(array.shape),
         "strides": _c_contiguous_strides(tuple(array.shape), dtype),
@@ -252,16 +286,37 @@ def _cuda_array_interface_for_array(array: jax.Array) -> dict[str, Any]:
 
 
 def _cuda_array_interface_for_lane(array: jax.Array, spec: DeviceSlabSpec, lane_id: int) -> dict[str, Any]:
-    dtype = np.dtype(spec.dtype)
-    lane_shape = (1, *spec.shape[1:])
-    lane_nbytes = int(np.prod(lane_shape) * dtype.itemsize)
+    dtype = _storage_dtype_for_spec(spec)
+    lane_shape = spec.shape
+    slab_strides = _c_contiguous_strides(spec.slab_shape, dtype)
+    lane_offset_bytes = lane_id * slab_strides[spec.normalized_lane_axis]
     return {
         "shape": lane_shape,
-        "strides": _c_contiguous_strides(lane_shape, dtype),
+        "strides": slab_strides,
         "typestr": dtype.str,
-        "data": (array.unsafe_buffer_pointer() + lane_id * lane_nbytes, False),
+        "data": (array.unsafe_buffer_pointer() + lane_offset_bytes, False),
         "version": 3,
     }
+
+
+def _copy_lane_with_kernel(dst: Any, src: Any, lane_id: int, spec: DeviceSlabSpec) -> None:
+    axis = spec.normalized_lane_axis
+    inner_elems = int(np.prod(spec.shape[axis + 1 :], dtype=np.int64))
+    total_elems = int(np.prod(spec.shape, dtype=np.int64))
+    threads_per_block = 256
+    blocks = (total_elems + threads_per_block - 1) // threads_per_block
+    _copy_lane_kernel[blocks, threads_per_block](dst, src, total_elems, lane_id, spec.max_lanes, inner_elems)
+
+
+@cuda.jit
+def _copy_lane_kernel(dst, src, total_elems, lane_id, lane_axis_size, inner_elems):  # pragma: no cover
+    index = cuda.grid(1)
+    if index >= total_elems:
+        return
+    outer = index // inner_elems
+    inner = index - outer * inner_elems
+    dst_index = outer * lane_axis_size * inner_elems + lane_id * inner_elems + inner
+    dst.flat[dst_index] = src.flat[index]
 
 
 @contextlib.contextmanager

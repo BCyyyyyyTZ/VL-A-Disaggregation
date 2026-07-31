@@ -152,6 +152,7 @@ class _ConcurrentFakePolicy:
                 "prefix_lane_overhead_ms": 0.5,
                 "ae_step_ms": 2.0,
                 "ae_effective_batch": 3.0,
+                "jax_warmup_batches": 3.0,
             },
         }
 
@@ -387,7 +388,7 @@ def test_run_profile_warms_up_policy_before_timed_workload(monkeypatch):
         worker_thread_ids.append(threading.get_ident())
         return {
             "actions": np.asarray([obs["value"]], dtype=np.float32),
-            "policy_timing": {"infer_ms": 0.0},
+            "policy_timing": {"infer_ms": 0.0, "jax_warmup_batches": 3.0},
         }
 
     policy.infer = infer
@@ -406,6 +407,7 @@ def test_run_profile_warms_up_policy_before_timed_workload(monkeypatch):
 
     assert calls[:2] == [0, 0]
     assert [trace.request_id for trace in result.traces] == ["req-000000", "req-000001"]
+    assert result.summary["jax_warmup_batches"] == 3.0
     assert policy.completed_calls == 0
     assert len(set(worker_thread_ids)) == 1
     assert worker_thread_ids[0] != threading.get_ident()
