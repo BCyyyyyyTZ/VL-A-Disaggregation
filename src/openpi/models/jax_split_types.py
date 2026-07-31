@@ -37,10 +37,8 @@ class JaxPrefixSlotHandle:
 
 
 @dataclass(frozen=True, slots=True)
-class JaxPrefixBatchViewHandle:
-    request_ids: tuple[str, ...]
-    slot_ids: tuple[int, ...]
-    batch_rows: int
+class JaxPrefixSlabHandleTree:
+    max_lanes: int
     prefix_shape_tree: Any
     prefix_dtype_tree: Any
-    view_handle_tree: Any
+    slab_handle_tree: Any

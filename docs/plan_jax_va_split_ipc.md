@@ -726,7 +726,7 @@ git commit -m "feat: add JAX device slab IPC backend"
 - Create: `src/openpi/serving/va_split_jax/prefix_cache_pool.py`
 - Test: `tests/serving/va_split_jax/test_prefix_cache_pool.py`
 
-- [ ] **Step 1: 实现 VLM 独占的 JAX tensor tree lane pool**
+- [x] **Step 1: 实现 VLM 独占的 JAX tensor tree lane pool**
 
 Create `src/openpi/serving/va_split_jax/prefix_cache_pool.py`:
 
@@ -931,7 +931,7 @@ def _row_view_tree(value: Any, row: int) -> Any:
     raise TypeError(f"Unsupported JAX prefix tree node: {type(value)}")
 ```
 
-- [ ] **Step 2: 写 VLM-owned lane pool 测试**
+- [x] **Step 2: 写 VLM-owned lane pool 测试**
 
 Create `tests/serving/va_split_jax/test_prefix_cache_pool.py`:
 
@@ -975,7 +975,7 @@ def test_vlm_owned_prefix_cache_lane_pool_compacts_on_release():
     np.testing.assert_allclose(np.asarray(batch.state), np.full((1, 8), 2.0, dtype=np.float32))
 ```
 
-- [ ] **Step 3: 运行测试**
+- [x] **Step 3: 运行测试**
 
 
 
@@ -987,7 +987,7 @@ PYTHONPATH=src:packages/openpi-client/src /data1/miliang/RLinf/openpi_libero/bin
 
 Expected: `2 passed`。
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add src/openpi/serving/va_split_jax/prefix_cache_pool.py tests/serving/va_split_jax/test_prefix_cache_pool.py
