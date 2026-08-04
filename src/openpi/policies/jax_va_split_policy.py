@@ -44,16 +44,27 @@ class JaxVASplitPolicy(_policy.BasePolicy):
 
     @override
     def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
+        policy_stage_start = time.monotonic()
         inputs = jax.tree.map(lambda x: x, obs)
+        transform_start = time.monotonic()
         inputs = self._input_transform(inputs)
+        input_transform_ms = (time.monotonic() - transform_start) * 1000
+        image_stage_start = time.monotonic()
+        inputs = _normalize_uint8_images_for_vlm_ipc(inputs)
+        parent_image_stage_ms = (time.monotonic() - image_stage_start) * 1000
+        batch_stage_start = time.monotonic()
         inputs = jax.tree.map(lambda x: np.asarray(x)[None, ...], inputs)
+        input_batch_stage_ms = (time.monotonic() - batch_stage_start) * 1000
 
+        sample_kwargs_stage_start = time.monotonic()
         sample_kwargs = dict(self._sample_kwargs)
         if noise is not None:
             noise_array = np.asarray(noise).copy()
             if noise_array.ndim == 2:
                 noise_array = noise_array[None, ...]
             sample_kwargs["noise"] = noise_array
+        sample_kwargs_stage_ms = (time.monotonic() - sample_kwargs_stage_start) * 1000
+        policy_input_stage_ms = (time.monotonic() - policy_stage_start) * 1000
 
         start_time = time.monotonic()
         runtime_result = self._runtime.infer(inputs, sample_kwargs)
@@ -72,17 +83,33 @@ class JaxVASplitPolicy(_policy.BasePolicy):
         }
         outputs = jax.tree.map(lambda x: np.asarray(x[0, ...]), outputs)
         outputs = self._output_transform(outputs)
-        outputs["policy_timing"] = {"infer_ms": infer_ms, **runtime_timing}
+        outputs["policy_timing"] = {
+            "infer_ms": infer_ms,
+            "policy_input_stage_ms": policy_input_stage_ms,
+            "policy_input_transform_ms": input_transform_ms,
+            "policy_input_batch_stage_ms": input_batch_stage_ms,
+            "policy_sample_kwargs_stage_ms": sample_kwargs_stage_ms,
+            "policy_observation_from_dict_ms": 0.0,
+            "vlm_parent_image_stage_ms": parent_image_stage_ms,
+            **runtime_timing,
+        }
         return outputs
 
     def infer_batch(self, obs_batch: dict, *, noise: np.ndarray | None = None) -> dict:
+        policy_stage_start = time.monotonic()
+        transform_start = time.monotonic()
         inputs = _batch.apply_input_transform_batch(
             obs_batch,
             self._input_transform,
             kind="numpy",
         )
+        input_transform_ms = (time.monotonic() - transform_start) * 1000
+        image_stage_start = time.monotonic()
+        inputs = _normalize_uint8_images_for_vlm_ipc(inputs)
+        parent_image_stage_ms = (time.monotonic() - image_stage_start) * 1000
         batch_size = int(inputs["state"].shape[0])
 
+        sample_kwargs_stage_start = time.monotonic()
         sample_kwargs = dict(self._sample_kwargs)
         if noise is not None:
             sample_kwargs["noise"] = _batch.prepare_batch_noise(
@@ -90,6 +117,8 @@ class JaxVASplitPolicy(_policy.BasePolicy):
                 batch_size=batch_size,
                 kind="numpy",
             )
+        sample_kwargs_stage_ms = (time.monotonic() - sample_kwargs_stage_start) * 1000
+        policy_input_stage_ms = (time.monotonic() - policy_stage_start) * 1000
 
         start_time = time.monotonic()
         runtime_result = self._runtime.infer_batch(inputs, sample_kwargs)
@@ -111,6 +140,12 @@ class JaxVASplitPolicy(_policy.BasePolicy):
         )
         outputs["policy_timing"] = {
             "infer_ms": infer_ms,
+            "policy_input_stage_ms": policy_input_stage_ms,
+            "policy_input_transform_ms": input_transform_ms,
+            "policy_input_batch_stage_ms": 0.0,
+            "policy_sample_kwargs_stage_ms": sample_kwargs_stage_ms,
+            "policy_observation_from_dict_ms": 0.0,
+            "vlm_parent_image_stage_ms": parent_image_stage_ms,
             "effective_batch": batch_size,
             "policy_effective_batch": batch_size,
             **runtime_timing,
@@ -138,6 +173,31 @@ class JaxVASplitPolicy(_policy.BasePolicy):
         if isinstance(compile_timing, dict):
             return dict(compile_timing)
         return {}
+
+
+def _normalize_uint8_images_for_vlm_ipc(inputs: dict[str, Any]) -> dict[str, Any]:
+    images = inputs.get("image")
+    if not isinstance(images, dict):
+        return inputs
+
+    staged_images = {}
+    changed = False
+    for key, value in images.items():
+        arr = np.asarray(value)
+        if arr.dtype == np.uint8:
+            normalized = arr.astype(np.float32)
+            normalized *= 2.0 / 255.0
+            normalized -= 1.0
+            staged_images[key] = np.ascontiguousarray(normalized)
+            changed = True
+        else:
+            staged_images[key] = np.asarray(value)
+
+    if not changed:
+        return inputs
+    staged = dict(inputs)
+    staged["image"] = staged_images
+    return staged
 
 
 def _load_jax_model(train_config: _config.TrainConfig, checkpoint_dir: pathlib.Path | str):

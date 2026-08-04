@@ -80,9 +80,13 @@ class Policy(BasePolicy):
 
     @override
     def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
+        policy_stage_start = time.monotonic()
         # Make a copy since transformations may modify the inputs in place.
         inputs = jax.tree.map(lambda x: x, obs)
+        transform_start = time.monotonic()
         inputs = self._input_transform(inputs)
+        input_transform_ms = (time.monotonic() - transform_start) * 1000
+        batch_stage_start = time.monotonic()
         if not self._is_pytorch_model:
             # Make a batch and convert to jax.Array.
             inputs = jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], inputs)
@@ -91,8 +95,10 @@ class Policy(BasePolicy):
             # Convert inputs to PyTorch tensors and move to correct device
             inputs = jax.tree.map(lambda x: torch.from_numpy(np.array(x)).to(self._pytorch_device)[None, ...], inputs)
             sample_rng_or_pytorch_device = self._pytorch_device
+        input_batch_stage_ms = (time.monotonic() - batch_stage_start) * 1000
 
         # Prepare kwargs for sample_actions
+        sample_kwargs_stage_start = time.monotonic()
         sample_kwargs = dict(self._sample_kwargs)
         if noise is not None:
             noise = torch.from_numpy(noise).to(self._pytorch_device) if self._is_pytorch_model else jnp.asarray(noise)
@@ -100,8 +106,12 @@ class Policy(BasePolicy):
             if noise.ndim == 2:  # If noise is (action_horizon, action_dim), add batch dimension
                 noise = noise[None, ...]  # Make it (1, action_horizon, action_dim)
             sample_kwargs["noise"] = noise
+        sample_kwargs_stage_ms = (time.monotonic() - sample_kwargs_stage_start) * 1000
 
+        observation_stage_start = time.monotonic()
         observation = _model.Observation.from_dict(inputs)
+        observation_from_dict_ms = (time.monotonic() - observation_stage_start) * 1000
+        policy_input_stage_ms = (time.monotonic() - policy_stage_start) * 1000
         start_time = time.monotonic()
         if self._is_pytorch_model:
             actions, component_timing = _sample_pytorch_actions_with_component_timing(
@@ -136,19 +146,28 @@ class Policy(BasePolicy):
         outputs = self._output_transform(outputs)
         outputs["policy_timing"] = {
             "infer_ms": model_time * 1000,
+            "policy_input_stage_ms": policy_input_stage_ms,
+            "policy_input_transform_ms": input_transform_ms,
+            "policy_input_batch_stage_ms": input_batch_stage_ms,
+            "policy_sample_kwargs_stage_ms": sample_kwargs_stage_ms,
+            "policy_observation_from_dict_ms": observation_from_dict_ms,
             **component_timing,
         }
         return outputs
 
     def infer_batch(self, obs_batch: dict, *, noise: np.ndarray | None = None) -> dict:
+        policy_stage_start = time.monotonic()
         if self._is_pytorch_model:
+            transform_start = time.monotonic()
             inputs = _batch.apply_input_transform_batch(
                 obs_batch,
                 self._input_transform,
                 kind="torch",
                 device=self._pytorch_device,
             )
+            input_transform_ms = (time.monotonic() - transform_start) * 1000
             batch_size = int(inputs["state"].shape[0])
+            sample_kwargs_stage_start = time.monotonic()
             sample_kwargs = dict(self._sample_kwargs)
             if noise is not None:
                 sample_kwargs["noise"] = _batch.prepare_batch_noise(
@@ -157,7 +176,11 @@ class Policy(BasePolicy):
                     kind="torch",
                     device=self._pytorch_device,
                 )
+            sample_kwargs_stage_ms = (time.monotonic() - sample_kwargs_stage_start) * 1000
+            observation_stage_start = time.monotonic()
             observation = _model.Observation.from_dict(inputs)
+            observation_from_dict_ms = (time.monotonic() - observation_stage_start) * 1000
+            policy_input_stage_ms = (time.monotonic() - policy_stage_start) * 1000
             start_time = time.monotonic()
             actions, component_timing = _sample_pytorch_actions_with_component_timing(
                 self._model,
@@ -168,12 +191,15 @@ class Policy(BasePolicy):
             )
             model_time = time.monotonic() - start_time
         else:
+            transform_start = time.monotonic()
             inputs = _batch.apply_input_transform_batch(
                 obs_batch,
                 self._input_transform,
                 kind="jax",
             )
+            input_transform_ms = (time.monotonic() - transform_start) * 1000
             batch_size = int(inputs["state"].shape[0])
+            sample_kwargs_stage_start = time.monotonic()
             sample_kwargs = dict(self._sample_kwargs)
             if noise is not None:
                 sample_kwargs["noise"] = _batch.prepare_batch_noise(
@@ -181,7 +207,11 @@ class Policy(BasePolicy):
                     batch_size=batch_size,
                     kind="jax",
                 )
+            sample_kwargs_stage_ms = (time.monotonic() - sample_kwargs_stage_start) * 1000
+            observation_stage_start = time.monotonic()
             observation = _model.Observation.from_dict(inputs)
+            observation_from_dict_ms = (time.monotonic() - observation_stage_start) * 1000
+            policy_input_stage_ms = (time.monotonic() - policy_stage_start) * 1000
             start_time = time.monotonic()
             self._rng, sample_rng = jax.random.split(self._rng)
             if self._jax_build_prefix_feature is not None:
@@ -207,6 +237,11 @@ class Policy(BasePolicy):
         )
         outputs["policy_timing"] = {
             "infer_ms": model_time * 1000,
+            "policy_input_stage_ms": policy_input_stage_ms,
+            "policy_input_transform_ms": input_transform_ms,
+            "policy_input_batch_stage_ms": 0.0,
+            "policy_sample_kwargs_stage_ms": sample_kwargs_stage_ms,
+            "policy_observation_from_dict_ms": observation_from_dict_ms,
             "effective_batch": batch_size,
             "policy_effective_batch": batch_size,
             **component_timing,

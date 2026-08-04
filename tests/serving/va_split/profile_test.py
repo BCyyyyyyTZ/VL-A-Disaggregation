@@ -220,6 +220,11 @@ class _ConcurrentFakePolicy:
                 "ae_result_transfer_ms": 0.35,
                 "va_split_transfer_ms": 0.6,
                 "va_split_queue_wait_ms": 1.15,
+                "policy_input_stage_ms": 0.9,
+                "policy_input_transform_ms": 0.4,
+                "policy_input_batch_stage_ms": 0.2,
+                "policy_sample_kwargs_stage_ms": 0.1,
+                "policy_observation_from_dict_ms": 0.2,
                 "prefix_lane_ingest_ms": 0.4,
                 "prefix_lane_compact_ms": 0.1,
                 "prefix_lane_overhead_ms": 0.5,
@@ -311,6 +316,11 @@ def test_run_benchmark_allows_concurrent_policy_overlap():
     assert summary["ae_result_transfer_mean_ms"] == 0.35
     assert summary["va_split_transfer_mean_ms"] == 0.6
     assert summary["va_split_queue_wait_mean_ms"] == 1.15
+    assert summary["policy_input_stage_mean_ms"] == 0.9
+    assert summary["policy_input_transform_mean_ms"] == 0.4
+    assert summary["policy_input_batch_stage_mean_ms"] == 0.2
+    assert summary["policy_sample_kwargs_stage_mean_ms"] == 0.1
+    assert summary["policy_observation_from_dict_mean_ms"] == 0.2
     assert summary["prefix_lane_ingest_mean_ms"] == 0.4
     assert summary["prefix_lane_compact_mean_ms"] == 0.1
     assert summary["prefix_lane_overhead_mean_ms"] == 0.5

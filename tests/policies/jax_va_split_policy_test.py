@@ -14,11 +14,13 @@ from openpi.serving.va_split_jax.types import JaxActionResult
 class FakeRuntime:
     def __init__(self):
         self.sample_kwargs = None
+        self.observation = None
         self.shutdown_called = False
         self.compile_timing = {"jax_warmup_batches": 3.0}
 
     def infer(self, observation: dict, sample_kwargs: dict) -> JaxActionResult:
         self.sample_kwargs = sample_kwargs
+        self.observation = observation
         assert isinstance(observation["state"], np.ndarray)
         return JaxActionResult(
             request_id="req-1",
@@ -69,6 +71,33 @@ def test_jax_va_split_policy_preserves_infer_output_contract():
     assert runtime.sample_kwargs == {"num_steps": 4}
     assert policy.metadata == {"model": "fake"}
     assert policy.supports_concurrent_infer is True
+
+
+def test_jax_va_split_policy_normalizes_uint8_images_before_runtime_ipc():
+    runtime = FakeRuntime()
+    policy = JaxVASplitPolicy(runtime=runtime)
+
+    policy.infer(
+        {
+            "state": np.array([0.25, -0.5], dtype=np.float32),
+            "image": {
+                "base_0_rgb": np.zeros((2, 2, 3), dtype=np.uint8),
+                "left_wrist_0_rgb": np.full((2, 2, 3), 255, dtype=np.uint8),
+            },
+            "image_mask": {
+                "base_0_rgb": np.True_,
+                "left_wrist_0_rgb": np.True_,
+            },
+        }
+    )
+
+    assert runtime.observation is not None
+    base = runtime.observation["image"]["base_0_rgb"]
+    wrist = runtime.observation["image"]["left_wrist_0_rgb"]
+    assert base.dtype == np.float32
+    assert wrist.dtype == np.float32
+    np.testing.assert_allclose(base, np.full((1, 2, 2, 3), -1.0, dtype=np.float32))
+    np.testing.assert_allclose(wrist, np.full((1, 2, 2, 3), 1.0, dtype=np.float32))
 
 
 def test_jax_va_split_policy_infer_batch_uses_runtime_batch_once():
