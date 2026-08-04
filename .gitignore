@@ -2,7 +2,11 @@
 assets/
 checkpoints/
 data/
-logs/
+logs/*
+!logs/JAX/
+!logs/JAX/**
+!logs/V-A/
+!logs/V-A/**
 wandb/
 
 # Byte-compiled / optimized / DLL files

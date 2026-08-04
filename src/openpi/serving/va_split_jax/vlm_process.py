@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import deque
 from collections.abc import Hashable
 from dataclasses import replace
+import heapq
 import queue
 import time
 import traceback
@@ -14,33 +15,49 @@ import numpy as np
 
 from openpi.models import model as _model
 from openpi.models.jax_split_types import JaxPrefixFeature
-from openpi.models.jax_split_types import JaxPrefixSlabHandleTree
 from openpi.models.jax_split_types import JaxPrefixSlotHandle
+from openpi.serving.va_split_jax.device_slab import DeviceSlab
+from openpi.serving.va_split_jax.device_slab import DeviceSlabBackend
+from openpi.serving.va_split_jax.device_slab import DeviceSlabHandle
+from openpi.serving.va_split_jax.device_slab import make_default_device_slab_backend
 from openpi.serving.va_split_jax.prefix_cache_pool import JaxVlmPrefixCacheLanePool
+from openpi.serving.va_split_jax.prefix_cache_pool import write_feature_to_slab_tree
+from openpi.serving.va_split_jax import timeline_log
 from openpi.serving.va_split_jax.timing import timed_queue_get
 from openpi.serving.va_split_jax.types import JaxBatchRequestEnvelope
+from openpi.serving.va_split_jax.types import JaxLaneCredits
 from openpi.serving.va_split_jax.types import JaxPrefixReady
 from openpi.serving.va_split_jax.types import JaxPrefixSlabReady
 from openpi.serving.va_split_jax.types import JaxReleaseFeature
 from openpi.serving.va_split_jax.types import JaxRequestEnvelope
 from openpi.serving.va_split_jax.types import JaxShutdown
-from openpi.serving.va_split_jax.types import JaxSlotMoved
 from openpi.serving.va_split_jax.types import JaxWorkerError
 
 
 class JaxVLMWorker:
-    """Builds JAX prefix features and stores rows in the VLM-owned device lane pool."""
+    """Builds prefix features and write-through into AE-owned slab lanes (credit gated)."""
 
-    def __init__(self, *, model: Any, max_live_features: int, prefix_pool: JaxVlmPrefixCacheLanePool):
+    def __init__(
+        self,
+        *,
+        model: Any,
+        max_live_features: int,
+        backend: DeviceSlabBackend | None = None,
+        shared_pool: JaxVlmPrefixCacheLanePool | None = None,
+    ):
         if max_live_features <= 0:
             raise ValueError("max_live_features must be positive")
         self._model = model
         self._max_live_features = max_live_features
-        self._prefix_pool = prefix_pool
+        self._backend = backend or make_default_device_slab_backend()
+        self._shared_pool = shared_pool
+        self._writable_slab_tree: dict[str, Any] | None = None
+        self._lane_credits: list[int] = []
+        self._outstanding: set[str] = set()
 
     @property
     def available_live_feature_slots(self) -> int:
-        return self._max_live_features - self._prefix_pool.active_count
+        return len(self._lane_credits)
 
     @property
     def max_live_features(self) -> int:
@@ -48,19 +65,46 @@ class JaxVLMWorker:
 
     @property
     def active_count(self) -> int:
-        return self._prefix_pool.active_count
+        return len(self._outstanding)
+
+    @property
+    def has_ae_slab(self) -> bool:
+        return self._writable_slab_tree is not None or self._shared_pool is not None
+
+    def attach_ae_slab(
+        self,
+        ready: JaxPrefixSlabReady,
+        credits: JaxLaneCredits,
+        *,
+        shared_pool: JaxVlmPrefixCacheLanePool | None = None,
+    ) -> None:
+        if shared_pool is not None:
+            self._shared_pool = shared_pool
+            self._writable_slab_tree = shared_pool.local_slab_tree()
+        else:
+            self._writable_slab_tree = _open_slab_tree(self._backend, ready.slab.slab_handle_tree)
+        self.grant_lane_credits(credits)
+
+    def attach_shared_pool(self, pool: JaxVlmPrefixCacheLanePool, credits: JaxLaneCredits) -> None:
+        self._shared_pool = pool
+        self._writable_slab_tree = pool.local_slab_tree()
+        self.grant_lane_credits(credits)
+
+    def grant_lane_credits(self, credits: JaxLaneCredits | JaxReleaseFeature) -> None:
+        if isinstance(credits, JaxReleaseFeature):
+            lane_ids = (credits.slot_id,)
+        else:
+            lane_ids = credits.lane_ids
+        owned = set(self._lane_credits)
+        for lane_id in lane_ids:
+            lid = int(lane_id)
+            if lid in owned:
+                continue
+            heapq.heappush(self._lane_credits, lid)
+            owned.add(lid)
 
     def has_live_feature_capacity(self, batch_size: int) -> bool:
         return batch_size <= self.available_live_feature_slots
-
-    def export_slab_handle_tree(self) -> JaxPrefixSlabHandleTree:
-        slab_tree = self._prefix_pool.export_slab_handle_tree()
-        return JaxPrefixSlabHandleTree(
-            max_lanes=self._prefix_pool.max_lanes,
-            prefix_shape_tree=_shape_tree_from_slab_handles(slab_tree),
-            prefix_dtype_tree=_dtype_tree_from_slab_handles(slab_tree),
-            slab_handle_tree=slab_tree,
-        )
 
     def handle_request(self, request: JaxRequestEnvelope) -> JaxPrefixReady:
         return self.handle_batch([request])[0]
@@ -69,10 +113,22 @@ class JaxVLMWorker:
         if not requests:
             raise ValueError("JaxVLMWorker.handle_batch requires at least one request")
         if not self.has_live_feature_capacity(len(requests)):
-            raise RuntimeError(f"VLM prefix lane pool is full ({self._prefix_pool.active_count} active requests)")
+            raise RuntimeError(f"VLM lane credits exhausted ({self.available_live_feature_slots} available)")
         request_ids = tuple(request.request_id for request in requests)
+        stage_start_ns = time.monotonic_ns()
+        sample_kwargs_start_ns = stage_start_ns
         sample_kwargs = _stack_request_sample_kwargs(requests)
-        observation = _model.Observation.from_dict(_to_jax_tree(_stack_request_observations([r.observation for r in requests])))
+        sample_kwargs_stage_ms = (time.monotonic_ns() - sample_kwargs_start_ns) / 1_000_000
+        observation_stack_start_ns = time.monotonic_ns()
+        observation_tree = _stack_request_observations([r.observation for r in requests])
+        observation_stack_ms = (time.monotonic_ns() - observation_stack_start_ns) / 1_000_000
+        to_jax_start_ns = time.monotonic_ns()
+        jax_observation_tree = _to_jax_tree(observation_tree)
+        to_jax_tree_ms = (time.monotonic_ns() - to_jax_start_ns) / 1_000_000
+        observation_from_dict_start_ns = time.monotonic_ns()
+        observation = _model.Observation.from_dict(jax_observation_tree)
+        observation_from_dict_ms = (time.monotonic_ns() - observation_from_dict_start_ns) / 1_000_000
+        input_stage_ms = (time.monotonic_ns() - stage_start_ns) / 1_000_000
         return self._handle_batched_observation(
             request_ids=request_ids,
             observation=observation,
@@ -80,12 +136,27 @@ class JaxVLMWorker:
             enqueue_ns_by_row=tuple(request.enqueue_ns for request in requests),
             dequeue_ns_by_row=tuple(request.dequeue_ns for request in requests),
             dequeue_start_ns_by_row=tuple(request.dequeue_start_ns for request in requests),
+            input_stage_start_ns=stage_start_ns,
+            input_stage_ms=input_stage_ms,
+            input_stage_timing={
+                "vlm_sample_kwargs_stage_ms": sample_kwargs_stage_ms,
+                "vlm_observation_stack_ms": observation_stack_ms,
+                "vlm_to_jax_tree_ms": to_jax_tree_ms,
+                "vlm_observation_from_dict_ms": observation_from_dict_ms,
+            },
         )
 
     def handle_batch_request(self, request: JaxBatchRequestEnvelope) -> list[JaxPrefixReady]:
         if not self.has_live_feature_capacity(len(request.request_ids)):
-            raise RuntimeError(f"VLM prefix lane pool is full ({self._prefix_pool.active_count} active requests)")
-        observation = _model.Observation.from_dict(_to_jax_tree(request.observation))
+            raise RuntimeError(f"VLM lane credits exhausted ({self.available_live_feature_slots} available)")
+        stage_start_ns = time.monotonic_ns()
+        to_jax_start_ns = stage_start_ns
+        jax_observation_tree = _to_jax_tree(request.observation)
+        to_jax_tree_ms = (time.monotonic_ns() - to_jax_start_ns) / 1_000_000
+        observation_from_dict_start_ns = time.monotonic_ns()
+        observation = _model.Observation.from_dict(jax_observation_tree)
+        observation_from_dict_ms = (time.monotonic_ns() - observation_from_dict_start_ns) / 1_000_000
+        input_stage_ms = (time.monotonic_ns() - stage_start_ns) / 1_000_000
         return self._handle_batched_observation(
             request_ids=request.request_ids,
             observation=observation,
@@ -93,14 +164,34 @@ class JaxVLMWorker:
             enqueue_ns_by_row=tuple(request.enqueue_ns for _ in request.request_ids),
             dequeue_ns_by_row=tuple(request.dequeue_ns for _ in request.request_ids),
             dequeue_start_ns_by_row=tuple(request.dequeue_start_ns for _ in request.request_ids),
+            input_stage_start_ns=stage_start_ns,
+            input_stage_ms=input_stage_ms,
+            input_stage_timing={
+                "vlm_sample_kwargs_stage_ms": 0.0,
+                "vlm_observation_stack_ms": 0.0,
+                "vlm_to_jax_tree_ms": to_jax_tree_ms,
+                "vlm_observation_from_dict_ms": observation_from_dict_ms,
+            },
         )
 
-    def release(self, release: JaxReleaseFeature) -> JaxSlotMoved | None:
-        moved = self._prefix_pool.release_lane(release.request_id)
-        if moved is None:
-            return None
-        old_slot_id, new_slot_id, moved_request_id = moved
-        return JaxSlotMoved(request_id=moved_request_id, old_slot_id=old_slot_id, new_slot_id=new_slot_id)
+    def release(self, release: JaxReleaseFeature) -> None:
+        self._outstanding.discard(release.request_id)
+        self.grant_lane_credits(release)
+
+    def _take_credit(self) -> int:
+        if not self._lane_credits:
+            raise RuntimeError("No VLM lane credits available")
+        return heapq.heappop(self._lane_credits)
+
+    def _write_feature_to_lane(self, lane_id: int, feature: JaxPrefixFeature) -> None:
+        if self._shared_pool is not None:
+            self._shared_pool.write_lane(lane_id, feature)
+            return
+        if self._writable_slab_tree is None:
+            raise RuntimeError("VLM has not attached AE-owned prefix slabs")
+        self._writable_slab_tree = write_feature_to_slab_tree(
+            self._backend, self._writable_slab_tree, lane_id, feature
+        )
 
     def _handle_batched_observation(
         self,
@@ -111,6 +202,9 @@ class JaxVLMWorker:
         enqueue_ns_by_row: tuple[int, ...],
         dequeue_ns_by_row: tuple[int | None, ...],
         dequeue_start_ns_by_row: tuple[int | None, ...],
+        input_stage_start_ns: int,
+        input_stage_ms: float,
+        input_stage_timing: dict[str, float],
     ) -> list[JaxPrefixReady]:
         if (
             len(enqueue_ns_by_row) != len(request_ids)
@@ -118,19 +212,32 @@ class JaxVLMWorker:
             or len(dequeue_start_ns_by_row) != len(request_ids)
         ):
             raise ValueError("enqueue/dequeue timing must have one entry per request id")
+        if not self.has_ae_slab:
+            raise RuntimeError("VLM cannot write prefixes before AE slab export")
         start_ns = time.monotonic_ns()
+        timeline_log.emit("vlm_prefix_fwd_begin", batch=len(request_ids), reqs=list(request_ids))
         feature = self._model.build_prefix_feature(None, observation)
         _block_prefix_feature(feature)
         elapsed_ms = (time.monotonic_ns() - start_ns) / 1_000_000
+        timeline_log.emit(
+            "vlm_prefix_fwd_end",
+            batch=len(request_ids),
+            reqs=list(request_ids),
+            ms=round(elapsed_ms, 3),
+        )
         batch_size = int(feature.prefix_pad_masks.shape[0])
         if batch_size != len(request_ids):
             raise RuntimeError(f"VLM prefix batch size {batch_size} does not match {len(request_ids)} request ids")
 
         num_steps = int(sample_kwargs.get("num_steps", 10))
+        write_start_ns = time.monotonic_ns()
+        timeline_log.emit("vlm_slab_write_begin", batch=batch_size, reqs=list(request_ids))
         ready: list[JaxPrefixReady] = []
         for row, request_id in enumerate(request_ids):
             row_feature = _prefix_feature_row_view(feature, row)
-            slot_id = self._prefix_pool.put_lane(request_id, row_feature)
+            slot_id = self._take_credit()
+            self._write_feature_to_lane(slot_id, row_feature)
+            self._outstanding.add(request_id)
             enqueue_ns = enqueue_ns_by_row[row]
             dequeue_ns = dequeue_ns_by_row[row] or enqueue_ns
             queue_wait_ms, transfer_ms = _vlm_request_queue_timings(
@@ -138,6 +245,7 @@ class JaxVLMWorker:
                 dequeue_start_ns=dequeue_start_ns_by_row[row],
                 dequeue_ns=dequeue_ns,
             )
+            batch_wait_ms = max(0.0, (input_stage_start_ns - dequeue_ns) / 1_000_000)
             row_kwargs = _sample_kwargs_for_row(sample_kwargs, row, batch_size)
             ready.append(
                 JaxPrefixReady(
@@ -155,10 +263,36 @@ class JaxVLMWorker:
                         "vlm_effective_batch": float(batch_size),
                         "vlm_request_queue_wait_ms": queue_wait_ms,
                         "vlm_request_transfer_ms": transfer_ms,
-                        "vlm_queue_wait_ms": max(0.0, (start_ns - dequeue_ns) / 1_000_000),
+                        "vlm_queue_wait_ms": batch_wait_ms,
+                        "vlm_batch_wait_ms": batch_wait_ms,
+                        "vlm_input_stage_ms": input_stage_ms,
+                        **input_stage_timing,
+                        "vlm_slab_write_ms": 0.0,  # filled after loop
                     },
                 )
             )
+        write_ms = (time.monotonic_ns() - write_start_ns) / 1_000_000
+        timeline_log.emit(
+            "vlm_slab_write_end",
+            batch=batch_size,
+            reqs=list(request_ids),
+            ms=round(write_ms, 3),
+        )
+        for item in ready:
+            timing = dict(item.timing or {})
+            timing["vlm_slab_write_ms"] = write_ms / max(len(ready), 1)
+            item = replace(item, timing=timing)
+            # dataclasses replace returns new; update list
+        ready = [
+            replace(
+                item,
+                timing={
+                    **dict(item.timing or {}),
+                    "vlm_slab_write_ms": write_ms / max(len(ready), 1),
+                },
+            )
+            for item in ready
+        ]
         return ready
 
 
@@ -170,26 +304,70 @@ class JaxVLMProcess:
         request_queue,
         prefix_queue,
         release_queue,
-        prefix_pool: JaxVlmPrefixCacheLanePool,
         max_batch_size: int = 8,
         max_wait_ms: float = 2.0,
-        max_live_features: int | None = None,
+        max_live_features: int = 8,
+        backend: DeviceSlabBackend | None = None,
+        shared_pool: JaxVlmPrefixCacheLanePool | None = None,
     ):
         if max_batch_size <= 0:
             raise ValueError("max_batch_size must be positive")
         if max_wait_ms < 0:
             raise ValueError("max_wait_ms must be non-negative")
-        live_features = max_live_features if max_live_features is not None else prefix_pool.max_lanes
-        self.worker = JaxVLMWorker(model=model, max_live_features=live_features, prefix_pool=prefix_pool)
+        self.worker = JaxVLMWorker(
+            model=model,
+            max_live_features=max_live_features,
+            backend=backend,
+            shared_pool=shared_pool,
+        )
         self._request_queue = request_queue
         self._prefix_queue = prefix_queue
         self._release_queue = release_queue
         self._max_batch_size = max_batch_size
         self._max_wait_ms = max_wait_ms
         self._backlog: deque[Any] = deque()
-        self._sent_slab_ready = False
+        self._ae_export_ready = self.worker.has_ae_slab and self.worker.available_live_feature_slots > 0
+
+    def wait_for_ae_export(self, *, timeout_s: float | None = None) -> None:
+        """Block until AE publishes PrefixSlabReady + LaneCredits on the release queue."""
+        deadline = None if timeout_s is None else time.monotonic() + timeout_s
+        saw_slab = self.worker.has_ae_slab
+        saw_credits = self.worker.available_live_feature_slots > 0
+        while not (saw_slab and saw_credits):
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError("Timed out waiting for AE prefix slab export / lane credits")
+            remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+            try:
+                if remaining is None:
+                    message = self._release_queue.get()
+                else:
+                    message = self._release_queue.get(timeout=min(remaining, 1.0))
+            except queue.Empty:
+                continue
+            if isinstance(message, JaxPrefixSlabReady):
+                # Credits may arrive as a separate message; attach slab first with empty credits.
+                if not self.worker.has_ae_slab:
+                    self.worker.attach_ae_slab(message, JaxLaneCredits(lane_ids=()))
+                saw_slab = True
+                continue
+            if isinstance(message, JaxLaneCredits):
+                self.worker.grant_lane_credits(message)
+                saw_credits = self.worker.available_live_feature_slots > 0
+                continue
+            if isinstance(message, JaxReleaseFeature):
+                self.worker.release(message)
+                saw_credits = self.worker.available_live_feature_slots > 0
+                continue
+            if isinstance(message, JaxShutdown):
+                raise SystemExit
+            # Unexpected control messages are ignored during bootstrap.
+        self._ae_export_ready = True
 
     def run(self) -> None:
+        timeline_log.configure("vlm")
+        timeline_log.emit("vlm_run_begin")
+        if not self._ae_export_ready:
+            self.wait_for_ae_export()
         while True:
             self._drain_releases()
             self._prefetch_request_backlog(max_messages=self._max_batch_size)
@@ -203,6 +381,11 @@ class JaxVLMProcess:
             if isinstance(message, JaxBatchRequestEnvelope):
                 if not self._defer_until_live_feature_capacity(message, len(message.request_ids)):
                     continue
+                # Drain releases again right before consuming credits for a batch so we
+                # never reuse a lane that AE has not yet freed (Result can race ahead).
+                self._drain_releases()
+                if not self._defer_until_live_feature_capacity(message, len(message.request_ids)):
+                    continue
                 try:
                     self._put_prefix_batch(self.worker.handle_batch_request(message))
                 except Exception as exc:  # pragma: no cover
@@ -214,6 +397,9 @@ class JaxVLMProcess:
             if not isinstance(message, JaxRequestEnvelope):
                 self._prefix_queue.put(JaxWorkerError(request_id=None, error=f"Unexpected VLM message: {type(message)}"))
                 continue
+            if not self._defer_until_live_feature_capacity(message, 1):
+                continue
+            self._drain_releases()
             if not self._defer_until_live_feature_capacity(message, 1):
                 continue
             requests = [message]
@@ -237,19 +423,14 @@ class JaxVLMProcess:
             except queue.Empty:
                 return
             if isinstance(message, JaxReleaseFeature):
-                moved = self.worker.release(message)
-                if moved is not None:
-                    self._prefix_queue.put(moved)
+                self.worker.release(message)
+            elif isinstance(message, JaxLaneCredits):
+                self.worker.grant_lane_credits(message)
+            elif isinstance(message, JaxPrefixSlabReady):
+                if not self.worker.has_ae_slab:
+                    self.worker.attach_ae_slab(message, JaxLaneCredits(lane_ids=()))
 
     def _put_prefix_batch(self, ready_messages: list[JaxPrefixReady]) -> None:
-        if ready_messages and not self._sent_slab_ready:
-            self._prefix_queue.put(
-                JaxPrefixSlabReady(
-                    slab=self.worker.export_slab_handle_tree(),
-                    timing={"_prefix_enqueue_ns": float(time.monotonic_ns())},
-                )
-            )
-            self._sent_slab_ready = True
         for ready in ready_messages:
             timing = dict(ready.timing or {})
             timing["_prefix_enqueue_ns"] = float(time.monotonic_ns())
@@ -328,6 +509,22 @@ class JaxVLMProcess:
         return False
 
 
+def _open_slab_tree(backend: DeviceSlabBackend, value: Any) -> Any:
+    if isinstance(value, DeviceSlabHandle):
+        return backend.open_slab(value)
+    if isinstance(value, DeviceSlab):
+        return value
+    if isinstance(value, tuple):
+        return tuple(_open_slab_tree(backend, item) for item in value)
+    if isinstance(value, list):
+        return [_open_slab_tree(backend, item) for item in value]
+    if isinstance(value, dict):
+        return {key: _open_slab_tree(backend, item) for key, item in value.items()}
+    if value is None:
+        return None
+    raise TypeError(f"Unsupported prefix slab handle tree node: {type(value)}")
+
+
 def _mark_dequeued_message(message: Any, *, get_start_ns: int, get_end_ns: int) -> Any:
     if isinstance(message, JaxRequestEnvelope | JaxBatchRequestEnvelope):
         return replace(message, dequeue_start_ns=get_start_ns, dequeue_ns=get_end_ns)
@@ -342,13 +539,16 @@ def _vlm_request_queue_timings(
 ) -> tuple[float, float]:
     if dequeue_start_ns is None:
         return max(0.0, (dequeue_ns - enqueue_ns) / 1_000_000), 0.0
+    effective_get_start_ns = max(dequeue_start_ns, enqueue_ns)
     return (
-        max(0.0, (dequeue_start_ns - enqueue_ns) / 1_000_000),
-        max(0.0, (dequeue_ns - dequeue_start_ns) / 1_000_000),
+        max(0.0, (effective_get_start_ns - enqueue_ns) / 1_000_000),
+        max(0.0, (dequeue_ns - effective_get_start_ns) / 1_000_000),
     )
 
 
 def _stack_request_observations(observations: list[dict[str, Any]]) -> dict[str, Any]:
+    if len(observations) == 1:
+        return observations[0]
     return _cat_tree(observations)
 
 
@@ -362,11 +562,11 @@ def _stack_request_sample_kwargs(requests: list[JaxRequestEnvelope]) -> dict[str
         first = values[0]
         if _is_array(first):
             if key == "noise" and first.ndim == 3:
-                stacked[key] = jnp.concatenate([jnp.asarray(value) for value in values], axis=0)
+                stacked[key] = np.concatenate([np.asarray(value) for value in values], axis=0).copy()
             else:
                 if any(not np.array_equal(np.asarray(value), np.asarray(first)) for value in values):
                     raise ValueError(f"Cannot batch requests with different tensor sample kwarg {key!r}")
-                stacked[key] = jnp.asarray(first)
+                stacked[key] = np.asarray(first).copy()
         else:
             if any(value != first for value in values):
                 raise ValueError(f"Cannot batch requests with different sample kwarg {key!r}")
@@ -379,7 +579,7 @@ def _cat_tree(values: list[Any]) -> Any:
     if isinstance(first, dict):
         return {key: _cat_tree([value[key] for value in values]) for key in first}
     if _is_array(first):
-        return jnp.concatenate([jnp.asarray(value) for value in values], axis=0)
+        return _concat_model_input(values)
     if isinstance(first, tuple):
         return tuple(_cat_tree([value[index] for value in values]) for index in range(len(first)))
     if isinstance(first, list):
@@ -389,7 +589,7 @@ def _cat_tree(values: list[Any]) -> Any:
 
 def _to_jax_tree(value: Any) -> Any:
     if _is_array(value):
-        return jnp.asarray(value)
+        return _asarray_model_input(value)
     if isinstance(value, dict):
         return {key: _to_jax_tree(item) for key, item in value.items()}
     if isinstance(value, list):
@@ -397,6 +597,15 @@ def _to_jax_tree(value: Any) -> Any:
     if isinstance(value, tuple):
         return tuple(_to_jax_tree(item) for item in value)
     return value
+
+
+def _asarray_model_input(value: Any) -> jax.Array:
+    return jnp.asarray(np.asarray(value))
+
+
+def _concat_model_input(values: list[Any]) -> jax.Array:
+    arrays = [np.asarray(value) for value in values]
+    return jnp.asarray(np.concatenate(arrays, axis=0))
 
 
 def _prefix_feature_row_view(feature: JaxPrefixFeature, row: int) -> JaxPrefixFeature:
@@ -423,7 +632,7 @@ def _sample_kwargs_for_row(sample_kwargs: dict[str, Any], row: int, batch_size: 
     row_kwargs = dict(sample_kwargs)
     noise = row_kwargs.get("noise")
     if _is_array(noise) and noise.ndim == 3 and int(noise.shape[0]) == batch_size:
-        row_kwargs["noise"] = noise[row : row + 1]
+        row_kwargs["noise"] = np.asarray(noise[row : row + 1]).copy()
     return row_kwargs
 
 
@@ -496,30 +705,6 @@ def _dtype_tree(value: Any) -> Any:
         return [_dtype_tree(item) for item in value]
     if isinstance(value, dict):
         return {key: _dtype_tree(item) for key, item in value.items()}
-    return None
-
-
-def _shape_tree_from_slab_handles(value: Any) -> Any:
-    if hasattr(value, "spec"):
-        return value.spec.shape
-    if isinstance(value, tuple):
-        return tuple(_shape_tree_from_slab_handles(item) for item in value)
-    if isinstance(value, list):
-        return [_shape_tree_from_slab_handles(item) for item in value]
-    if isinstance(value, dict):
-        return {key: _shape_tree_from_slab_handles(item) for key, item in value.items()}
-    return None
-
-
-def _dtype_tree_from_slab_handles(value: Any) -> Any:
-    if hasattr(value, "spec"):
-        return value.spec.dtype
-    if isinstance(value, tuple):
-        return tuple(_dtype_tree_from_slab_handles(item) for item in value)
-    if isinstance(value, list):
-        return [_dtype_tree_from_slab_handles(item) for item in value]
-    if isinstance(value, dict):
-        return {key: _dtype_tree_from_slab_handles(item) for key, item in value.items()}
     return None
 
 

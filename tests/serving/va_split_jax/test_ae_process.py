@@ -17,10 +17,11 @@ from openpi.serving.va_split_jax.ae_process import JaxAEProcess
 from openpi.serving.va_split_jax.ae_process import JaxAEWorker
 from openpi.serving.va_split_jax.device_slab import make_default_device_slab_backend
 from openpi.serving.va_split_jax.prefix_cache_pool import JaxVlmPrefixCacheLanePool
+from openpi.serving.va_split_jax.types import JaxLaneCredits
 from openpi.serving.va_split_jax.types import JaxPrefixReady
+from openpi.serving.va_split_jax.types import JaxPrefixSlabReady
 from openpi.serving.va_split_jax.types import JaxReleaseFeature
 from openpi.serving.va_split_jax.types import JaxShutdown
-from openpi.serving.va_split_jax.types import JaxSlotMoved
 from openpi.serving.va_split_jax.types import JaxWorkerError
 
 
@@ -85,12 +86,13 @@ def _feature(fill: float) -> JaxPrefixFeature:
     )
 
 
-def _mapped_prefix_slabs(*request_ids: str):
+def _owned_pool_with_written_lanes(*fills: float):
     backend = make_default_device_slab_backend()
     pool = JaxVlmPrefixCacheLanePool(max_lanes=4, backend=backend)
-    for idx, request_id in enumerate(request_ids):
-        pool.put_lane(request_id, _feature(float(idx + 1)))
-    return backend, pool.local_slab_tree()
+    pool.initialize_from_feature(_feature(0.0))
+    for idx, fill in enumerate(fills):
+        pool.write_lane(idx, _feature(fill))
+    return backend, pool
 
 
 def _ready(request_id: str, slot_id: int, *, num_steps: int = 1) -> JaxPrefixReady:
@@ -110,9 +112,9 @@ def _ready(request_id: str, slot_id: int, *, num_steps: int = 1) -> JaxPrefixRea
 
 def test_jax_ae_worker_batches_two_ready_requests_for_two_denoise_steps():
     model = FakeJaxAEModel()
-    backend, slab_tree = _mapped_prefix_slabs("req-1", "req-2")
-    worker = JaxAEWorker(model=model, max_batch_size=2, max_prefix_slots=4, backend=backend)
-    worker.set_mapped_prefix_slabs(slab_tree, map_ms=0.25)
+    backend, pool = _owned_pool_with_written_lanes(1.0, 2.0)
+    worker = JaxAEWorker(model=model, max_batch_size=2, max_prefix_slots=4, backend=backend, owned_pool=pool)
+    worker.attach_initialized_pool(pool)
     worker.add_prefix(_ready("req-1", 0, num_steps=2))
     worker.add_prefix(_ready("req-2", 1, num_steps=2))
 
@@ -129,32 +131,47 @@ def test_jax_ae_worker_batches_two_ready_requests_for_two_denoise_steps():
         np.testing.assert_allclose(result.actions, -jnp.ones((1, 2, 1), dtype=jnp.float32))
         assert result.timing is not None
         assert result.timing["ae_effective_batch"] == 2.0
-        assert result.timing["prefix_pool_write_ms"] == 0.0
+        assert result.timing["ae_init_denoise_ms"] >= 0.0
+        assert result.timing["prefix_lane_ingest_ms"] == 0.0
         assert result.timing["prefix_pool_compact_ms"] >= 0.0
-        assert result.timing["prefix_slab_map_ms"] == 0.25
 
 
-def test_jax_ae_worker_updates_prefix_slot_after_vlm_compaction():
-    backend, slab_tree = _mapped_prefix_slabs("req-1", "req-2")
-    worker = JaxAEWorker(model=FakeJaxAEModel(), max_batch_size=2, max_prefix_slots=4, backend=backend)
-    worker.set_mapped_prefix_slabs(slab_tree)
+def test_jax_ae_worker_accepts_host_noise_from_prefix_ready():
+    backend, pool = _owned_pool_with_written_lanes(1.0)
+    worker = JaxAEWorker(model=FakeJaxAEModel(), max_batch_size=1, max_prefix_slots=4, backend=backend, owned_pool=pool)
+    worker.attach_initialized_pool(pool)
+    ready = dataclasses.replace(
+        _ready("req-1", 0, num_steps=1),
+        sample_kwargs={"noise": np.full((1, 2, 1), 3.0, dtype=np.float32)},
+    )
+
+    worker.add_prefix(ready)
+    results, releases = worker.step_once()
+
+    assert [release.request_id for release in releases] == ["req-1"]
+    np.testing.assert_allclose(results[0].actions, np.full((1, 2, 1), 2.0, dtype=np.float32))
+
+
+def test_jax_ae_worker_compacts_locally_without_slot_moved():
+    backend, pool = _owned_pool_with_written_lanes(1.0, 2.0)
+    worker = JaxAEWorker(model=FakeJaxAEModel(), max_batch_size=2, max_prefix_slots=4, backend=backend, owned_pool=pool)
+    worker.attach_initialized_pool(pool)
     worker.add_prefix(_ready("req-1", 0, num_steps=1))
     worker.add_prefix(_ready("req-2", 1, num_steps=2))
 
     results, releases = worker.step_once()
     assert [result.request_id for result in results] == ["req-1"]
-    assert releases == [JaxReleaseFeature(request_id="req-1", slot_id=0)]
-    assert worker.active["req-2"].prefix_slot_id == 1
-
-    worker.apply_slot_moved(JaxSlotMoved(request_id="req-2", old_slot_id=1, new_slot_id=0))
-
-    assert worker.active["req-2"].prefix_slot_id == 0
+    assert releases == [JaxReleaseFeature(request_id="req-1", slot_id=1)]
     assert [request.request_id for request in worker.select_ready_lanes()] == ["req-2"]
+    assert worker.active["req-2"].active_lane_id == 0
 
 
 def test_jax_ae_process_waits_for_free_prefix_slot_before_draining_more_ready_messages():
-    backend, slab_tree = _mapped_prefix_slabs("req-1", "req-2")
-    prefix_queue = SimpleQueue([_ready("req-1", 0, num_steps=2), _ready("req-2", 1, num_steps=1)])
+    backend = make_default_device_slab_backend()
+    pool = JaxVlmPrefixCacheLanePool(max_lanes=1, backend=backend)
+    pool.initialize_from_feature(_feature(0.0))
+    pool.write_lane(0, _feature(1.0))
+    prefix_queue = SimpleQueue([_ready("req-1", 0, num_steps=2), _ready("req-2", 0, num_steps=1)])
     process = JaxAEProcess(
         model=FakeJaxAEModel(),
         prefix_queue=prefix_queue,
@@ -163,8 +180,9 @@ def test_jax_ae_process_waits_for_free_prefix_slot_before_draining_more_ready_me
         max_batch_size=1,
         max_prefix_slots=1,
         backend=backend,
+        owned_pool=pool,
     )
-    process.worker.set_mapped_prefix_slabs(slab_tree)
+    process.worker.attach_initialized_pool(pool)
 
     process.drain_prefix_ready(block=True)
 
@@ -178,14 +196,15 @@ def test_jax_ae_process_waits_for_free_prefix_slot_before_draining_more_ready_me
     assert [message.request_id for message in prefix_queue.remaining()] == ["req-2"]
 
     process.step_active_once()
-    process.worker.apply_slot_moved(JaxSlotMoved(request_id="req-2", old_slot_id=1, new_slot_id=0))
+    # After release, credit returns; VLM would rewrite lane 0. Simulate rewrite + admit.
+    pool.write_lane(0, _feature(2.0))
     process.drain_prefix_ready(block=True)
 
     assert list(process.worker.active) == ["req-2"]
 
 
 def test_jax_ae_process_releases_active_features_when_step_fails():
-    backend, slab_tree = _mapped_prefix_slabs("req-1", "req-2")
+    backend, pool = _owned_pool_with_written_lanes(1.0, 2.0)
     result_queue = SimpleQueue()
     release_queue = SimpleQueue()
     process = JaxAEProcess(
@@ -194,9 +213,11 @@ def test_jax_ae_process_releases_active_features_when_step_fails():
         result_queue=result_queue,
         release_queue=release_queue,
         max_batch_size=2,
+        max_prefix_slots=4,
         backend=backend,
+        owned_pool=pool,
     )
-    process.worker.set_mapped_prefix_slabs(slab_tree)
+    process.worker.attach_initialized_pool(pool)
     process.worker.add_prefix(_ready("req-1", 0))
     process.worker.add_prefix(_ready("req-2", 1))
 
@@ -222,9 +243,9 @@ def test_jax_ae_process_shutdown_closes_worker():
 
 
 def test_jax_ae_worker_splits_prefix_queue_wait_transfer_and_admit():
-    backend, slab_tree = _mapped_prefix_slabs("req-1")
-    worker = JaxAEWorker(model=FakeJaxAEModel(), max_batch_size=1, backend=backend)
-    worker.set_mapped_prefix_slabs(slab_tree)
+    backend, pool = _owned_pool_with_written_lanes(1.0)
+    worker = JaxAEWorker(model=FakeJaxAEModel(), max_batch_size=1, max_prefix_slots=4, backend=backend, owned_pool=pool)
+    worker.attach_initialized_pool(pool)
     get_end_ns = time.monotonic_ns() - 2_000_000
     prefix_ready = dataclasses.replace(
         _ready("req-1", 0),
@@ -242,4 +263,23 @@ def test_jax_ae_worker_splits_prefix_queue_wait_transfer_and_admit():
     assert timing["prefix_queue_wait_ms"] == pytest.approx(4.0, abs=0.1)
     assert timing["prefix_transfer_ms"] == pytest.approx(1.0, abs=0.1)
     assert timing["prefix_admit_wait_ms"] >= 4.0
+    assert timing["prefix_lane_ingest_ms"] == 0.0
     assert "_prefix_enqueue_ns" not in timing
+
+
+def test_jax_ae_bootstrap_exports_slab_and_credits():
+    backend = make_default_device_slab_backend()
+    release_queue = SimpleQueue()
+    process = JaxAEProcess(
+        model=FakeJaxAEModel(),
+        prefix_queue=SimpleQueue(),
+        result_queue=SimpleQueue(),
+        release_queue=release_queue,
+        max_batch_size=2,
+        max_prefix_slots=3,
+        backend=backend,
+    )
+    process.bootstrap_owned_pool(_feature(0.0))
+    assert isinstance(release_queue.items[0], JaxPrefixSlabReady)
+    assert isinstance(release_queue.items[1], JaxLaneCredits)
+    assert release_queue.items[1].lane_ids == (0, 1, 2)

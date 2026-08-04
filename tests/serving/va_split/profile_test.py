@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import dataclasses
 import json
 import threading
@@ -96,13 +97,83 @@ def test_args_defaults_to_profile_checkpoint():
 
 def test_args_defaults_to_two_warmup_requests():
     assert profile_va_split.Args().warmup_requests == 2
+    assert profile_va_split.Args().warmup_until_steady is True
+    assert profile_va_split.Args().warmup_steady_window == 4
+
+
+def test_is_e2e_latency_steady_requires_two_windows_and_rejects_spikes():
+    assert not profile_va_split.is_e2e_latency_steady(
+        [100.0, 100.0, 100.0],
+        window=4,
+        rel_tol=0.2,
+        spike_factor=3.0,
+    )
+    assert profile_va_split.is_e2e_latency_steady(
+        [200.0, 190.0, 195.0, 205.0, 180.0, 185.0, 190.0, 188.0],
+        window=4,
+        rel_tol=0.2,
+        spike_factor=3.0,
+    )
+    assert not profile_va_split.is_e2e_latency_steady(
+        [200.0, 190.0, 195.0, 205.0, 180.0, 185.0, 190.0, 900.0],
+        window=4,
+        rel_tol=0.2,
+        spike_factor=3.0,
+    )
+    assert not profile_va_split.is_e2e_latency_steady(
+        [400.0, 420.0, 410.0, 430.0, 180.0, 185.0, 190.0, 188.0],
+        window=4,
+        rel_tol=0.2,
+        spike_factor=3.0,
+    )
+
+
+def test_jax_e2e_warmup_until_steady_skips_cold_spikes_before_return(monkeypatch):
+    policy = _ConcurrentFakePolicy(sleep_s=0.0)
+    delays_ms = [2000.0, 1500.0, 400.0, 220.0, 200.0, 195.0, 190.0, 188.0, 185.0, 187.0, 186.0, 184.0]
+    call_idx = {"i": 0}
+    marks: list[float] = [0.0]
+
+    original_infer = policy.infer
+
+    def infer(obs, *, noise=None):
+        i = call_idx["i"]
+        call_idx["i"] += 1
+        delay = delays_ms[min(i, len(delays_ms) - 1)] / 1000.0
+        marks.append(marks[-1] + delay)
+        return original_infer(obs, noise=noise)
+
+    policy.infer = infer
+    monkeypatch.setattr(profile_va_split.time, "perf_counter", lambda: marks[-1])
+
+    requests = _fake_requests(8)
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        stats = profile_va_split.warmup_jax_e2e_pipeline_until_steady(
+            policy,
+            requests,
+            args=profile_va_split.Args(
+                mode="jax-split-ipc",
+                warmup_requests=2,
+                warmup_until_steady=True,
+                warmup_steady_window=4,
+                warmup_steady_max_requests=20,
+                warmup_steady_rel_tol=0.2,
+                warmup_steady_spike_factor=3.0,
+                warmup_concurrent_inflight=0,
+                max_vlm_batch_size=2,
+            ),
+            executor=executor,
+        )
+
+    assert stats["e2e_warmup_requests"] >= 8
+    assert stats["e2e_warmup_steady_p50_ms"] < 300.0
 
 
 def test_args_defaults_to_jax_compile_enabled():
     args = profile_va_split.Args()
     assert args.jax_compile is True
     assert args.jax_compile_warmup is True
-    assert args.jax_compile_warmup_max_batch_size == 32
+    assert args.jax_compile_warmup_max_batch_size is None
 
 
 def test_args_disables_pytorch_compile_by_default():
@@ -140,6 +211,8 @@ class _ConcurrentFakePolicy:
                 "vlm_request_queue_wait_ms": 0.2,
                 "vlm_request_transfer_ms": 0.05,
                 "vlm_queue_wait_ms": 0.1,
+                "vlm_batch_wait_ms": 0.1,
+                "vlm_input_stage_ms": 0.25,
                 "prefix_queue_wait_ms": 0.3,
                 "prefix_transfer_ms": 0.2,
                 "prefix_admit_wait_ms": 0.15,
@@ -229,6 +302,8 @@ def test_run_benchmark_allows_concurrent_policy_overlap():
     assert summary["vlm_request_queue_wait_mean_ms"] == 0.2
     assert summary["vlm_request_transfer_mean_ms"] == 0.05
     assert summary["vlm_queue_wait_mean_ms"] == 0.1
+    assert summary["vlm_batch_wait_mean_ms"] == 0.1
+    assert summary["vlm_input_stage_mean_ms"] == 0.25
     assert summary["prefix_queue_wait_mean_ms"] == 0.3
     assert summary["prefix_transfer_mean_ms"] == 0.2
     assert summary["prefix_admit_wait_mean_ms"] == 0.15

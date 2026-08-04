@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -20,7 +19,7 @@ class FakeRuntime:
 
     def infer(self, observation: dict, sample_kwargs: dict) -> JaxActionResult:
         self.sample_kwargs = sample_kwargs
-        assert isinstance(observation["state"], jax.Array)
+        assert isinstance(observation["state"], np.ndarray)
         return JaxActionResult(
             request_id="req-1",
             actions=jnp.ones((1, 2, 3), dtype=jnp.float32),
@@ -41,7 +40,7 @@ class FakeBatchRuntime(FakeRuntime):
         self.batch_calls += 1
         self.sample_kwargs = sample_kwargs
         self.batch_observation = observation
-        assert isinstance(observation["state"], jax.Array)
+        assert isinstance(observation["state"], np.ndarray)
         return JaxActionResult(
             request_id="batch-1",
             actions=jnp.zeros((observation["state"].shape[0], 2, 3), dtype=jnp.float32),
@@ -88,7 +87,7 @@ def test_jax_va_split_policy_infer_batch_uses_runtime_batch_once():
 
     assert runtime.batch_calls == 1
     assert runtime.batch_observation["state"].shape == (2, 2)
-    assert isinstance(runtime.sample_kwargs["noise"], jax.Array)
+    assert isinstance(runtime.sample_kwargs["noise"], np.ndarray)
     assert runtime.sample_kwargs["noise"].shape == (2, 2, 3)
     assert result["actions"].shape == (2, 2, 3)
     assert result["policy_timing"]["effective_batch"] == 2

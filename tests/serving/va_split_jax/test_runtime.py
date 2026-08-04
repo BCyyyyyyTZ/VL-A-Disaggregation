@@ -93,7 +93,7 @@ def test_jax_local_va_split_runtime_infer_batch_builds_prefix_once_and_returns_r
     )
 
     assert result.request_id
-    assert model.prefix_batch_sizes == [2]
+    assert model.prefix_batch_sizes == [1, 2]  # bootstrap template + batched batch
     np.testing.assert_allclose(result.actions, -jnp.ones((2, 2, 1), dtype=jnp.float32))
     assert result.timing is not None
     assert result.timing["effective_batch"] == 2

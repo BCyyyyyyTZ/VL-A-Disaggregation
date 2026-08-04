@@ -28,10 +28,13 @@ def test_pi05_jax_split_helpers_match_sample_actions_dummy_model():
     mono = model.sample_actions(jax.random.key(1), obs, noise=noise, num_steps=4)
     prefix = model.build_prefix_feature(None, obs)
     state = model.init_denoise_state(jax.random.key(1), batch_size=1, noise=noise, num_steps=4)
+    assert state.step_idx.shape == (1,)
+    assert state.dt.shape == (1,)
     for _ in range(4):
         v_t = model.denoise_one_batch(prefix, state)
+        dt = state.dt.reshape((state.x_t.shape[0],) + (1,) * (state.x_t.ndim - 1))
         state = type(state)(
-            x_t=state.x_t + state.dt * v_t,
+            x_t=state.x_t + dt * v_t,
             step_idx=state.step_idx + 1,
             num_steps=state.num_steps,
             dt=state.dt,

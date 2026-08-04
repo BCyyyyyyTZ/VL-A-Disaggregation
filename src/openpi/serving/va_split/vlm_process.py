@@ -349,9 +349,10 @@ def _vlm_request_queue_timings(
     if dequeue_start_ns is None:
         # Direct in-process calls have no queue get()/IPC; treat the gap as queue wait.
         return max(0.0, (dequeue_ns - enqueue_ns) / 1_000_000), 0.0
+    effective_get_start_ns = max(dequeue_start_ns, enqueue_ns)
     return (
-        max(0.0, (dequeue_start_ns - enqueue_ns) / 1_000_000),
-        max(0.0, (dequeue_ns - dequeue_start_ns) / 1_000_000),
+        max(0.0, (effective_get_start_ns - enqueue_ns) / 1_000_000),
+        max(0.0, (dequeue_ns - effective_get_start_ns) / 1_000_000),
     )
 
 

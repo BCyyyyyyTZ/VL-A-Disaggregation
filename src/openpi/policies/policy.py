@@ -61,10 +61,22 @@ class Policy(BasePolicy):
             self._model = self._model.to(pytorch_device)
             self._model.eval()
             self._sample_actions = model.sample_actions
+            self._jax_build_prefix_feature = None
+            self._jax_init_denoise_state = None
+            self._jax_denoise_one_batch = None
         else:
             # JAX model setup
             self._sample_actions = nnx_utils.module_jit(model.sample_actions)
             self._rng = rng or jax.random.key(0)
+            if _supports_jax_component_timing(model):
+                self._jax_build_prefix_feature = nnx_utils.module_jit(model.build_prefix_feature)
+                # init_denoise_state takes a Python int batch_size; do not module_jit it.
+                self._jax_init_denoise_state = model.init_denoise_state
+                self._jax_denoise_one_batch = nnx_utils.module_jit(model.denoise_one_batch)
+            else:
+                self._jax_build_prefix_feature = None
+                self._jax_init_denoise_state = None
+                self._jax_denoise_one_batch = None
 
     @override
     def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
@@ -99,6 +111,15 @@ class Policy(BasePolicy):
                 observation,
                 sample_kwargs,
             )
+        elif self._jax_build_prefix_feature is not None:
+            actions, component_timing = _sample_jax_actions_with_component_timing(
+                build_prefix_feature=self._jax_build_prefix_feature,
+                init_denoise_state=self._jax_init_denoise_state,
+                denoise_one_batch=self._jax_denoise_one_batch,
+                rng=sample_rng_or_pytorch_device,
+                observation=observation,
+                sample_kwargs=sample_kwargs,
+            )
         else:
             actions = self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs)
             component_timing = {}
@@ -120,36 +141,62 @@ class Policy(BasePolicy):
         return outputs
 
     def infer_batch(self, obs_batch: dict, *, noise: np.ndarray | None = None) -> dict:
-        if not self._is_pytorch_model:
-            raise NotImplementedError("Policy.infer_batch currently supports PyTorch models only")
-
-        inputs = _batch.apply_input_transform_batch(
-            obs_batch,
-            self._input_transform,
-            kind="torch",
-            device=self._pytorch_device,
-        )
-        batch_size = int(inputs["state"].shape[0])
-
-        sample_kwargs = dict(self._sample_kwargs)
-        if noise is not None:
-            sample_kwargs["noise"] = _batch.prepare_batch_noise(
-                noise,
-                batch_size=batch_size,
+        if self._is_pytorch_model:
+            inputs = _batch.apply_input_transform_batch(
+                obs_batch,
+                self._input_transform,
                 kind="torch",
                 device=self._pytorch_device,
             )
-
-        observation = _model.Observation.from_dict(inputs)
-        start_time = time.monotonic()
-        actions, component_timing = _sample_pytorch_actions_with_component_timing(
-            self._model,
-            self._sample_actions,
-            self._pytorch_device,
-            observation,
-            sample_kwargs,
-        )
-        model_time = time.monotonic() - start_time
+            batch_size = int(inputs["state"].shape[0])
+            sample_kwargs = dict(self._sample_kwargs)
+            if noise is not None:
+                sample_kwargs["noise"] = _batch.prepare_batch_noise(
+                    noise,
+                    batch_size=batch_size,
+                    kind="torch",
+                    device=self._pytorch_device,
+                )
+            observation = _model.Observation.from_dict(inputs)
+            start_time = time.monotonic()
+            actions, component_timing = _sample_pytorch_actions_with_component_timing(
+                self._model,
+                self._sample_actions,
+                self._pytorch_device,
+                observation,
+                sample_kwargs,
+            )
+            model_time = time.monotonic() - start_time
+        else:
+            inputs = _batch.apply_input_transform_batch(
+                obs_batch,
+                self._input_transform,
+                kind="jax",
+            )
+            batch_size = int(inputs["state"].shape[0])
+            sample_kwargs = dict(self._sample_kwargs)
+            if noise is not None:
+                sample_kwargs["noise"] = _batch.prepare_batch_noise(
+                    noise,
+                    batch_size=batch_size,
+                    kind="jax",
+                )
+            observation = _model.Observation.from_dict(inputs)
+            start_time = time.monotonic()
+            self._rng, sample_rng = jax.random.split(self._rng)
+            if self._jax_build_prefix_feature is not None:
+                actions, component_timing = _sample_jax_actions_with_component_timing(
+                    build_prefix_feature=self._jax_build_prefix_feature,
+                    init_denoise_state=self._jax_init_denoise_state,
+                    denoise_one_batch=self._jax_denoise_one_batch,
+                    rng=sample_rng,
+                    observation=observation,
+                    sample_kwargs=sample_kwargs,
+                )
+            else:
+                actions = self._sample_actions(sample_rng, observation, **sample_kwargs)
+                component_timing = {}
+            model_time = time.monotonic() - start_time
 
         outputs = _batch.apply_output_transform_batch(
             {
@@ -224,6 +271,66 @@ def _supports_pytorch_component_timing(model: Any, sample_kwargs: dict[str, Any]
         callable(getattr(model, name, None))
         for name in ("build_prefix_feature", "init_denoise_state", "denoise_one_batch")
     )
+
+
+def _supports_jax_component_timing(model: Any) -> bool:
+    return all(
+        callable(getattr(model, name, None))
+        for name in ("build_prefix_feature", "init_denoise_state", "denoise_one_batch")
+    )
+
+
+def _block_jax_tree(value: Any) -> None:
+    for leaf in jax.tree.leaves(value):
+        if hasattr(leaf, "block_until_ready"):
+            leaf.block_until_ready()
+
+
+def _sample_jax_actions_with_component_timing(
+    *,
+    build_prefix_feature,
+    init_denoise_state,
+    denoise_one_batch,
+    rng: at.KeyArrayLike,
+    observation: _model.Observation,
+    sample_kwargs: dict[str, Any],
+) -> tuple[Any, dict[str, float]]:
+    if set(sample_kwargs) - {"noise", "num_steps"}:
+        raise ValueError(f"Unsupported JAX component-timing kwargs: {sorted(sample_kwargs)}")
+
+    batch_size = int(observation.state.shape[0])
+    num_steps = int(sample_kwargs.get("num_steps", 10))
+    noise = sample_kwargs.get("noise")
+
+    vlm_start = time.monotonic()
+    prefix_feature = build_prefix_feature(None, observation)
+    _block_jax_tree(prefix_feature)
+    vlm_ms = (time.monotonic() - vlm_start) * 1000
+
+    denoise_state = init_denoise_state(rng, batch_size, noise, num_steps)
+    _block_jax_tree(denoise_state)
+    ae_step_ms: list[float] = []
+    for _ in range(num_steps):
+        ae_step_start = time.monotonic()
+        v_t = denoise_one_batch(prefix_feature, denoise_state)
+        dt = jnp.asarray(denoise_state.dt).reshape((denoise_state.x_t.shape[0],) + (1,) * (denoise_state.x_t.ndim - 1))
+        denoise_state = dataclasses.replace(
+            denoise_state,
+            x_t=denoise_state.x_t + dt * v_t,
+            step_idx=denoise_state.step_idx + 1,
+        )
+        _block_jax_tree(denoise_state.x_t)
+        ae_step_ms.append((time.monotonic() - ae_step_start) * 1000)
+
+    ae_ms = sum(ae_step_ms)
+    timing = {
+        "baseline_vlm_ms": vlm_ms,
+        "baseline_ae_ms": ae_ms,
+        "baseline_ae_step_ms": ae_ms / len(ae_step_ms) if ae_step_ms else 0.0,
+        "baseline_ae_steps": float(num_steps),
+        "baseline_effective_batch": float(batch_size),
+    }
+    return denoise_state.x_t, timing
 
 
 def _sync_torch_device(device: str) -> None:

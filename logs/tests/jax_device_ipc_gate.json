@@ -9,7 +9,7 @@
     "cuda:6",
     "cuda:7"
   ],
-  "elapsed_ms": 9240.966320037842,
+  "elapsed_ms": 3128.1772640068084,
   "payload_dtype": "float32",
   "payload_shape": [
     16,

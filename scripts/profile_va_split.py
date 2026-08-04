@@ -100,9 +100,18 @@ class Args:
     fixed_noise: bool = True
     timeout_s: float = 60.0
     warmup_requests: int = 2
+    # After compile/shape warmup, keep issuing real e2e requests until latency is steady
+    # (jax-split / jax-monolithic only). Avoids counting first-request cold spikes in profile.
+    warmup_until_steady: bool = True
+    warmup_steady_window: int = 4
+    warmup_steady_max_requests: int = 48
+    warmup_steady_rel_tol: float = 0.20
+    warmup_steady_spike_factor: float = 3.0
+    warmup_concurrent_inflight: int = 4
     jax_compile: bool = True
     jax_compile_warmup: bool = True
-    jax_compile_warmup_max_batch_size: int = 32
+    # None => VA-split resolves to max_vlm_batch_size * 3 (prefix capacity).
+    jax_compile_warmup_max_batch_size: int | None = None
     slo_ms: float = 200.0
     pytorch_device: str | None = None
     pytorch_compile_mode: CompileMode | None = None
@@ -523,6 +532,24 @@ def summarize_traces(
         "vlm_queue_wait_mean_ms": _timing_mean(completed, "vlm_queue_wait_ms"),
         "vlm_queue_wait_p50_ms": _timing_percentile(completed, "vlm_queue_wait_ms", 50),
         "vlm_queue_wait_p95_ms": _timing_percentile(completed, "vlm_queue_wait_ms", 95),
+        "vlm_batch_wait_mean_ms": _timing_mean(completed, "vlm_batch_wait_ms"),
+        "vlm_batch_wait_p50_ms": _timing_percentile(completed, "vlm_batch_wait_ms", 50),
+        "vlm_batch_wait_p95_ms": _timing_percentile(completed, "vlm_batch_wait_ms", 95),
+        "vlm_input_stage_mean_ms": _timing_mean(completed, "vlm_input_stage_ms"),
+        "vlm_input_stage_p50_ms": _timing_percentile(completed, "vlm_input_stage_ms", 50),
+        "vlm_input_stage_p95_ms": _timing_percentile(completed, "vlm_input_stage_ms", 95),
+        "vlm_sample_kwargs_stage_mean_ms": _timing_mean(completed, "vlm_sample_kwargs_stage_ms"),
+        "vlm_sample_kwargs_stage_p50_ms": _timing_percentile(completed, "vlm_sample_kwargs_stage_ms", 50),
+        "vlm_sample_kwargs_stage_p95_ms": _timing_percentile(completed, "vlm_sample_kwargs_stage_ms", 95),
+        "vlm_observation_stack_mean_ms": _timing_mean(completed, "vlm_observation_stack_ms"),
+        "vlm_observation_stack_p50_ms": _timing_percentile(completed, "vlm_observation_stack_ms", 50),
+        "vlm_observation_stack_p95_ms": _timing_percentile(completed, "vlm_observation_stack_ms", 95),
+        "vlm_to_jax_tree_mean_ms": _timing_mean(completed, "vlm_to_jax_tree_ms"),
+        "vlm_to_jax_tree_p50_ms": _timing_percentile(completed, "vlm_to_jax_tree_ms", 50),
+        "vlm_to_jax_tree_p95_ms": _timing_percentile(completed, "vlm_to_jax_tree_ms", 95),
+        "vlm_observation_from_dict_mean_ms": _timing_mean(completed, "vlm_observation_from_dict_ms"),
+        "vlm_observation_from_dict_p50_ms": _timing_percentile(completed, "vlm_observation_from_dict_ms", 50),
+        "vlm_observation_from_dict_p95_ms": _timing_percentile(completed, "vlm_observation_from_dict_ms", 95),
         "prefix_queue_wait_mean_ms": _timing_mean(completed, "prefix_queue_wait_ms"),
         "prefix_queue_wait_p50_ms": _timing_percentile(completed, "prefix_queue_wait_ms", 50),
         "prefix_queue_wait_p95_ms": _timing_percentile(completed, "prefix_queue_wait_ms", 95),
@@ -565,6 +592,9 @@ def summarize_traces(
         "prefix_slab_map_mean_ms": _timing_mean(completed, "prefix_slab_map_ms"),
         "prefix_slab_map_p50_ms": _timing_percentile(completed, "prefix_slab_map_ms", 50),
         "prefix_slab_map_p95_ms": _timing_percentile(completed, "prefix_slab_map_ms", 95),
+        "ae_init_denoise_mean_ms": _timing_mean(completed, "ae_init_denoise_ms"),
+        "ae_init_denoise_p50_ms": _timing_percentile(completed, "ae_init_denoise_ms", 50),
+        "ae_init_denoise_p95_ms": _timing_percentile(completed, "ae_init_denoise_ms", 95),
         "ae_step_mean_ms": _timing_mean(completed, "ae_step_ms"),
         "ae_step_p50_ms": _timing_percentile(completed, "ae_step_ms", 50),
         "ae_effective_batch_mean": _timing_mean(completed, "ae_effective_batch"),
@@ -707,6 +737,12 @@ def run_profile(args: Args) -> BenchmarkResult:
     summary["jax_warmup_batches"] = _timing_max([trace for trace in traces if trace.status == "ok"], "jax_warmup_batches")
     if summary["jax_warmup_batches"] is None:
         summary["jax_warmup_batches"] = 0.0
+    e2e_warmup = getattr(policy, "_profile_e2e_warmup_stats", None)
+    if isinstance(e2e_warmup, dict):
+        summary["e2e_warmup_requests"] = float(e2e_warmup.get("e2e_warmup_requests", 0.0))
+        summary["e2e_warmup_wall_ms"] = float(e2e_warmup.get("e2e_warmup_wall_ms", 0.0))
+        if e2e_warmup.get("e2e_warmup_steady_p50_ms") is not None:
+            summary["e2e_warmup_steady_p50_ms"] = float(e2e_warmup["e2e_warmup_steady_p50_ms"])
     consistency = _run_consistency_check(args, requests) if args.check_consistency else None
     return BenchmarkResult(traces=traces, summary=summary, consistency=consistency)
 
@@ -790,6 +826,162 @@ def profile_warmup_max_batch_size(args: Args) -> int:
     return min(absolute_cap, prefix_capacity, max(1, int(args.max_ae_batch_size)))
 
 
+def _median_ms(values: Sequence[float]) -> float:
+    if not values:
+        return 0.0
+    return float(np.median(np.asarray(values, dtype=np.float64)))
+
+
+def is_e2e_latency_steady(
+    latencies_ms: Sequence[float],
+    *,
+    window: int,
+    rel_tol: float,
+    spike_factor: float,
+) -> bool:
+    """Return True when the last two windows have similar p50 and no huge spikes remain."""
+    if window <= 0:
+        raise ValueError("window must be positive")
+    if len(latencies_ms) < 2 * window:
+        return False
+    recent = list(latencies_ms[-window:])
+    prev = list(latencies_ms[-2 * window : -window])
+    recent_p50 = _median_ms(recent)
+    prev_p50 = _median_ms(prev)
+    if recent_p50 <= 0.0 or prev_p50 <= 0.0:
+        return False
+    if abs(recent_p50 - prev_p50) / prev_p50 > rel_tol:
+        return False
+    if max(recent) > recent_p50 * spike_factor:
+        return False
+    return True
+
+
+def warmup_jax_e2e_pipeline_until_steady(
+    policy: Any,
+    requests: Sequence[SyntheticRequest],
+    *,
+    args: Args,
+    executor: ThreadPoolExecutor,
+) -> dict[str, float]:
+    """Warm the full VLM→AE serving path until e2e latency looks steady.
+
+    Component XLA warmup does not cover first real queue/IPC/credit handoff; those cold
+    spikes must finish before timed profile measurement.
+    """
+    if not requests:
+        raise ValueError("requests must be non-empty")
+    request = requests[0]
+    wall_start = time.perf_counter()
+    latencies_ms: list[float] = []
+    e2e_count = 0
+
+    print(
+        f"[profile] e2e pipeline warmup starting (mode={args.mode} "
+        f"min={args.warmup_requests} max={args.warmup_steady_max_requests} "
+        f"window={args.warmup_steady_window} rel_tol={args.warmup_steady_rel_tol})",
+        flush=True,
+    )
+
+    def _one_e2e() -> float:
+        nonlocal e2e_count
+        t0 = time.perf_counter()
+        executor.submit(_call_policy_infer, policy, request).result()
+        ms = (time.perf_counter() - t0) * 1000.0
+        latencies_ms.append(ms)
+        e2e_count += 1
+        return ms
+
+    for _ in range(max(0, args.warmup_requests)):
+        ms = _one_e2e()
+        print(f"[profile]   e2e warmup #{e2e_count}: {ms:.1f}ms", flush=True)
+
+    if args.mode in ("jax-split-ipc", "jax-monolithic") and callable(getattr(policy, "infer_batch", None)):
+        batch_sizes: list[int] = []
+        if args.mode == "jax-monolithic":
+            # Baseline FCFS can emit any size in [1, batch_size]; warm all of them so timed
+            # measurement does not pay first-hit XLA compile behind the single-worker queue.
+            cap = max(1, int(args.batch_size))
+            batch_sizes = list(range(1, cap + 1))
+        else:
+            cap = max(1, min(int(args.max_vlm_batch_size), 8))
+            for batch_size in (1, 2, 4, 8):
+                if batch_size <= cap and batch_size not in batch_sizes:
+                    batch_sizes.append(batch_size)
+            if cap not in batch_sizes:
+                batch_sizes.append(cap)
+        print(f"[profile]   batch-shape e2e warmup: B={batch_sizes}", flush=True)
+        for batch_size in batch_sizes:
+            batch_request = make_fixed_size_batch_request(requests, batch_size=batch_size)
+            t0 = time.perf_counter()
+            executor.submit(_call_policy_infer_batch, policy, batch_request).result()
+            ms = (time.perf_counter() - t0) * 1000.0
+            e2e_count += 1
+            print(f"[profile]   e2e batch warmup B={batch_size}: {ms:.1f}ms", flush=True)
+
+    burst = max(0, min(int(args.warmup_concurrent_inflight), int(args.max_inflight)))
+    if burst > 1 and bool(getattr(policy, "supports_concurrent_infer", False)):
+        print(f"[profile]   concurrent burst warmup: inflight={burst}", flush=True)
+        t0 = time.perf_counter()
+        futures = [executor.submit(_call_policy_infer, policy, request) for _ in range(burst)]
+        for future in futures:
+            future.result()
+            e2e_count += 1
+        burst_ms = (time.perf_counter() - t0) * 1000.0
+        print(f"[profile]   concurrent burst done: wall={burst_ms:.1f}ms", flush=True)
+        for _ in range(min(burst, args.warmup_steady_window)):
+            ms = _one_e2e()
+            print(f"[profile]   e2e warmup #{e2e_count}: {ms:.1f}ms (post-burst)", flush=True)
+
+    steady_p50 = 0.0
+    if args.warmup_until_steady:
+        max_requests = max(args.warmup_steady_max_requests, args.warmup_requests)
+        while len(latencies_ms) < max_requests:
+            if is_e2e_latency_steady(
+                latencies_ms,
+                window=args.warmup_steady_window,
+                rel_tol=args.warmup_steady_rel_tol,
+                spike_factor=args.warmup_steady_spike_factor,
+            ):
+                break
+            ms = _one_e2e()
+            recent_p50 = _median_ms(latencies_ms[-args.warmup_steady_window :])
+            print(
+                f"[profile]   e2e warmup #{e2e_count}: {ms:.1f}ms "
+                f"(window_p50={recent_p50:.1f}ms, n_singles={len(latencies_ms)})",
+                flush=True,
+            )
+        steady = is_e2e_latency_steady(
+            latencies_ms,
+            window=args.warmup_steady_window,
+            rel_tol=args.warmup_steady_rel_tol,
+            spike_factor=args.warmup_steady_spike_factor,
+        )
+        steady_p50 = _median_ms(latencies_ms[-args.warmup_steady_window :]) if latencies_ms else 0.0
+        if steady:
+            print(
+                f"[profile] e2e pipeline warmup steady after {len(latencies_ms)} timed singles "
+                f"(p50={steady_p50:.1f}ms); total e2e ops≈{e2e_count}",
+                flush=True,
+            )
+        else:
+            print(
+                f"[profile] e2e pipeline warmup hit max without full steady "
+                f"(last_p50={steady_p50:.1f}ms); proceeding to timed profile",
+                flush=True,
+            )
+    elif latencies_ms:
+        steady_p50 = _median_ms(latencies_ms[-args.warmup_steady_window :])
+
+    wall_ms = (time.perf_counter() - wall_start) * 1000.0
+    print(f"[profile] timed measurement starting (e2e_warmup_wall={wall_ms:.1f}ms)", flush=True)
+    return {
+        "e2e_warmup_requests": float(e2e_count),
+        "e2e_warmup_wall_ms": float(wall_ms),
+        "e2e_warmup_steady_p50_ms": float(steady_p50),
+    }
+
+
 def _warmup_before_timed_workload(
     policy: Any,
     requests: Sequence[SyntheticRequest],
@@ -805,7 +997,11 @@ def _warmup_before_timed_workload(
             executor=executor,
         )
         return
-    if args.mode in ("monolithic", "jax-monolithic") and args.batch_size > 1:
+    if args.mode in ("jax-split-ipc", "jax-monolithic"):
+        stats = warmup_jax_e2e_pipeline_until_steady(policy, requests, args=args, executor=executor)
+        policy._profile_e2e_warmup_stats = stats  # noqa: SLF001 — profile-only annotation
+        return
+    if args.mode == "monolithic" and args.batch_size > 1:
         warmup_batch_requests = make_fcfs_batched_synthetic_requests(
             requests,
             max_batch_size=args.batch_size,

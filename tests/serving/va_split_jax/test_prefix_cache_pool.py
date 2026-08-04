@@ -20,7 +20,7 @@ def _feature(fill: float) -> JaxPrefixFeature:
     )
 
 
-def test_vlm_owned_prefix_cache_lane_pool_exports_dense_batch():
+def test_ae_owned_prefix_cache_lane_pool_exports_dense_batch():
     pool = JaxVlmPrefixCacheLanePool(max_lanes=4, backend=make_default_device_slab_backend())
     pool.put_lane("req-1", _feature(1.0))
     pool.put_lane("req-2", _feature(2.0))
@@ -32,17 +32,28 @@ def test_vlm_owned_prefix_cache_lane_pool_exports_dense_batch():
     assert batch.state.shape == (2, 8)
 
 
-def test_vlm_owned_prefix_cache_lane_pool_compacts_on_release():
+def test_ae_owned_prefix_cache_lane_pool_compacts_on_release():
     pool = JaxVlmPrefixCacheLanePool(max_lanes=4, backend=make_default_device_slab_backend())
     pool.put_lane("req-1", _feature(1.0))
     pool.put_lane("req-2", _feature(2.0))
-    moved = pool.release_lane("req-1")
-    assert moved == (1, 0, "req-2")
+    freed = pool.release_lane("req-1")
+    assert freed == 1
     batch = pool.export_batch_view(("req-2",))
     np.testing.assert_allclose(np.asarray(batch.state), np.full((1, 8), 2.0, dtype=np.float32))
 
 
-def test_vlm_owned_prefix_cache_lane_pool_rejects_sparse_export():
+def test_ae_owned_prefix_cache_lane_pool_write_claim_densifies():
+    pool = JaxVlmPrefixCacheLanePool(max_lanes=4, backend=make_default_device_slab_backend())
+    pool.initialize_from_feature(_feature(0.0))
+    pool.write_lane(2, _feature(9.0))
+    dense, vacated = pool.claim_written_lane("req-1", 2)
+    assert dense == 0
+    assert vacated == 2
+    batch = pool.view_prefix_batch(1)
+    np.testing.assert_allclose(np.asarray(batch.state), np.full((1, 8), 9.0, dtype=np.float32))
+
+
+def test_ae_owned_prefix_cache_lane_pool_rejects_sparse_export():
     pool = JaxVlmPrefixCacheLanePool(max_lanes=4, backend=make_default_device_slab_backend())
     pool.put_lane("req-1", _feature(1.0))
     pool.put_lane("req-2", _feature(2.0))

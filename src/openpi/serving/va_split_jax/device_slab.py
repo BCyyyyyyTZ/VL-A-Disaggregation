@@ -87,13 +87,25 @@ class DeviceSlabBackend:
         """Open a producer-created device slab from another process."""
         raise NotImplementedError
 
-    def copy_lane_from_array(self, slab: DeviceSlab, lane_id: int, value: jax.Array) -> DeviceSlab:
+    def copy_lane_from_array(
+        self,
+        slab: DeviceSlab,
+        lane_id: int,
+        value: jax.Array,
+        *,
+        sync: bool = True,
+    ) -> DeviceSlab:
+        del sync  # JAX local path has no write stream; always complete the update.
         _validate_lane_update(slab, lane_id, value)
         update = jax.lax.dynamic_update_slice_in_dim(
             slab.array, value, lane_id, axis=slab.spec.normalized_lane_axis
         )
         update.block_until_ready()
         return DeviceSlab(slab.spec, update, slab.handle, slab._close_stack)
+
+    def sync_write_stream(self, device_ordinal: int | None = None) -> None:
+        """No-op for backends that complete each lane copy synchronously."""
+        del device_ordinal
 
     def view_batch(self, slab: DeviceSlab, batch_size: int) -> jax.Array:
         if batch_size < 0 or batch_size > slab.spec.max_lanes:
@@ -114,6 +126,7 @@ class CudaIpcDeviceSlabBackend(DeviceSlabBackend):
 
     def __init__(self, *, device_ordinal: int | None = None):
         self._device_ordinal = device_ordinal
+        self._write_streams: dict[int, Any] = {}
 
     def create_slab(self, spec: DeviceSlabSpec) -> DeviceSlab:
         if spec.max_lanes <= 0:
@@ -154,19 +167,53 @@ class CudaIpcDeviceSlabBackend(DeviceSlabBackend):
             stack.close()
             raise
 
-    def copy_lane_from_array(self, slab: DeviceSlab, lane_id: int, value: jax.Array) -> DeviceSlab:
+    def copy_lane_from_array(
+        self,
+        slab: DeviceSlab,
+        lane_id: int,
+        value: jax.Array,
+        *,
+        sync: bool = True,
+    ) -> DeviceSlab:
+        """Copy one lane into an IPC slab without device-wide or whole-slab sync.
+
+        Only waits for ``value`` (producer output) and, when ``sync=True``, the
+        dedicated write stream that ran this copy. Free-lane writes can proceed
+        while another process reads other lanes of the same slab.
+        """
         _validate_lane_update(slab, lane_id, value)
         if slab.handle.transport != self.transport:
             raise RuntimeError(f"expected {self.transport!r} slab, got {slab.handle.transport!r}")
         value.block_until_ready()
-        slab.array.block_until_ready()
-        cuda.select_device(slab.handle.device_ordinal)
+        device_ordinal = int(slab.handle.device_ordinal)
+        cuda.select_device(device_ordinal)
+        stream = self._write_stream(device_ordinal)
         dst = cuda.from_cuda_array_interface(_cuda_array_interface_for_array(slab.array), owner=slab)
         src = cuda.from_cuda_array_interface(_cuda_array_interface_for_array(value), owner=value)
-        _copy_lane_with_kernel(dst, src, lane_id, slab.spec)
-        cuda.synchronize()
-        slab.array.block_until_ready()
+        _copy_lane_with_kernel(dst, src, lane_id, slab.spec, stream=stream)
+        if sync:
+            stream.synchronize()
         return slab
+
+    def sync_write_stream(self, device_ordinal: int | None = None) -> None:
+        """Synchronize the dedicated lane-write stream (not the whole device)."""
+        ordinal = self._device_ordinal if device_ordinal is None else device_ordinal
+        if ordinal is None:
+            for stream in self._write_streams.values():
+                stream.synchronize()
+            return
+        stream = self._write_streams.get(int(ordinal))
+        if stream is not None:
+            stream.synchronize()
+
+    def _write_stream(self, device_ordinal: int):
+        key = int(device_ordinal)
+        stream = self._write_streams.get(key)
+        if stream is None:
+            cuda.select_device(key)
+            stream = cuda.stream()
+            self._write_streams[key] = stream
+        return stream
 
 
 class LocalDeviceSlabBackend(DeviceSlabBackend):
@@ -299,13 +346,27 @@ def _cuda_array_interface_for_lane(array: jax.Array, spec: DeviceSlabSpec, lane_
     }
 
 
-def _copy_lane_with_kernel(dst: Any, src: Any, lane_id: int, spec: DeviceSlabSpec) -> None:
+def _copy_lane_with_kernel(
+    dst: Any,
+    src: Any,
+    lane_id: int,
+    spec: DeviceSlabSpec,
+    *,
+    stream: Any | None = None,
+) -> None:
     axis = spec.normalized_lane_axis
     inner_elems = int(np.prod(spec.shape[axis + 1 :], dtype=np.int64))
     total_elems = int(np.prod(spec.shape, dtype=np.int64))
     threads_per_block = 256
     blocks = (total_elems + threads_per_block - 1) // threads_per_block
-    _copy_lane_kernel[blocks, threads_per_block](dst, src, total_elems, lane_id, spec.max_lanes, inner_elems)
+    if stream is None:
+        _copy_lane_kernel[blocks, threads_per_block](
+            dst, src, total_elems, lane_id, spec.max_lanes, inner_elems
+        )
+    else:
+        _copy_lane_kernel[blocks, threads_per_block, stream](
+            dst, src, total_elems, lane_id, spec.max_lanes, inner_elems
+        )
 
 
 @cuda.jit

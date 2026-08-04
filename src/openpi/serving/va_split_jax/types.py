@@ -30,6 +30,8 @@ class JaxBatchRequestEnvelope:
 
 @dataclass(frozen=True, slots=True)
 class JaxPrefixReady:
+    """VLM finished writing prefix KV into AE-owned slab lane ``slot_handle.slot_id``."""
+
     request_id: str
     slot_handle: JaxPrefixSlotHandle
     num_steps: int
@@ -46,19 +48,23 @@ class JaxActionResult:
 
 @dataclass(frozen=True, slots=True)
 class JaxReleaseFeature:
+    """AE finished a request; ``slot_id`` is the recycled physical lane credit for VLM."""
+
     request_id: str
     slot_id: int
 
 
 @dataclass(frozen=True, slots=True)
-class JaxSlotMoved:
-    request_id: str
-    old_slot_id: int
-    new_slot_id: int
+class JaxLaneCredits:
+    """Physical lane ids VLM may write before handing ownership to AE via PrefixReady."""
+
+    lane_ids: tuple[int, ...]
 
 
 @dataclass(frozen=True, slots=True)
 class JaxPrefixSlabReady:
+    """AE-owned prefix slab export (sent AE → VLM on the release/control path)."""
+
     slab: JaxPrefixSlabHandleTree
     timing: dict[str, float] | None = None
 
@@ -79,3 +85,9 @@ class JaxWorkerError:
 @dataclass(frozen=True, slots=True)
 class JaxShutdown:
     pass
+
+
+@dataclass(frozen=True, slots=True)
+class JaxCompileWarmupDone:
+    role: str
+    jax_warmup_batches: float

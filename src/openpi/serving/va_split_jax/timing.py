@@ -32,9 +32,23 @@ def queue_wait_and_transfer_ms(
     get_start_ns: int | None,
     get_end_ns: int | None,
 ) -> tuple[float, float]:
+    """Split IPC queue residency into wait vs transfer.
+
+    Definitions:
+    - ``queue_wait``: time the message spent in the queue before the consumer began
+      retrieving it (``max(0, get_start - enqueue)``).
+    - ``transfer``: time spent in ``Queue.get()`` *after* the message existed
+      (``get_end - max(get_start, enqueue)``).
+
+    This matters for blocking gets that start *before* the producer enqueues: the
+    idle blocked time must not be billed as transfer.
+    """
     if enqueue_ns is None or get_start_ns is None or get_end_ns is None:
         return 0.0, 0.0
-    return (
-        max(0.0, (float(get_start_ns) - float(enqueue_ns)) / 1_000_000),
-        max(0.0, (float(get_end_ns) - float(get_start_ns)) / 1_000_000),
-    )
+    enqueue = float(enqueue_ns)
+    get_start = float(get_start_ns)
+    get_end = float(get_end_ns)
+    effective_get_start = max(get_start, enqueue)
+    queue_wait_ms = max(0.0, (effective_get_start - enqueue) / 1_000_000)
+    transfer_ms = max(0.0, (get_end - effective_get_start) / 1_000_000)
+    return queue_wait_ms, transfer_ms

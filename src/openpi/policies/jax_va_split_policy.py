@@ -46,11 +46,11 @@ class JaxVASplitPolicy(_policy.BasePolicy):
     def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
         inputs = jax.tree.map(lambda x: x, obs)
         inputs = self._input_transform(inputs)
-        inputs = jax.tree.map(lambda x: jnp.asarray(x)[None, ...], inputs)
+        inputs = jax.tree.map(lambda x: np.asarray(x)[None, ...], inputs)
 
         sample_kwargs = dict(self._sample_kwargs)
         if noise is not None:
-            noise_array = jnp.asarray(noise)
+            noise_array = np.asarray(noise).copy()
             if noise_array.ndim == 2:
                 noise_array = noise_array[None, ...]
             sample_kwargs["noise"] = noise_array
@@ -79,7 +79,7 @@ class JaxVASplitPolicy(_policy.BasePolicy):
         inputs = _batch.apply_input_transform_batch(
             obs_batch,
             self._input_transform,
-            kind="jax",
+            kind="numpy",
         )
         batch_size = int(inputs["state"].shape[0])
 
@@ -88,7 +88,7 @@ class JaxVASplitPolicy(_policy.BasePolicy):
             sample_kwargs["noise"] = _batch.prepare_batch_noise(
                 noise,
                 batch_size=batch_size,
-                kind="jax",
+                kind="numpy",
             )
 
         start_time = time.monotonic()
@@ -178,7 +178,7 @@ def create_trained_jax_va_split_policy(
     result_timeout_s: float = 120.0,
     jax_compile: bool = True,
     jax_compile_warmup: bool = True,
-    jax_compile_warmup_max_batch_size: int = 32,
+    jax_compile_warmup_max_batch_size: int | None = None,
 ) -> JaxVASplitPolicy:
     repack_transforms = repack_transforms or _transforms.Group()
     checkpoint_dir = pathlib.Path(download.maybe_download(str(checkpoint_dir)))
@@ -197,6 +197,11 @@ def create_trained_jax_va_split_policy(
             raise ValueError("Asset id is required to load norm stats.")
         norm_stats = _checkpoints.load_checkpoint_norm_stats(checkpoint_dir, data_config.asset_id)
 
+    warmup_max_batch_size = (
+        jax_compile_warmup_max_batch_size
+        if jax_compile_warmup_max_batch_size is not None
+        else max_vlm_batch_size * 3
+    )
     runtime = JaxProcessVASplitRuntime(
         model_factory=functools.partial(_load_jax_model, train_config, checkpoint_dir),
         max_ae_batch_size=max_ae_batch_size,
@@ -208,7 +213,8 @@ def create_trained_jax_va_split_policy(
         compile_config=JaxCompileConfig(
             enabled=jax_compile,
             warmup_enabled=jax_compile_warmup,
-            warmup_max_batch_size=jax_compile_warmup_max_batch_size,
+            warmup_max_batch_size=warmup_max_batch_size,
+            num_steps=int((sample_kwargs or {}).get("num_steps", 10)),
         ),
     )
     return JaxVASplitPolicy(

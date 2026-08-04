@@ -210,8 +210,9 @@ class Pi0(_model.BaseModel):
     ) -> JaxDenoiseState:
         if noise is None:
             noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
-        dt = jnp.asarray(-1.0 / num_steps, dtype=jnp.float32)
-        step_idx = jnp.asarray(0, dtype=jnp.int32)
+        # Use (B,) layouts so AE step_once / warmup share one denoise_one_batch jit cache.
+        dt = jnp.full((batch_size,), -1.0 / num_steps, dtype=jnp.float32)
+        step_idx = jnp.zeros((batch_size,), dtype=jnp.int32)
         return JaxDenoiseState(x_t=noise, step_idx=step_idx, num_steps=num_steps, dt=dt)
 
     @at.typecheck
@@ -291,14 +292,16 @@ class Pi0(_model.BaseModel):
 
         def step(state: JaxDenoiseState) -> JaxDenoiseState:
             v_t = self.denoise_one_batch(prefix_feature, state)
+            dt = jnp.asarray(state.dt).reshape((state.x_t.shape[0],) + (1,) * (state.x_t.ndim - 1))
             return JaxDenoiseState(
-                x_t=state.x_t + state.dt * v_t,
+                x_t=state.x_t + dt * v_t,
                 step_idx=state.step_idx + 1,
                 num_steps=state.num_steps,
                 dt=state.dt,
             )
 
         def cond(state: JaxDenoiseState) -> jax.Array:
-            return state.step_idx < state.num_steps
+            # step_idx is (B,); rows advance together so all() is the scalar while predicate.
+            return jnp.all(state.step_idx < state.num_steps)
 
         return jax.lax.while_loop(cond, step, denoise_state).x_t

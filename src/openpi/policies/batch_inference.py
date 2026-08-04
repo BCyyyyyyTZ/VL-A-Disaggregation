@@ -45,7 +45,7 @@ def apply_input_transform_batch(
     obs_batch: dict[str, Any],
     input_transform,
     *,
-    kind: Literal["jax", "torch"],
+    kind: ArrayKind,
     device: str | torch.device | None = None,
 ) -> dict[str, Any]:
     samples = [input_transform(sample) for sample in split_obs_batch(obs_batch)]
@@ -72,7 +72,7 @@ def prepare_batch_noise(
     noise: np.ndarray | torch.Tensor,
     *,
     batch_size: int,
-    kind: Literal["jax", "torch"],
+    kind: ArrayKind,
     device: str | torch.device | None = None,
 ) -> Any:
     noise_ndim = int(noise.ndim)
@@ -88,6 +88,8 @@ def prepare_batch_noise(
             f"infer_batch noise batch dimension {noise.shape[0]} does not match observation batch {batch_size}"
         )
 
+    if kind == "numpy":
+        return np.asarray(noise).copy()
     if kind == "torch":
         if torch.is_tensor(noise):
             return noise.to(device).contiguous() if device is not None else noise.contiguous()

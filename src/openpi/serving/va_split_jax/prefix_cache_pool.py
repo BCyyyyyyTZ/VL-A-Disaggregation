@@ -28,6 +28,24 @@ class JaxVlmPrefixCacheLanePool:
     def active_count(self) -> int:
         return self._active_count
 
+    def initialize_from_feature(self, feature: JaxPrefixFeature) -> None:
+        """Allocate slab storage from a template row without activating any lane."""
+        _validate_single_row_feature(feature)
+        self._ensure_initialized(feature)
+
+    def write_lane(self, lane_id: int, feature: JaxPrefixFeature) -> None:
+        """Write a single-row feature into a physical lane without activating it.
+
+        Used by VLM (in-process shared pool) or tests. Cross-process VLM writes go through
+        opened IPC slab handles via :func:`write_feature_to_slab_tree` instead.
+        """
+        self._validate_physical_lane_id(lane_id)
+        if self._lane_to_request[lane_id] is not None:
+            raise RuntimeError(f"Cannot write into active AE lane {lane_id}")
+        _validate_single_row_feature(feature)
+        self._ensure_initialized(feature)
+        self._write_feature_into_lane(lane_id, feature)
+
     def put_lane(self, request_id: str, feature: JaxPrefixFeature) -> int:
         if request_id in self._request_to_lane:
             raise ValueError(f"request_id {request_id!r} already exists in prefix lane pool")
@@ -36,21 +54,41 @@ class JaxVlmPrefixCacheLanePool:
         _validate_single_row_feature(feature)
         lane_id = self._active_count
         self._ensure_initialized(feature)
-        self._past_slabs = _copy_tree_lane(self._backend, self._past_slabs, feature.past_key_values, lane_id)
-        assert self._prefix_pad_masks is not None
-        self._prefix_pad_masks = self._backend.copy_lane_from_array(
-            self._prefix_pad_masks, lane_id, feature.prefix_pad_masks
-        )
-        if self._has_state:
-            assert self._state is not None
-            assert feature.state is not None
-            self._state = self._backend.copy_lane_from_array(self._state, lane_id, feature.state)
+        self._write_feature_into_lane(lane_id, feature)
         self._request_to_lane[request_id] = lane_id
         self._lane_to_request[lane_id] = request_id
         self._active_count += 1
         return lane_id
 
-    def release_lane(self, request_id: str) -> tuple[int, int, str] | None:
+    def claim_written_lane(self, request_id: str, lane_id: int) -> tuple[int, int | None]:
+        """Activate a lane that already holds prefix data (VLM wrote it).
+
+        Densifies into ``active_count`` when needed. Returns ``(dense_lane_id, vacated_lane_or_none)``.
+        ``vacated_lane`` is a free physical id after densify move (credit candidate).
+        """
+        if request_id in self._request_to_lane:
+            raise ValueError(f"request_id {request_id!r} already exists in prefix lane pool")
+        if self._active_count >= self.max_lanes:
+            raise RuntimeError(f"AE prefix lane pool is full ({self.max_lanes} active requests)")
+        self._validate_physical_lane_id(lane_id)
+        if self._lane_to_request[lane_id] is not None:
+            raise RuntimeError(f"Lane {lane_id} is already active")
+        if self._past_slabs is None or self._prefix_pad_masks is None:
+            raise RuntimeError("Cannot claim lanes before pool initialization")
+
+        vacated: int | None = None
+        dense_lane = self._active_count
+        if lane_id != dense_lane:
+            self._move_lane(lane_id, dense_lane)
+            vacated = lane_id
+            lane_id = dense_lane
+        self._request_to_lane[request_id] = lane_id
+        self._lane_to_request[lane_id] = request_id
+        self._active_count += 1
+        return lane_id, vacated
+
+    def release_lane(self, request_id: str) -> int | None:
+        """Release and compact. Returns the freed physical lane id (credit for VLM), if any."""
         lane_id = self._request_to_lane.pop(request_id, None)
         if lane_id is None:
             return None
@@ -65,9 +103,27 @@ class JaxVlmPrefixCacheLanePool:
             self._request_to_lane[moved_request_id] = lane_id
         self._lane_to_request[last_lane] = None
         self._active_count -= 1
-        if lane_id != last_lane and moved_request_id is not None:
-            return last_lane, lane_id, moved_request_id
-        return None
+        return last_lane
+
+    def _write_feature_into_lane(self, lane_id: int, feature: JaxPrefixFeature) -> None:
+        self._past_slabs = _copy_tree_lane(
+            self._backend, self._past_slabs, feature.past_key_values, lane_id, sync=False
+        )
+        assert self._prefix_pad_masks is not None
+        self._prefix_pad_masks = self._backend.copy_lane_from_array(
+            self._prefix_pad_masks, lane_id, feature.prefix_pad_masks, sync=False
+        )
+        if self._has_state:
+            assert self._state is not None
+            assert feature.state is not None
+            self._state = self._backend.copy_lane_from_array(
+                self._state, lane_id, feature.state, sync=False
+            )
+        self._backend.sync_write_stream()
+
+    def _validate_physical_lane_id(self, lane_id: int) -> None:
+        if lane_id < 0 or lane_id >= self.max_lanes:
+            raise ValueError(f"lane_id {lane_id} outside pool capacity {self.max_lanes}")
 
     def export_batch_view(self, request_ids: tuple[str, ...]) -> JaxPrefixFeature:
         if not request_ids:
@@ -108,19 +164,27 @@ class JaxVlmPrefixCacheLanePool:
         )
 
     def _move_lane(self, src_lane: int, dst_lane: int) -> None:
-        batch = self.view_prefix_batch(src_lane + 1)
-        row = _row_view_tree(batch.past_key_values, src_lane, axis=1)
-        assert self._prefix_pad_masks is not None
-        mask_row = self._backend.view_batch(self._prefix_pad_masks, src_lane + 1)[src_lane : src_lane + 1]
+        if self._past_slabs is None or self._prefix_pad_masks is None:
+            raise RuntimeError("Cannot move lanes before initialization")
+        # Physical read: may move a free-but-written lane during claim densify, so do not
+        # require src_lane < active_count.
+        span = max(src_lane, dst_lane) + 1
+        past_view = _view_tree_batch(self._backend, self._past_slabs, span)
+        row = _row_view_tree(past_view, src_lane, axis=1)
+        mask_row = self._backend.view_batch(self._prefix_pad_masks, span)[src_lane : src_lane + 1]
         state_row = None
         if self._state is not None:
-            state_row = self._backend.view_batch(self._state, src_lane + 1)[src_lane : src_lane + 1]
-        assert self._past_slabs is not None
-        self._past_slabs = _copy_tree_lane(self._backend, self._past_slabs, row, dst_lane)
-        self._prefix_pad_masks = self._backend.copy_lane_from_array(self._prefix_pad_masks, dst_lane, mask_row)
+            state_row = self._backend.view_batch(self._state, span)[src_lane : src_lane + 1]
+        self._past_slabs = _copy_tree_lane(self._backend, self._past_slabs, row, dst_lane, sync=False)
+        self._prefix_pad_masks = self._backend.copy_lane_from_array(
+            self._prefix_pad_masks, dst_lane, mask_row, sync=False
+        )
         if self._state is not None:
             assert state_row is not None
-            self._state = self._backend.copy_lane_from_array(self._state, dst_lane, state_row)
+            self._state = self._backend.copy_lane_from_array(
+                self._state, dst_lane, state_row, sync=False
+            )
+        self._backend.sync_write_stream()
 
     def _ensure_initialized(self, feature: JaxPrefixFeature) -> None:
         if self._past_slabs is None:
@@ -196,15 +260,30 @@ def _make_tree_slabs(
     raise TypeError(f"Unsupported JAX prefix tree node: {type(value)}")
 
 
-def _copy_tree_lane(backend: DeviceSlabBackend, slabs: Any, value: Any, lane_id: int) -> Any:
+def _copy_tree_lane(
+    backend: DeviceSlabBackend,
+    slabs: Any,
+    value: Any,
+    lane_id: int,
+    *,
+    sync: bool = True,
+) -> Any:
     if isinstance(slabs, DeviceSlab):
-        return backend.copy_lane_from_array(slabs, lane_id, value)
+        return backend.copy_lane_from_array(slabs, lane_id, value, sync=sync)
     if isinstance(slabs, tuple):
-        return tuple(_copy_tree_lane(backend, slab, item, lane_id) for slab, item in zip(slabs, value, strict=True))
+        return tuple(
+            _copy_tree_lane(backend, slab, item, lane_id, sync=sync)
+            for slab, item in zip(slabs, value, strict=True)
+        )
     if isinstance(slabs, list):
-        return [_copy_tree_lane(backend, slab, item, lane_id) for slab, item in zip(slabs, value, strict=True)]
+        return [
+            _copy_tree_lane(backend, slab, item, lane_id, sync=sync)
+            for slab, item in zip(slabs, value, strict=True)
+        ]
     if isinstance(slabs, dict):
-        return {key: _copy_tree_lane(backend, slabs[key], value[key], lane_id) for key in slabs}
+        return {
+            key: _copy_tree_lane(backend, slabs[key], value[key], lane_id, sync=sync) for key in slabs
+        }
     raise TypeError(f"Unsupported JAX slab tree node: {type(slabs)}")
 
 
@@ -314,3 +393,36 @@ def _validate_slab_compatible(slab: DeviceSlab, value: jax.Array) -> None:
         raise ValueError(f"feature shape changed from {slab.spec.shape} to {tuple(value.shape)}")
     if str(value.dtype) != slab.spec.dtype:
         raise ValueError(f"feature dtype changed from {slab.spec.dtype} to {value.dtype}")
+
+
+def write_feature_to_slab_tree(
+    backend: DeviceSlabBackend,
+    slab_tree: dict[str, Any],
+    lane_id: int,
+    feature: JaxPrefixFeature,
+) -> dict[str, Any]:
+    """Write a single-row prefix feature into an opened (possibly IPC) slab tree.
+
+    All leaf copies share one write stream; we synchronize that stream once so
+    PrefixReady can be sent without a device-wide or whole-slab barrier.
+    """
+    _validate_single_row_feature(feature)
+    past = _copy_tree_lane(
+        backend, slab_tree["past_key_values"], feature.past_key_values, lane_id, sync=False
+    )
+    masks = backend.copy_lane_from_array(
+        slab_tree["prefix_pad_masks"], lane_id, feature.prefix_pad_masks, sync=False
+    )
+    state = slab_tree["state"]
+    if state is not None:
+        if feature.state is None:
+            raise ValueError("slab tree has state but feature.state is None")
+        state = backend.copy_lane_from_array(state, lane_id, feature.state, sync=False)
+    elif feature.state is not None:
+        raise ValueError("feature has state but slab tree state is None")
+    backend.sync_write_stream()
+    return {
+        "past_key_values": past,
+        "prefix_pad_masks": masks,
+        "state": state,
+    }

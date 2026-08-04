@@ -10,9 +10,10 @@ from openpi.models.jax_split_types import JaxPrefixSlotHandle
 from openpi.serving.va_split_jax.timing import queue_wait_and_transfer_ms
 from openpi.serving.va_split_jax.timing import timed_queue_get
 from openpi.serving.va_split_jax.types import JaxDenoiseBatchSlots
+from openpi.serving.va_split_jax.types import JaxLaneCredits
 from openpi.serving.va_split_jax.types import JaxPrefixReady
+from openpi.serving.va_split_jax.types import JaxReleaseFeature
 from openpi.serving.va_split_jax.types import JaxRequestEnvelope
-from openpi.serving.va_split_jax.types import JaxSlotMoved
 
 
 def test_jax_prefix_ready_round_trips_metadata_only():
@@ -35,14 +36,15 @@ def test_jax_prefix_ready_round_trips_metadata_only():
     assert received.slot_handle.slot_id == 3
 
 
-def test_jax_slot_moved_round_trips_after_vlm_compaction():
+def test_jax_lane_credits_and_release_round_trip():
     ctx = mp.get_context("spawn")
     q = ctx.Queue()
-    q.put(JaxSlotMoved(request_id="req-2", old_slot_id=1, new_slot_id=0))
-    received = q.get(timeout=5)
-    assert received.request_id == "req-2"
-    assert received.old_slot_id == 1
-    assert received.new_slot_id == 0
+    q.put(JaxLaneCredits(lane_ids=(0, 1, 2)))
+    q.put(JaxReleaseFeature(request_id="req-1", slot_id=1))
+    credits = q.get(timeout=5)
+    release = q.get(timeout=5)
+    assert credits.lane_ids == (0, 1, 2)
+    assert release.slot_id == 1
 
 
 def test_jax_denoise_batch_slots_round_trips_metadata_only():
@@ -72,6 +74,20 @@ def test_jax_timing_helpers_split_queue_wait_and_transfer():
     assert message == "msg"
     assert queue_wait_ms >= 0.0
     assert transfer_ms >= 0.0
+
+
+def test_jax_timing_helpers_do_not_bill_pre_enqueue_block_as_transfer():
+    enqueue_ns = 1_000_000_000
+    # Consumer started blocking 100ms before the producer enqueued.
+    get_start_ns = enqueue_ns - 100_000_000
+    get_end_ns = enqueue_ns + 1_000_000
+    queue_wait_ms, transfer_ms = queue_wait_and_transfer_ms(
+        enqueue_ns=enqueue_ns,
+        get_start_ns=get_start_ns,
+        get_end_ns=get_end_ns,
+    )
+    assert queue_wait_ms == pytest.approx(0.0)
+    assert transfer_ms == pytest.approx(1.0, abs=0.01)
 
 
 def test_jax_timed_queue_get_reraises_empty():
