@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import contextlib
 from dataclasses import dataclass
+import gc
 from typing import Any
 
 import jax
@@ -32,11 +34,62 @@ def maybe_jit_split_model(model: Any, config: JaxCompileConfig) -> Any:
     return model
 
 
+def maybe_jit_vlm_model(model: Any, config: JaxCompileConfig) -> Any:
+    if not config.enabled:
+        return model
+    model.build_prefix_feature = nnx_utils.module_jit(model.build_prefix_feature)
+    return model
+
+
+def maybe_jit_ae_model(model: Any, config: JaxCompileConfig) -> Any:
+    if not config.enabled:
+        return model
+    model.denoise_one_batch = nnx_utils.module_jit(model.denoise_one_batch)
+    return model
+
+
 def maybe_jit_monolithic_model(model: Any, config: JaxCompileConfig) -> Any:
     if not config.enabled:
         return model
     model.sample_actions = nnx_utils.module_jit(model.sample_actions, static_argnames=("num_steps",))
     return model
+
+
+def prune_split_model_for_role(model: Any, *, role: str) -> Any:
+    """Drop role-unused top-level modules before freezing NNX state for jit.
+
+    The PaliGemma LLM is intentionally kept in both roles: VLM uses it to build
+    prefix KV, and AE uses it to consume that KV during suffix denoising.
+    """
+    if role == "vlm":
+        _delete_attrs(
+            model,
+            (
+                "action_in_proj",
+                "action_out_proj",
+                "time_mlp_in",
+                "time_mlp_out",
+                "state_proj",
+                "action_time_mlp_in",
+                "action_time_mlp_out",
+            ),
+        )
+    elif role == "ae":
+        paligemma = getattr(model, "PaliGemma", None)
+        if paligemma is not None and hasattr(paligemma, "img"):
+            delattr(paligemma, "img")
+    else:
+        raise ValueError(f"Unsupported split model role: {role!r}")
+    gc.collect()
+    with contextlib.suppress(Exception):
+        jax.clear_caches()
+    return model
+
+
+def _delete_attrs(value: Any, names: tuple[str, ...]) -> None:
+    for name in names:
+        if hasattr(value, name):
+            delattr(value, name)
 
 
 def planned_warmup_batches(*, max_batch_size: int, warmup_max_batch_size: int) -> tuple[tuple[int, int], ...]:
@@ -104,6 +157,21 @@ def make_model_noise_factory(model: Any):
         return jnp.zeros((batch_size, action_horizon, action_dim), dtype=jnp.float32)
 
     return factory
+
+
+def make_prefix_feature_template(model: Any, observation_factory) -> JaxPrefixFeature:
+    """Create a single-row prefix template without executing prefix forward kernels."""
+
+    shape_feature = jax.eval_shape(lambda: model.build_prefix_feature(None, observation_factory(1)))
+    return JaxPrefixFeature(
+        past_key_values=jax.tree.map(_zeros_from_shape_dtype, shape_feature.past_key_values),
+        prefix_pad_masks=jnp.ones(shape_feature.prefix_pad_masks.shape, dtype=shape_feature.prefix_pad_masks.dtype),
+        state=None if shape_feature.state is None else _zeros_from_shape_dtype(shape_feature.state),
+    )
+
+
+def _zeros_from_shape_dtype(value: Any) -> jax.Array:
+    return jnp.zeros(value.shape, dtype=value.dtype)
 
 
 def warmup_vlm_prefix_model(

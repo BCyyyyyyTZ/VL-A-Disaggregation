@@ -116,7 +116,7 @@ Conclusion: the earlier 20-30 ms `vlm_queue_wait` was mostly a measurement bug /
 
 `_stack_request_observations()` now returns the original observation for `len==1`, avoiding unnecessary tree concat in r1.
 
-### 3. VLM input staging attempted optimization
+### 3. VLM input staging optimization + sub-instrumentation
 
 The VLM process no longer manually normalizes `uint8` images in NumPy inside `_asarray_model_input()` / `_concat_model_input()`. It keeps arrays as JAX arrays and relies on `_model.Observation.from_dict()` to do the standard `uint8 -> float32[-1,1]` conversion.
 
@@ -126,11 +126,20 @@ Rationale:
 - Avoid expanding image payload 4x before device staging.
 - Preserve model input semantics.
 
-Important observation:
+Current code also emits sub-timing fields for `vlm_input_stage_ms`:
 
-- Latest r1 still shows `vlm_input_stage_ms ~= 17.4 ms`, not lower than the previous `~16.5 ms`.
-- Either this optimization was not the dominant part, or the time moved into JAX staging/normalization and still lands inside `vlm_input_stage_ms`.
-- Next step should instrument `vlm_input_stage` internally before doing more speculative optimization.
+```text
+vlm_sample_kwargs_stage_ms
+vlm_observation_stack_ms
+vlm_to_jax_tree_ms
+vlm_observation_from_dict_ms
+```
+
+Important status:
+
+- Latest inspected r1 profile still predates this sub-instrumented version and shows `vlm_input_stage_ms ~= 17.4 ms`.
+- Rerun r1 before deciding whether the `uint8` staging change reduced `vlm_input_stage_ms`, or simply moved normalization into `Observation.from_dict` / VLM forward.
+- Compare `vlm_input_stage_ms + vlm_prefix_forward_ms` before and after the change; latest old r1 sum was `17.42 + 40.07 = 57.49 ms`.
 
 ### 4. AE-side low-risk cleanup
 
@@ -150,7 +159,7 @@ Observed current r1:
 - previous inspected r1 was about `5.40 ms`
 - this is a small improvement, but split AE is still much slower than baseline AE `3.03 ms/step`.
 
-### 5. New metric added after latest profile
+### 5. New AE metric added after latest profile
 
 Current code now emits:
 
@@ -216,28 +225,21 @@ This is plausible for multiprocessing control/data movement. It is not the domin
 
    - split AE calls a jitted `denoise_one_batch` once per Python step, while baseline compile can optimize a tighter monolithic/action loop boundary.
    - split AE reads prefix through AE-owned slab views, not direct local prefix arrays.
-   - every step still constructs `step_idx`, `dt`, and `JaxDenoiseState`.
+   - every step still constructs `step_idx`, `dt`, and `JaxDenoiseState` batch objects, though the per-request `step_idx` host readback and `dt` host slice have been removed.
    - `view_prefix_batch()` is outside the component baseline timing and may interact with JAX cache/sharding/layout differently.
 
 ## Recommended Next Steps
 
-### Step 1: Instrument `vlm_input_stage`
+### Step 1: Rerun r1 with current sub-timing
 
-Before changing more logic, split `vlm_input_stage_ms` into subfields:
+Required new fields:
 
 ```text
+vlm_sample_kwargs_stage_ms
 vlm_observation_stack_ms
 vlm_to_jax_tree_ms
 vlm_observation_from_dict_ms
-vlm_sample_kwargs_stage_ms
-```
-
-If possible, separate image leaves from non-image leaves:
-
-```text
-vlm_image_stage_ms
-vlm_state_stage_ms
-vlm_prompt_stage_ms
+ae_init_denoise_ms
 ```
 
 Goal: determine whether the 17 ms is image H2D, prompt/token arrays, Python tree work, or `Observation.from_dict` normalization.

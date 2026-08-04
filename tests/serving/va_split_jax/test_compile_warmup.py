@@ -5,9 +5,13 @@ import pytest
 
 from openpi.models.jax_split_types import JaxPrefixFeature
 from openpi.serving.va_split_jax.compile import JaxCompileConfig
+from openpi.serving.va_split_jax.compile import make_prefix_feature_template
+from openpi.serving.va_split_jax.compile import maybe_jit_ae_model
 from openpi.serving.va_split_jax.compile import maybe_jit_monolithic_model
 from openpi.serving.va_split_jax.compile import maybe_jit_split_model
+from openpi.serving.va_split_jax.compile import maybe_jit_vlm_model
 from openpi.serving.va_split_jax.compile import planned_warmup_batches
+from openpi.serving.va_split_jax.compile import prune_split_model_for_role
 from openpi.serving.va_split_jax.compile import runtime_aligned_denoise_state
 from openpi.serving.va_split_jax.compile import warmup_ae_denoise_model
 from openpi.serving.va_split_jax.compile import warmup_ae_denoise_on_mapped_slabs
@@ -56,10 +60,46 @@ def test_compile_helpers_use_module_jit(monkeypatch):
 
     monkeypatch.setattr("openpi.serving.va_split_jax.compile.nnx_utils.module_jit", fake_module_jit)
     maybe_jit_split_model(FakeModel(), JaxCompileConfig(enabled=True))
+    maybe_jit_vlm_model(FakeModel(), JaxCompileConfig(enabled=True))
+    maybe_jit_ae_model(FakeModel(), JaxCompileConfig(enabled=True))
     maybe_jit_monolithic_model(FakeModel(), JaxCompileConfig(enabled=True))
 
-    assert [call[0] for call in calls] == ["build_prefix_feature", "denoise_one_batch", "sample_actions"]
+    assert [call[0] for call in calls] == [
+        "build_prefix_feature",
+        "denoise_one_batch",
+        "build_prefix_feature",
+        "denoise_one_batch",
+        "sample_actions",
+    ]
     assert calls[-1][2] == {"static_argnames": ("num_steps",)}
+
+
+def test_prune_split_model_for_role_removes_only_role_unused_top_level_modules():
+    class PaliGemma:
+        def __init__(self):
+            self.llm = object()
+            self.img = object()
+
+    class FakeModel:
+        def __init__(self):
+            self.PaliGemma = PaliGemma()
+            self.action_in_proj = object()
+            self.action_out_proj = object()
+            self.time_mlp_in = object()
+            self.time_mlp_out = object()
+
+    vlm_model = FakeModel()
+    prune_split_model_for_role(vlm_model, role="vlm")
+    assert hasattr(vlm_model.PaliGemma, "img")
+    assert hasattr(vlm_model.PaliGemma, "llm")
+    assert not hasattr(vlm_model, "action_in_proj")
+    assert not hasattr(vlm_model, "action_out_proj")
+
+    ae_model = FakeModel()
+    prune_split_model_for_role(ae_model, role="ae")
+    assert not hasattr(ae_model.PaliGemma, "img")
+    assert hasattr(ae_model.PaliGemma, "llm")
+    assert hasattr(ae_model, "action_in_proj")
 
 
 def test_runtime_aligned_denoise_state_uses_batch_vectors():
@@ -126,6 +166,20 @@ def test_warmup_vlm_prefix_model_covers_all_sizes_up_to_vlm_cap():
 
     assert stats == {"jax_warmup_batches": 5.0}
     assert model.prefix_batches == [1, 1, 2, 3, 4]
+
+
+def test_make_prefix_feature_template_uses_shapes_without_real_prefix_values():
+    model = WarmupFakeModel()
+
+    template = make_prefix_feature_template(model, Observation)
+
+    assert template.past_key_values[0].shape == (3, 1, 2, 4)
+    assert template.past_key_values[0].dtype == jnp.float32
+    assert template.prefix_pad_masks.shape == (1, 3)
+    assert template.prefix_pad_masks.dtype == jnp.bool_
+    assert template.state.shape == (1, 8)
+    assert jnp.all(template.past_key_values[0] == 0)
+    assert jnp.all(template.prefix_pad_masks)
 
 
 def test_warmup_vlm_prefix_lane_pool_puts_views_and_releases():

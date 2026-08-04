@@ -18,7 +18,10 @@ from openpi.serving.va_split_jax.ae_process import JaxAEWorker
 from openpi.serving.va_split_jax.compile import JaxCompileConfig
 from openpi.serving.va_split_jax.compile import make_model_noise_factory
 from openpi.serving.va_split_jax.compile import make_model_observation_factory
-from openpi.serving.va_split_jax.compile import maybe_jit_split_model
+from openpi.serving.va_split_jax.compile import make_prefix_feature_template
+from openpi.serving.va_split_jax.compile import maybe_jit_ae_model
+from openpi.serving.va_split_jax.compile import maybe_jit_vlm_model
+from openpi.serving.va_split_jax.compile import prune_split_model_for_role
 from openpi.serving.va_split_jax.compile import warmup_vlm_ae_slab_writes
 from openpi.serving.va_split_jax.compile import warmup_vlm_prefix_model
 from openpi.serving.va_split_jax.device_slab import make_default_device_slab_backend
@@ -174,9 +177,10 @@ def _run_jax_vlm_process(
     _apply_env_updates(env_updates)
     model = model_factory()
     observation_factory = make_model_observation_factory(model)
+    model = prune_split_model_for_role(model, role="vlm")
     vlm_warmup_batches = 0.0
     if compile_config is not None:
-        model = maybe_jit_split_model(model, compile_config)
+        model = maybe_jit_vlm_model(model, compile_config)
         if warmup_queue is not None:
             stats = warmup_vlm_prefix_model(
                 model=model,
@@ -229,8 +233,10 @@ def _run_jax_ae_process(
     model = model_factory()
     observation_factory = make_model_observation_factory(model)
     noise_factory = make_model_noise_factory(model) if compile_config is not None else None
+    template = make_prefix_feature_template(model, observation_factory)
+    model = prune_split_model_for_role(model, role="ae")
     if compile_config is not None:
-        model = maybe_jit_split_model(model, compile_config)
+        model = maybe_jit_ae_model(model, compile_config)
     process = JaxAEProcess(
         model=model,
         prefix_queue=prefix_queue,
@@ -241,7 +247,6 @@ def _run_jax_ae_process(
         compile_config=compile_config,
         noise_factory=noise_factory,
     )
-    template = model.build_prefix_feature(None, observation_factory(1))
     ipc_batches = process.bootstrap_owned_pool(template)
     if warmup_queue is not None:
         warmup_queue.put(JaxCompileWarmupDone(role="ae", jax_warmup_batches=float(ipc_batches)))
@@ -313,14 +318,26 @@ class JaxProcessVASplitRuntime:
             daemon=True,
         )
         self._ae_process.start()
-        self._vlm_process.start()
-        self._compile_timing = _collect_compile_warmup(
+        ae_compile_timing = _collect_compile_warmup(
             self._warmup_queue,
-            expected_roles=("vlm", "ae"),
+            expected_roles=("ae",),
+            timeout_s=warmup_timeout_s if warmup_timeout_s is not None else result_timeout_s,
+            vlm_process=None,
+            ae_process=self._ae_process,
+        )
+        self._vlm_process.start()
+        vlm_compile_timing = _collect_compile_warmup(
+            self._warmup_queue,
+            expected_roles=("vlm",),
             timeout_s=warmup_timeout_s if warmup_timeout_s is not None else result_timeout_s,
             vlm_process=self._vlm_process,
             ae_process=self._ae_process,
         )
+        self._compile_timing = {
+            "jax_warmup_batches": float(
+                ae_compile_timing["jax_warmup_batches"] + vlm_compile_timing["jax_warmup_batches"]
+            )
+        }
         self._result_thread = threading.Thread(target=self._collect_results, daemon=True)
         self._result_thread.start()
 
@@ -430,9 +447,9 @@ def _collect_compile_warmup(
     deadline = time.monotonic() + max(timeout_s, 1.0)
     seen: dict[str, float] = {}
     while len(seen) < len(expected_roles):
-        if not vlm_process.is_alive() and "vlm" not in seen:
+        if vlm_process is not None and not vlm_process.is_alive() and "vlm" not in seen:
             raise RuntimeError("VLM process exited before reporting compile warmup")
-        if not ae_process.is_alive() and "ae" not in seen:
+        if ae_process is not None and not ae_process.is_alive() and "ae" not in seen:
             raise RuntimeError("AE process exited before reporting compile warmup")
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -469,8 +486,13 @@ def _aggregate_batch_timing(row_timings: list[dict[str, float]], *, batch_size: 
         "vlm_queue_wait_ms",
         "vlm_batch_wait_ms",
         "vlm_input_stage_ms",
+        "vlm_sample_kwargs_stage_ms",
+        "vlm_observation_stack_ms",
+        "vlm_to_jax_tree_ms",
+        "vlm_observation_from_dict_ms",
         "vlm_effective_batch",
         "vlm_slab_write_ms",
+        "ae_init_denoise_ms",
         "ae_step_ms",
         "ae_step_total_ms",
         "prefix_slab_map_ms",
