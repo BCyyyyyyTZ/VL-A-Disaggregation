@@ -1,0 +1,45 @@
+{
+  "status": "pass",
+  "case_id": "mps-sm40-bs8",
+  "mps_sm": 40,
+  "batch_size": 8,
+  "gpu_id": 3,
+  "warmup_steps": 3,
+  "measure_steps": 20,
+  "elapsed_s": 44.72607265226543,
+  "metrics": {
+    "total": {
+      "avg_ms": 519.2925911396742,
+      "p50_ms": 519.2254055291414,
+      "p95_ms": 520.0103954412043
+    },
+    "vlm": {
+      "avg_ms": 465.5180722475052,
+      "p50_ms": 465.51661659032106,
+      "p95_ms": 465.9009271301329
+    },
+    "action_head": {
+      "avg_ms": 53.2244186848402,
+      "p50_ms": 53.20038087666035,
+      "p95_ms": 53.348037879914045
+    },
+    "other": {
+      "avg_ms": 0.5501002073287964,
+      "p50_ms": 0.5398429930210114,
+      "p95_ms": 0.7765874266624451
+    }
+  },
+  "model": {
+    "config": "pi05_libero",
+    "checkpoint_dir": "/data1/miliang/models/pi05_libero",
+    "num_steps": 10,
+    "action_horizon": 10,
+    "action_dim": 32,
+    "max_token_len": 200,
+    "jax_jit": true,
+    "devices": [
+      "cuda:0"
+    ]
+  },
+  "timing_kind": "synchronous_jax_wall_clock_ms"
+}

@@ -41,7 +41,15 @@ class AERequestState:
 class AEWorker:
     """Runs step-level continuous batching over active AE requests."""
 
-    def __init__(self, model: Any, device: str, max_batch_size: int, max_prefix_slots: int | None = None):
+    def __init__(
+        self,
+        model: Any,
+        device: str,
+        max_batch_size: int,
+        max_prefix_slots: int | None = None,
+        *,
+        enable_component_timing: bool = True,
+    ):
         if max_batch_size <= 0:
             raise ValueError("max_batch_size must be positive")
         if max_prefix_slots is None:
@@ -52,6 +60,7 @@ class AEWorker:
         self._device = device
         self._max_batch_size = max_batch_size
         self._max_prefix_slots = max_prefix_slots
+        self._enable_component_timing = enable_component_timing
         self._prefix_lanes = PrefixCacheLanePool(max_lanes=max_prefix_slots)
         self._lanes: list[AERequestState | None] = [None for _ in range(max_prefix_slots)]
         self._active_count = 0
@@ -72,30 +81,39 @@ class AEWorker:
         prefix_enqueue_ns = timing.pop("_prefix_enqueue_ns", None)
         prefix_get_start_ns = timing.pop("_prefix_get_start_ns", None)
         prefix_get_end_ns = timing.pop("_prefix_get_end_ns", None)
-        queue_wait_ms, transfer_ms = queue_wait_and_transfer_ms(
-            enqueue_ns=prefix_enqueue_ns,
-            get_start_ns=prefix_get_start_ns,
-            get_end_ns=prefix_get_end_ns,
-        )
-        timing["prefix_queue_wait_ms"] = queue_wait_ms
-        timing["prefix_transfer_ms"] = transfer_ms
-        if prefix_get_end_ns is not None:
-            timing["prefix_admit_wait_ms"] = max(0.0, (time.monotonic_ns() - float(prefix_get_end_ns)) / 1_000_000)
-        elif prefix_enqueue_ns is not None:
-            # Legacy path: no get split available; keep old single-gap accounting as queue wait.
-            timing["prefix_admit_wait_ms"] = 0.0
-            timing["prefix_queue_wait_ms"] = max(0.0, (time.monotonic_ns() - float(prefix_enqueue_ns)) / 1_000_000)
-            timing["prefix_transfer_ms"] = 0.0
-        else:
-            timing["prefix_admit_wait_ms"] = 0.0
+        if self._enable_component_timing:
+            queue_wait_ms, transfer_ms = queue_wait_and_transfer_ms(
+                enqueue_ns=prefix_enqueue_ns,
+                get_start_ns=prefix_get_start_ns,
+                get_end_ns=prefix_get_end_ns,
+            )
+            timing["prefix_queue_wait_ms"] = queue_wait_ms
+            timing["prefix_transfer_ms"] = transfer_ms
+            if prefix_get_end_ns is not None:
+                timing["prefix_admit_wait_ms"] = max(
+                    0.0,
+                    (time.monotonic_ns() - float(prefix_get_end_ns)) / 1_000_000,
+                )
+            elif prefix_enqueue_ns is not None:
+                # Legacy path: no get split available; keep old single-gap accounting as queue wait.
+                timing["prefix_admit_wait_ms"] = 0.0
+                timing["prefix_queue_wait_ms"] = max(
+                    0.0,
+                    (time.monotonic_ns() - float(prefix_enqueue_ns)) / 1_000_000,
+                )
+                timing["prefix_transfer_ms"] = 0.0
+            else:
+                timing["prefix_admit_wait_ms"] = 0.0
         batch_size = ready.feature.prefix_pad_masks.shape[0]
         denoise_state = self._model.init_denoise_state(self._device, batch_size, noise, ready.num_steps)
         lane_id = self._active_count
-        synchronize_cuda_if_needed(self._device)
+        if self._enable_component_timing:
+            synchronize_cuda_if_needed(self._device)
         ingest_start_ns = time.monotonic_ns()
         self._prefix_lanes.put_lane(lane_id, ready.feature)
-        synchronize_cuda_if_needed(self._device)
-        timing["prefix_lane_ingest_ms"] = (time.monotonic_ns() - ingest_start_ns) / 1_000_000
+        if self._enable_component_timing:
+            synchronize_cuda_if_needed(self._device)
+            timing["prefix_lane_ingest_ms"] = (time.monotonic_ns() - ingest_start_ns) / 1_000_000
         state = AERequestState(
             request_id=ready.request_id,
             lane_id=lane_id,
@@ -127,7 +145,8 @@ class AEWorker:
         if not batch:
             return [], []
 
-        synchronize_cuda_if_needed(self._device)
+        if self._enable_component_timing:
+            synchronize_cuda_if_needed(self._device)
         step_start_ns = time.monotonic_ns()
         prefix_batch = self._prefix_lanes.view_prefix_batch(len(batch))
         x_t = torch.cat([request.x_t for request in batch], dim=0)
@@ -141,11 +160,13 @@ class AEWorker:
         for row, request in enumerate(batch):
             request.x_t = request.x_t + request.dt * v_t[row : row + 1]
             request.step_idx += 1
-        synchronize_cuda_if_needed(self._device)
+        if self._enable_component_timing:
+            synchronize_cuda_if_needed(self._device)
         step_ms = (time.monotonic_ns() - step_start_ns) / 1_000_000
 
         for request in batch:
-            request.ae_step_ms.append(step_ms)
+            if self._enable_component_timing:
+                request.ae_step_ms.append(step_ms)
             request.ae_batch_sizes.append(len(batch))
             if request.step_idx == request.num_steps:
                 results.append(
@@ -172,11 +193,13 @@ class AEWorker:
             moved = self._lanes[last_lane]
             if moved is None:
                 raise RuntimeError(f"Cannot compact empty AE lane {last_lane}")
-            synchronize_cuda_if_needed(self._device)
+            if self._enable_component_timing:
+                synchronize_cuda_if_needed(self._device)
             compact_start_ns = time.monotonic_ns()
             self._prefix_lanes.move_lane(last_lane, lane_id)
-            synchronize_cuda_if_needed(self._device)
-            moved.lane_compact_ms += (time.monotonic_ns() - compact_start_ns) / 1_000_000
+            if self._enable_component_timing:
+                synchronize_cuda_if_needed(self._device)
+                moved.lane_compact_ms += (time.monotonic_ns() - compact_start_ns) / 1_000_000
             moved.lane_id = lane_id
             self._lanes[lane_id] = moved
         self._lanes[last_lane] = None
@@ -206,17 +229,20 @@ class AEProcess:
         release_queue,
         max_batch_size: int,
         max_prefix_slots: int | None = None,
+        enable_component_timing: bool = True,
     ):
         self.worker = AEWorker(
             model=model,
             device=device,
             max_batch_size=max_batch_size,
             max_prefix_slots=max_prefix_slots,
+            enable_component_timing=enable_component_timing,
         )
         self._prefix_queue = prefix_queue
         self._result_queue = result_queue
         self._release_queue = release_queue
         self._prefix_backlog: deque[object] = deque()
+        self._enable_component_timing = enable_component_timing
 
     def run(self) -> None:
         while True:
@@ -232,9 +258,12 @@ class AEProcess:
             return
 
         for result in results:
+            copy_start_ns = time.monotonic_ns()
             actions = result.actions.detach().cpu() if torch.is_tensor(result.actions) else result.actions
             timing = dict(result.timing or {})
-            timing["_ae_result_enqueue_ns"] = float(time.monotonic_ns())
+            if self._enable_component_timing:
+                timing["ae_result_cpu_copy_ms"] = (time.monotonic_ns() - copy_start_ns) / 1_000_000
+                timing["_ae_result_enqueue_ns"] = float(time.monotonic_ns())
             self._result_queue.put(ActionResult(request_id=result.request_id, actions=actions, timing=timing))
         for release in releases:
             self._release_queue.put(release)
@@ -306,8 +335,9 @@ def _finish_timing(request: AERequestState) -> dict[str, float]:
         timing["ae_step_total_ms"] = sum(request.ae_step_ms)
     if request.ae_batch_sizes:
         timing["ae_effective_batch"] = sum(request.ae_batch_sizes) / len(request.ae_batch_sizes)
-    ingest_ms = float(timing.get("prefix_lane_ingest_ms", 0.0))
-    compact_ms = float(request.lane_compact_ms)
-    timing["prefix_lane_compact_ms"] = compact_ms
-    timing["prefix_lane_overhead_ms"] = ingest_ms + compact_ms
+    if "prefix_lane_ingest_ms" in timing or request.lane_compact_ms:
+        ingest_ms = float(timing.get("prefix_lane_ingest_ms", 0.0))
+        compact_ms = float(request.lane_compact_ms)
+        timing["prefix_lane_compact_ms"] = compact_ms
+        timing["prefix_lane_overhead_ms"] = ingest_ms + compact_ms
     return timing

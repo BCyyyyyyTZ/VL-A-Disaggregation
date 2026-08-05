@@ -33,12 +33,20 @@ class BatchLiveFeature:
 class VLMWorker:
     """Builds prefix features and keeps producer-side tensor references alive."""
 
-    def __init__(self, model: Any, device: str, max_live_features: int | None = None):
+    def __init__(
+        self,
+        model: Any,
+        device: str,
+        max_live_features: int | None = None,
+        *,
+        enable_component_timing: bool = True,
+    ):
         if max_live_features is not None and max_live_features <= 0:
             raise ValueError("max_live_features must be positive")
         self._model = model
         self._device = device
         self._max_live_features = max_live_features
+        self._enable_component_timing = enable_component_timing
         self.live_features: dict[str, PrefixFeature] = {}
         self.live_batches: dict[str, BatchLiveFeature] = {}
         self._request_to_batch: dict[str, str] = {}
@@ -108,7 +116,8 @@ class VLMWorker:
             or len(dequeue_start_ns_by_row) != len(request_ids)
         ):
             raise ValueError("enqueue/dequeue timing must have one entry per request id")
-        synchronize_cuda_if_needed(self._device)
+        if self._enable_component_timing:
+            synchronize_cuda_if_needed(self._device)
         start_ns = time.monotonic_ns()
         observation = _model.Observation.from_dict(_move_tensors_to_device(dict(observation), self._device))
         feature = self._model.build_prefix_feature(self._device, observation)
@@ -132,19 +141,23 @@ class VLMWorker:
             self.live_features[request_id] = feature
             self._request_to_batch[request_id] = batch_id
             row_kwargs = _sample_kwargs_for_row(sample_kwargs, row, batch_size)
+            timing = {"vlm_effective_batch": float(batch_size)}
+            if self._enable_component_timing:
+                timing.update(
+                    {
+                        "vlm_prefix_forward_ms": elapsed_ms,
+                        "vlm_request_queue_wait_ms": queue_wait_ms,
+                        "vlm_request_transfer_ms": transfer_ms,
+                        "vlm_queue_wait_ms": max(0.0, (start_ns - dequeue_ns) / 1_000_000),
+                    }
+                )
             ready.append(
                 PrefixReady(
                     request_id=request_id,
                     feature=_prefix_feature_row_view(feature, row),
                     num_steps=num_steps,
                     sample_kwargs=row_kwargs,
-                    timing={
-                        "vlm_prefix_forward_ms": elapsed_ms,
-                        "vlm_effective_batch": float(batch_size),
-                        "vlm_request_queue_wait_ms": queue_wait_ms,
-                        "vlm_request_transfer_ms": transfer_ms,
-                        "vlm_queue_wait_ms": max(0.0, (start_ns - dequeue_ns) / 1_000_000),
-                    },
+                    timing=timing,
                 )
             )
         return ready
@@ -181,17 +194,24 @@ class VLMProcess:
         max_batch_size: int = 8,
         max_wait_ms: float = 2.0,
         max_live_features: int | None = None,
+        enable_component_timing: bool = True,
     ):
         if max_batch_size <= 0:
             raise ValueError("max_batch_size must be positive")
         if max_wait_ms < 0:
             raise ValueError("max_wait_ms must be non-negative")
-        self.worker = VLMWorker(model=model, device=device, max_live_features=max_live_features)
+        self.worker = VLMWorker(
+            model=model,
+            device=device,
+            max_live_features=max_live_features,
+            enable_component_timing=enable_component_timing,
+        )
         self._request_queue = request_queue
         self._prefix_queue = prefix_queue
         self._release_queue = release_queue
         self._max_batch_size = max_batch_size
         self._max_wait_ms = max_wait_ms
+        self._enable_component_timing = enable_component_timing
         self._backlog: deque[Any] = deque()
 
     def run(self) -> None:
@@ -256,7 +276,8 @@ class VLMProcess:
 
     def _put_prefix_ready(self, ready: PrefixReady) -> None:
         timing = dict(ready.timing or {})
-        timing["_prefix_enqueue_ns"] = float(time.monotonic_ns())
+        if self._enable_component_timing:
+            timing["_prefix_enqueue_ns"] = float(time.monotonic_ns())
         self._prefix_queue.put(replace(ready, timing=timing))
 
     def _collect_fcfs_batch(self, first_request: RequestEnvelope) -> tuple[list[RequestEnvelope], bool]:

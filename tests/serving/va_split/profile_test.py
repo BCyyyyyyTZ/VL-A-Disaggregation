@@ -229,6 +229,8 @@ class _ConcurrentFakePolicy:
                 "prefix_lane_compact_ms": 0.1,
                 "prefix_lane_overhead_ms": 0.5,
                 "ae_step_ms": 2.0,
+                "ae_result_slice_ms": 0.25,
+                "ae_result_device_get_ms": 0.3,
                 "ae_effective_batch": 3.0,
                 "jax_warmup_batches": 3.0,
             },
@@ -326,6 +328,8 @@ def test_run_benchmark_allows_concurrent_policy_overlap():
     assert summary["prefix_lane_overhead_mean_ms"] == 0.5
     assert summary["ae_step_mean_ms"] == 2.0
     assert summary["ae_step_p50_ms"] == 2.0
+    assert summary["ae_result_slice_mean_ms"] == 0.25
+    assert summary["ae_result_device_get_mean_ms"] == 0.3
     assert summary["ae_effective_batch_mean"] == 3.0
     assert summary["effective_batch_mean"] == 3.0
     assert summary["effective_batch_p50"] == 3.0
@@ -753,6 +757,39 @@ def test_create_policy_for_mode_uses_profile_timeout_for_split_runtime(monkeypat
     assert captured_kwargs["result_timeout_s"] == 321.0
     assert captured_kwargs["max_vlm_batch_size"] == 6
     assert captured_kwargs["max_vlm_wait_ms"] == 1.25
+    assert captured_kwargs["enable_component_timing"] is True
+
+
+def test_create_policy_for_mode_forwards_component_timing_to_split_runtime(monkeypatch):
+    @dataclasses.dataclass(frozen=True)
+    class FakeModelConfig:
+        pytorch_compile_mode: str | None = "max-autotune"
+
+    @dataclasses.dataclass(frozen=True)
+    class FakeTrainConfig:
+        model: FakeModelConfig = dataclasses.field(default_factory=FakeModelConfig)
+
+    captured_kwargs = {}
+
+    def create_split_policy(received_train_config, *args, **kwargs):
+        del received_train_config, args
+        captured_kwargs.update(kwargs)
+        return "split-policy"
+
+    monkeypatch.setattr(training_config, "get_config", lambda config_name: FakeTrainConfig())
+    monkeypatch.setattr(va_split_policy, "create_trained_va_split_policy", create_split_policy)
+
+    policy = profile_va_split.create_policy_for_mode(
+        profile_va_split.Args(
+            mode="split-no-mps",
+            policy=profile_va_split.Checkpoint(config="dummy", dir="/tmp/checkpoint"),
+            enable_component_timing=False,
+        ),
+        "split-no-mps",
+    )
+
+    assert policy == "split-policy"
+    assert captured_kwargs["enable_component_timing"] is False
 
 
 def test_create_policy_for_mode_allows_explicit_pytorch_compile_opt_in(monkeypatch):

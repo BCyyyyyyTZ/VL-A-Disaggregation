@@ -141,3 +141,78 @@ def test_load_pytorch_model_matches_monolithic_compile_mode(monkeypatch, compile
 
     assert va_split_policy._load_pytorch_model(train_config, "/tmp/model.safetensors") is model  # noqa: SLF001
     assert compilations == expected_compilations
+
+
+@pytest.mark.parametrize(
+    ("role", "compiled_methods", "model_absent_attrs", "expert_absent_attrs"),
+    [
+        (
+            "vlm",
+            ["build_prefix_feature"],
+            [
+                "action_in_proj",
+                "action_out_proj",
+                "time_mlp_in",
+                "time_mlp_out",
+                "state_proj",
+                "action_time_mlp_in",
+                "action_time_mlp_out",
+            ],
+            ["gemma_expert"],
+        ),
+        ("ae", ["denoise_one_batch"], [], ["paligemma"]),
+    ],
+)
+def test_load_pytorch_model_prunes_split_role_weights(
+    monkeypatch, role, compiled_methods, model_absent_attrs, expert_absent_attrs
+):
+    class FakePaliGemmaWithExpert:
+        def __init__(self):
+            self.paligemma = object()
+            self.gemma_expert = object()
+
+        def to_bfloat16_for_selected_params(self, dtype):
+            assert dtype == "bfloat16"
+
+    class FakeModel:
+        def __init__(self):
+            self.paligemma_with_expert = FakePaliGemmaWithExpert()
+            self.action_in_proj = object()
+            self.action_out_proj = object()
+            self.time_mlp_in = object()
+            self.time_mlp_out = object()
+            self.state_proj = object()
+            self.action_time_mlp_in = object()
+            self.action_time_mlp_out = object()
+
+        def build_prefix_feature(self, device, observation):
+            return device, observation
+
+        def denoise_one_batch(self, prefix_batch, denoise_batch):
+            return prefix_batch, denoise_batch
+
+    model = FakeModel()
+    train_config = SimpleNamespace(
+        model=SimpleNamespace(
+            pytorch_compile_mode="max-autotune",
+            load_pytorch=lambda config, weight_path: model,
+        )
+    )
+    compilations = []
+
+    def compile_spy(function, *, mode, dynamic):
+        compilations.append(function.__name__)
+        assert mode == "max-autotune"
+        assert dynamic is True
+        return function
+
+    monkeypatch.setattr(va_split_policy.torch, "compile", compile_spy)
+    monkeypatch.setattr(va_split_policy.torch.cuda, "is_available", lambda: False)
+
+    assert va_split_policy._load_pytorch_model(train_config, "/tmp/model.safetensors", role=role) is model  # noqa: SLF001
+
+    assert compilations == compiled_methods
+    for name in model_absent_attrs:
+        assert not hasattr(model, name)
+    for name in expert_absent_attrs:
+        assert not hasattr(model.paligemma_with_expert, name)

@@ -26,13 +26,27 @@ from openpi.serving.va_split.vlm_process import VLMWorker
 class LocalVASplitRuntime:
     """In-process runtime that exercises the same VLM/AE worker split."""
 
-    def __init__(self, *, model, device: str, max_ae_batch_size: int = 8, max_prefix_slots: int | None = None):
-        self.vlm_worker = VLMWorker(model=model, device=device, max_live_features=max_prefix_slots)
+    def __init__(
+        self,
+        *,
+        model,
+        device: str,
+        max_ae_batch_size: int = 8,
+        max_prefix_slots: int | None = None,
+        enable_component_timing: bool = True,
+    ):
+        self.vlm_worker = VLMWorker(
+            model=model,
+            device=device,
+            max_live_features=max_prefix_slots,
+            enable_component_timing=enable_component_timing,
+        )
         self.ae_worker = AEWorker(
             model=model,
             device=device,
             max_batch_size=max_ae_batch_size,
             max_prefix_slots=max_prefix_slots,
+            enable_component_timing=enable_component_timing,
         )
 
     def infer(self, observation: dict, sample_kwargs: dict) -> ActionResult:
@@ -108,6 +122,7 @@ def _run_vlm_process(
     max_vlm_wait_ms,
     max_live_features,
     env_updates=None,
+    enable_component_timing=True,
 ) -> None:
     _apply_env_updates(env_updates)
     model = _prepare_model(model_factory, device)
@@ -120,6 +135,7 @@ def _run_vlm_process(
         max_batch_size=max_vlm_batch_size,
         max_wait_ms=max_vlm_wait_ms,
         max_live_features=max_live_features,
+        enable_component_timing=enable_component_timing,
     ).run()
 
 
@@ -132,6 +148,7 @@ def _run_ae_process(
     max_ae_batch_size,
     max_prefix_slots,
     env_updates=None,
+    enable_component_timing=True,
 ) -> None:
     _apply_env_updates(env_updates)
     model = _prepare_model(model_factory, device)
@@ -143,6 +160,7 @@ def _run_ae_process(
         release_queue=release_queue,
         max_batch_size=max_ae_batch_size,
         max_prefix_slots=max_prefix_slots,
+        enable_component_timing=enable_component_timing,
     ).run()
 
 
@@ -153,6 +171,8 @@ class ProcessVASplitRuntime:
         self,
         *,
         model_factory: Callable[[], object],
+        vlm_model_factory: Callable[[], object] | None = None,
+        ae_model_factory: Callable[[], object] | None = None,
         device: str,
         max_ae_batch_size: int = 8,
         max_vlm_batch_size: int = 8,
@@ -162,10 +182,13 @@ class ProcessVASplitRuntime:
         result_timeout_s: float = 120.0,
         vlm_env_updates: dict[str, str | None] | None = None,
         ae_env_updates: dict[str, str | None] | None = None,
+        enable_component_timing: bool = True,
     ):
         if max_prefix_slots is None:
             max_prefix_slots = max_vlm_batch_size * 3
         self._model_factory = model_factory
+        self._vlm_model_factory = vlm_model_factory or model_factory
+        self._ae_model_factory = ae_model_factory or model_factory
         self._device = device
         self._max_ae_batch_size = max_ae_batch_size
         self._max_vlm_batch_size = max_vlm_batch_size
@@ -186,7 +209,7 @@ class ProcessVASplitRuntime:
         self._vlm_process = ctx.Process(
             target=_run_vlm_process,
             args=(
-                model_factory,
+                self._vlm_model_factory,
                 device,
                 self._request_queue,
                 self._prefix_queue,
@@ -195,13 +218,14 @@ class ProcessVASplitRuntime:
                 max_vlm_wait_ms,
                 max_prefix_slots,
                 vlm_env_updates,
+                enable_component_timing,
             ),
             daemon=True,
         )
         self._ae_process = ctx.Process(
             target=_run_ae_process,
             args=(
-                model_factory,
+                self._ae_model_factory,
                 device,
                 self._prefix_queue,
                 self._result_queue,
@@ -209,6 +233,7 @@ class ProcessVASplitRuntime:
                 max_ae_batch_size,
                 max_prefix_slots,
                 ae_env_updates,
+                enable_component_timing,
             ),
             daemon=True,
         )
@@ -324,7 +349,14 @@ def _aggregate_batch_timing(row_timings: list[dict[str, float]], *, batch_size: 
         "effective_batch": float(batch_size),
         "policy_effective_batch": float(batch_size),
     }
-    for key in ("vlm_prefix_forward_ms", "vlm_queue_wait_ms", "vlm_effective_batch", "ae_step_ms", "ae_step_total_ms"):
+    for key in (
+        "vlm_prefix_forward_ms",
+        "vlm_queue_wait_ms",
+        "vlm_effective_batch",
+        "ae_step_ms",
+        "ae_step_total_ms",
+        "ae_result_cpu_copy_ms",
+    ):
         values = [float(row[key]) for row in row_timings if key in row]
         if values:
             timing[key] = sum(values) / len(values)

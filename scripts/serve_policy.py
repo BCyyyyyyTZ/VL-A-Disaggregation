@@ -64,6 +64,7 @@ class Args:
     ae_sm_percent: int = 20
     vlm_sm_percent: int = 0
     enable_policy_batch: bool = True
+    enable_component_timing: bool = True
     pytorch_device: str | None = None
     pytorch_compile_mode: CompileMode | None = None
 
@@ -125,6 +126,7 @@ def _create_checkpoint_policy(args: Args, checkpoint: Checkpoint) -> _policy.Bas
             ae_sm_percent=args.ae_sm_percent,
             vlm_sm_percent=args.vlm_sm_percent,
             pytorch_device=args.pytorch_device,
+            enable_component_timing=args.enable_component_timing,
         )
     return _policy_config.create_trained_policy(
         train_config,

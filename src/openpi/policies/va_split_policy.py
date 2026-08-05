@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 import functools
+import gc
 import os
 import pathlib
 import time
@@ -139,13 +140,55 @@ class VASplitPolicy(_policy.BasePolicy):
         self.shutdown()
 
 
-def _load_pytorch_model(train_config: _config.TrainConfig, weight_path: str):
+_VLM_UNUSED_PI0_ATTRS = (
+    "action_in_proj",
+    "action_out_proj",
+    "time_mlp_in",
+    "time_mlp_out",
+    "state_proj",
+    "action_time_mlp_in",
+    "action_time_mlp_out",
+)
+
+
+def _delete_attr_if_present(obj: object, name: str) -> None:
+    if hasattr(obj, name):
+        delattr(obj, name)
+
+
+def _prune_pytorch_split_model_for_role(model: object, role: str | None) -> None:
+    """Drop modules unused by a split inference role before moving the model to GPU."""
+    if role is None:
+        return
+    if role not in {"vlm", "ae"}:
+        raise ValueError(f"Unsupported PyTorch VA split model role: {role!r}")
+
+    paligemma_with_expert = getattr(model, "paligemma_with_expert", None)
+    if paligemma_with_expert is None:
+        raise AttributeError("PyTorch VA split model is missing paligemma_with_expert.")
+
+    if role == "vlm":
+        for name in _VLM_UNUSED_PI0_ATTRS:
+            _delete_attr_if_present(model, name)
+        _delete_attr_if_present(paligemma_with_expert, "gemma_expert")
+    else:
+        _delete_attr_if_present(paligemma_with_expert, "paligemma")
+
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def _load_pytorch_model(train_config: _config.TrainConfig, weight_path: str, *, role: str | None = None):
     model = train_config.model.load_pytorch(train_config, weight_path)
     model.paligemma_with_expert.to_bfloat16_for_selected_params("bfloat16")
+    _prune_pytorch_split_model_for_role(model, role)
     compile_mode = train_config.model.pytorch_compile_mode
     if compile_mode is not None:
-        model.build_prefix_feature = torch.compile(model.build_prefix_feature, mode=compile_mode, dynamic=True)
-        model.denoise_one_batch = torch.compile(model.denoise_one_batch, mode=compile_mode, dynamic=True)
+        if role in (None, "vlm"):
+            model.build_prefix_feature = torch.compile(model.build_prefix_feature, mode=compile_mode, dynamic=True)
+        if role in (None, "ae"):
+            model.denoise_one_batch = torch.compile(model.denoise_one_batch, mode=compile_mode, dynamic=True)
     return model
 
 
@@ -170,6 +213,7 @@ def create_trained_va_split_policy(
     ae_sm_percent: int = 20,
     vlm_sm_percent: int = 0,
     result_timeout_s: float = 120.0,
+    enable_component_timing: bool = True,
 ) -> VASplitPolicy:
     """Create a PyTorch VA split policy from a trained checkpoint."""
     repack_transforms = repack_transforms or _transforms.Group()
@@ -189,6 +233,8 @@ def create_trained_va_split_policy(
 
     runtime = ProcessVASplitRuntime(
         model_factory=functools.partial(_load_pytorch_model, train_config, weight_path),
+        vlm_model_factory=functools.partial(_load_pytorch_model, train_config, weight_path, role="vlm"),
+        ae_model_factory=functools.partial(_load_pytorch_model, train_config, weight_path, role="ae"),
         device=pytorch_device,
         max_ae_batch_size=max_ae_batch_size,
         max_vlm_batch_size=max_vlm_batch_size,
@@ -196,6 +242,7 @@ def create_trained_va_split_policy(
         result_timeout_s=result_timeout_s,
         vlm_env_updates=_mps_env_updates(vlm_sm_percent),
         ae_env_updates=_mps_env_updates(ae_sm_percent),
+        enable_component_timing=enable_component_timing,
     )
     return VASplitPolicy(
         runtime=runtime,

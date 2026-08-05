@@ -20,6 +20,17 @@ def _feature(fill: float) -> JaxPrefixFeature:
     )
 
 
+def _batch_feature(*fills: float) -> JaxPrefixFeature:
+    return JaxPrefixFeature(
+        past_key_values=(
+            jnp.concatenate([jnp.full((3, 1, 2, 4), fill, dtype=jnp.bfloat16) for fill in fills], axis=1),
+            jnp.concatenate([jnp.full((3, 1, 2, 4), fill + 1, dtype=jnp.bfloat16) for fill in fills], axis=1),
+        ),
+        prefix_pad_masks=jnp.ones((len(fills), 3), dtype=jnp.bool_),
+        state=jnp.concatenate([jnp.full((1, 8), fill, dtype=jnp.float32) for fill in fills], axis=0),
+    )
+
+
 def test_ae_owned_prefix_cache_lane_pool_exports_dense_batch():
     pool = JaxVlmPrefixCacheLanePool(max_lanes=4, backend=make_default_device_slab_backend())
     pool.put_lane("req-1", _feature(1.0))
@@ -51,6 +62,23 @@ def test_ae_owned_prefix_cache_lane_pool_write_claim_densifies():
     assert vacated == 2
     batch = pool.view_prefix_batch(1)
     np.testing.assert_allclose(np.asarray(batch.state), np.full((1, 8), 9.0, dtype=np.float32))
+
+
+def test_ae_owned_prefix_cache_lane_pool_batch_write_claim_densifies():
+    pool = JaxVlmPrefixCacheLanePool(max_lanes=4, backend=make_default_device_slab_backend())
+    pool.initialize_from_feature(_feature(0.0))
+    pool.write_lanes((1, 2), _batch_feature(4.0, 5.0))
+
+    dense_1, vacated_1 = pool.claim_written_lane("req-1", 1)
+    dense_2, vacated_2 = pool.claim_written_lane("req-2", 2)
+
+    assert (dense_1, vacated_1) == (0, 1)
+    assert (dense_2, vacated_2) == (1, 2)
+    batch = pool.export_batch_view(("req-1", "req-2"))
+    np.testing.assert_allclose(np.asarray(batch.state[0]), np.full((8,), 4.0, dtype=np.float32))
+    np.testing.assert_allclose(np.asarray(batch.state[1]), np.full((8,), 5.0, dtype=np.float32))
+    np.testing.assert_allclose(np.asarray(batch.past_key_values[0][:, 0]), np.full((3, 2, 4), 4.0, dtype=np.float32))
+    np.testing.assert_allclose(np.asarray(batch.past_key_values[0][:, 1]), np.full((3, 2, 4), 5.0, dtype=np.float32))
 
 
 def test_ae_owned_prefix_cache_lane_pool_rejects_sparse_export():

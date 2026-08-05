@@ -209,7 +209,8 @@ def warmup_vlm_ae_slab_writes(
     max_vlm_batch_size: int,
     config: JaxCompileConfig,
 ) -> dict[str, float]:
-    """Warm VLM write-through into AE-owned slabs (row-slice -> copy_lane)."""
+    """Warm VLM write-through into AE-owned slabs."""
+    from openpi.serving.va_split_jax.prefix_cache_pool import write_feature_batch_to_slab_tree
     from openpi.serving.va_split_jax.prefix_cache_pool import write_feature_to_slab_tree
 
     if not config.warmup_enabled:
@@ -233,13 +234,20 @@ def warmup_vlm_ae_slab_writes(
                 chunk = min(max_vlm_batch_size, batch_size - filled)
                 feature = model.build_prefix_feature(None, observation_factory(chunk))
                 _block_until_ready(feature)
-                for row in range(chunk):
-                    lane_id = filled + row
+                lane_ids = tuple(range(filled, filled + chunk))
+                if chunk > 1:
+                    writable = write_feature_batch_to_slab_tree(
+                        backend,
+                        writable,
+                        lane_ids,
+                        feature,
+                    )
+                else:
                     writable = write_feature_to_slab_tree(
                         backend,
                         writable,
-                        lane_id,
-                        _prefix_feature_row_view(feature, row),
+                        lane_ids[0],
+                        _prefix_feature_row_view(feature, 0),
                     )
                 filled += chunk
             warmed += 1
@@ -357,8 +365,8 @@ def warmup_ae_denoise_on_mapped_slabs(
     if not config.enabled:
         batches = ((1, 1),)
     warmed = 0
-    # Match AE step_once exactly: concat per-request x_t rows, batched Euler update, then
-    # store row slices and concat again on the next step (not reuse the contiguous x_t).
+    # Match AE step_once's dense state layout: rows live in one batched device array
+    # across denoise steps instead of being rebuilt from per-request slices.
     warmup_steps = min(max(config.num_steps, 2), 5)
     for batch_size, repeats in batches:
         if batch_size > max_prefix_slots:
@@ -366,14 +374,10 @@ def warmup_ae_denoise_on_mapped_slabs(
         slot_ids = tuple(range(batch_size))
         for _ in range(repeats):
             prefix_batch = make_prefix_batch(slot_ids)
-            noise = noise_factory(batch_size)
-            xs = [noise[i : i + 1] for i in range(batch_size)]
-            dt = jnp.stack(
-                [jnp.asarray(-1.0 / float(config.num_steps), dtype=jnp.float32) for _ in range(batch_size)]
-            )
+            x_t = noise_factory(batch_size)
+            dt = jnp.full((batch_size,), -1.0 / float(config.num_steps), dtype=jnp.float32)
             for step in range(warmup_steps):
-                x_t = jnp.concatenate(xs, axis=0)
-                step_idx = jnp.asarray([step for _ in range(batch_size)], dtype=jnp.int32)
+                step_idx = jnp.full((batch_size,), step, dtype=jnp.int32)
                 denoise_state = JaxDenoiseState(
                     x_t=x_t, step_idx=step_idx, num_steps=config.num_steps, dt=dt
                 )
@@ -381,7 +385,6 @@ def warmup_ae_denoise_on_mapped_slabs(
                 dt_b = dt.reshape((-1,) + (1,) * (v_t.ndim - 1))
                 x_t = x_t + dt_b * v_t
                 _block_until_ready(x_t)
-                xs = [x_t[i : i + 1] for i in range(batch_size)]
             warmed += 1
     return {"jax_warmup_batches": float(warmed)}
 

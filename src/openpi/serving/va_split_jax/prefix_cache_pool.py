@@ -37,7 +37,8 @@ class JaxVlmPrefixCacheLanePool:
         """Write a single-row feature into a physical lane without activating it.
 
         Used by VLM (in-process shared pool) or tests. Cross-process VLM writes go through
-        opened IPC slab handles via :func:`write_feature_to_slab_tree` instead.
+        opened IPC slab handles via :func:`write_feature_to_slab_tree` /
+        :func:`write_feature_batch_to_slab_tree` instead.
         """
         self._validate_physical_lane_id(lane_id)
         if self._lane_to_request[lane_id] is not None:
@@ -45,6 +46,20 @@ class JaxVlmPrefixCacheLanePool:
         _validate_single_row_feature(feature)
         self._ensure_initialized(feature)
         self._write_feature_into_lane(lane_id, feature)
+
+    def write_lanes(self, lane_ids: tuple[int, ...], feature: JaxPrefixFeature) -> None:
+        """Write a contiguous feature batch into physical lanes without activating them."""
+        _validate_contiguous_lane_ids(lane_ids)
+        for lane_id in lane_ids:
+            self._validate_physical_lane_id(lane_id)
+            if self._lane_to_request[lane_id] is not None:
+                raise RuntimeError(f"Cannot write into active AE lane {lane_id}")
+        _validate_batch_feature(feature, len(lane_ids))
+        self._ensure_initialized(_prefix_feature_row_view(feature, 0))
+        slab_tree = write_feature_batch_to_slab_tree(self._backend, self.local_slab_tree(), lane_ids, feature)
+        self._past_slabs = slab_tree["past_key_values"]
+        self._prefix_pad_masks = slab_tree["prefix_pad_masks"]
+        self._state = slab_tree["state"]
 
     def put_lane(self, request_id: str, feature: JaxPrefixFeature) -> int:
         if request_id in self._request_to_lane:
@@ -287,6 +302,33 @@ def _copy_tree_lane(
     raise TypeError(f"Unsupported JAX slab tree node: {type(slabs)}")
 
 
+def _copy_tree_batch(
+    backend: DeviceSlabBackend,
+    slabs: Any,
+    value: Any,
+    lane_start: int,
+    *,
+    sync: bool = True,
+) -> Any:
+    if isinstance(slabs, DeviceSlab):
+        return backend.copy_batch_from_array(slabs, lane_start, value, sync=sync)
+    if isinstance(slabs, tuple):
+        return tuple(
+            _copy_tree_batch(backend, slab, item, lane_start, sync=sync)
+            for slab, item in zip(slabs, value, strict=True)
+        )
+    if isinstance(slabs, list):
+        return [
+            _copy_tree_batch(backend, slab, item, lane_start, sync=sync)
+            for slab, item in zip(slabs, value, strict=True)
+        ]
+    if isinstance(slabs, dict):
+        return {
+            key: _copy_tree_batch(backend, slabs[key], value[key], lane_start, sync=sync) for key in slabs
+        }
+    raise TypeError(f"Unsupported JAX slab tree node: {type(slabs)}")
+
+
 def _view_tree_batch(backend: DeviceSlabBackend, slabs: Any, batch_size: int) -> Any:
     if isinstance(slabs, DeviceSlab):
         return backend.view_batch(slabs, batch_size)
@@ -337,6 +379,14 @@ def _row_view_tree(value: Any, row: int, *, axis: int) -> Any:
     raise TypeError(f"Unsupported JAX prefix tree node: {type(value)}")
 
 
+def _prefix_feature_row_view(feature: JaxPrefixFeature, row: int) -> JaxPrefixFeature:
+    return JaxPrefixFeature(
+        past_key_values=_row_view_tree(feature.past_key_values, row, axis=1),
+        prefix_pad_masks=feature.prefix_pad_masks[row : row + 1],
+        state=feature.state[row : row + 1] if feature.state is not None else None,
+    )
+
+
 def _validate_single_row_feature(feature: JaxPrefixFeature) -> None:
     _validate_single_row_tree(feature.past_key_values)
     if feature.prefix_pad_masks.shape[0] != 1:
@@ -359,6 +409,43 @@ def _validate_single_row_tree(value: Any) -> None:
             _validate_single_row_tree(item)
         return
     raise TypeError(f"Unsupported JAX prefix tree node: {type(value)}")
+
+
+def _validate_batch_feature(feature: JaxPrefixFeature, batch_size: int) -> None:
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+    _validate_batch_tree(feature.past_key_values, batch_size)
+    if feature.prefix_pad_masks.shape[0] != batch_size:
+        raise ValueError(
+            f"prefix_pad_masks must have batch size {batch_size}, got {feature.prefix_pad_masks.shape}"
+        )
+    if feature.state is not None and feature.state.shape[0] != batch_size:
+        raise ValueError(f"state must have batch size {batch_size}, got {feature.state.shape}")
+
+
+def _validate_batch_tree(value: Any, batch_size: int) -> None:
+    if isinstance(value, jax.Array):
+        if value.ndim < 2 or value.shape[1] != batch_size:
+            raise ValueError(f"prefix tree array must have batch size {batch_size} on axis 1, got {value.shape}")
+        return
+    if isinstance(value, (tuple, list)):
+        for item in value:
+            _validate_batch_tree(item, batch_size)
+        return
+    if isinstance(value, dict):
+        for item in value.values():
+            _validate_batch_tree(item, batch_size)
+        return
+    raise TypeError(f"Unsupported JAX prefix tree node: {type(value)}")
+
+
+def _validate_contiguous_lane_ids(lane_ids: tuple[int, ...]) -> None:
+    if not lane_ids:
+        raise ValueError("lane_ids must be non-empty")
+    start = int(lane_ids[0])
+    expected = tuple(range(start, start + len(lane_ids)))
+    if tuple(int(lane_id) for lane_id in lane_ids) != expected:
+        raise ValueError(f"lane_ids must be contiguous, got {lane_ids}")
 
 
 def _validate_tree_compatible(slabs: Any, value: Any) -> None:
@@ -418,6 +505,37 @@ def write_feature_to_slab_tree(
         if feature.state is None:
             raise ValueError("slab tree has state but feature.state is None")
         state = backend.copy_lane_from_array(state, lane_id, feature.state, sync=False)
+    elif feature.state is not None:
+        raise ValueError("feature has state but slab tree state is None")
+    backend.sync_write_stream()
+    return {
+        "past_key_values": past,
+        "prefix_pad_masks": masks,
+        "state": state,
+    }
+
+
+def write_feature_batch_to_slab_tree(
+    backend: DeviceSlabBackend,
+    slab_tree: dict[str, Any],
+    lane_ids: tuple[int, ...],
+    feature: JaxPrefixFeature,
+) -> dict[str, Any]:
+    """Write a contiguous prefix batch into an opened (possibly IPC) slab tree."""
+    _validate_contiguous_lane_ids(lane_ids)
+    _validate_batch_feature(feature, len(lane_ids))
+    lane_start = int(lane_ids[0])
+    past = _copy_tree_batch(
+        backend, slab_tree["past_key_values"], feature.past_key_values, lane_start, sync=False
+    )
+    masks = backend.copy_batch_from_array(
+        slab_tree["prefix_pad_masks"], lane_start, feature.prefix_pad_masks, sync=False
+    )
+    state = slab_tree["state"]
+    if state is not None:
+        if feature.state is None:
+            raise ValueError("slab tree has state but feature.state is None")
+        state = backend.copy_batch_from_array(state, lane_start, feature.state, sync=False)
     elif feature.state is not None:
         raise ValueError("feature has state but slab tree state is None")
     backend.sync_write_stream()

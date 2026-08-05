@@ -18,6 +18,7 @@ def test_run_va_split_mps_defaults_to_libero_env_python():
     assert 'WARMUP_REQUESTS="${WARMUP_REQUESTS:-2}"' in script
     assert 'BATCH_SIZE="${BATCH_SIZE:-${MAX_VLM_BATCH_SIZE}}"' in script
     assert 'ENABLE_POLICY_BATCH="${ENABLE_POLICY_BATCH:-true}"' in script
+    assert 'ENABLE_COMPONENT_TIMING="${ENABLE_COMPONENT_TIMING:-true}"' in script
     assert 'VA_SPLIT_MAX_VLM_BATCH_SIZE="${VA_SPLIT_MAX_VLM_BATCH_SIZE:-8}"' in script
     assert 'VA_SPLIT_MAX_VLM_WAIT_MS="${VA_SPLIT_MAX_VLM_WAIT_MS:-1.0}"' in script
     assert 'PYTORCH_COMPILE_MODE="${PYTORCH_COMPILE_MODE:-}"' in script
@@ -80,6 +81,7 @@ def test_run_va_split_mps_profile_mode_invokes_profile_workload(tmp_path):
     assert _flag_value(args, "--timeout-s") == "9"
     assert _flag_value(args, "--warmup-requests") == "2"
     assert _flag_value(args, "--pytorch-compile-mode") == "default"
+    assert "--enable-component-timing" in args
     assert _flag_value(args, "--max-vlm-batch-size") == "13"
     assert _flag_value(args, "--max-vlm-wait-ms") == "1.5"
     assert _flag_value(args, "--gpu-device-index") == "5"
@@ -102,6 +104,48 @@ def test_run_va_split_mps_profile_mode_invokes_profile_workload(tmp_path):
     assert "MAX_VLM_WAIT_MS=1.5" in gpu_binding
     assert "BATCH_SIZE=3" in gpu_binding
     assert "ENABLE_POLICY_BATCH=true" in gpu_binding
+    assert "ENABLE_COMPONENT_TIMING=true" in gpu_binding
+
+
+def test_run_va_split_mps_profile_can_disable_component_timing(tmp_path):
+    repo_root = pathlib.Path(__file__).resolve().parents[3]
+    python_arg_log = tmp_path / "python_args.txt"
+    mps_arg_log = tmp_path / "mps_args.txt"
+    bin_dir = _prepare_stub_tools(tmp_path, python_arg_log=python_arg_log, mps_arg_log=mps_arg_log)
+
+    log_root = tmp_path / "logs"
+    env = os.environ.copy()
+    env.update(
+        {
+            "PATH": f"{bin_dir}:{env['PATH']}",
+            "PYTHON_BIN": "python",
+            "PYTHON_ARG_LOG": str(python_arg_log),
+            "MPS_ARG_LOG": str(mps_arg_log),
+            "RUN_MODE": "profile",
+            "PROFILE_MODE": "monolithic",
+            "GPU_ID": "5",
+            "RUN_TS": "no_component_timing",
+            "LOG_ROOT": str(log_root),
+            "ENABLE_COMPONENT_TIMING": "false",
+            "PYTORCH_COMPILE_MODE": "default",
+        }
+    )
+
+    result = subprocess.run(
+        ["bash", "scripts/run_va_split_mps.sh"],
+        cwd=repo_root,
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    args = python_arg_log.read_text(encoding="utf-8").splitlines()
+    assert "--no-enable-component-timing" in args
+    gpu_binding = (log_root / "no_component_timing" / "gpu_binding.log").read_text(encoding="utf-8")
+    assert "ENABLE_COMPONENT_TIMING=false" in gpu_binding
 
 
 def test_run_va_split_mps_profile_can_run_monolithic_baseline_without_mps(tmp_path):
@@ -185,6 +229,7 @@ def test_run_va_split_mps_server_forwards_safe_compile_mode(tmp_path):
     assert _flag_value(args, "--va-split-max-vlm-batch-size") == "5"
     assert _flag_value(args, "--va-split-max-vlm-wait-ms") == "0.5"
     assert "--no-enable-policy-batch" in args
+    assert "--enable-component-timing" in args
 
 
 def _prepare_stub_tools(
@@ -216,6 +261,9 @@ if [[ $# -gt 0 ]]; then
   for arg in "$@"; do
     printf '%s\n' "$arg"
   done >>"${MPS_ARG_LOG}"
+  if [[ "$*" == *"-d"* ]]; then
+    touch "${CUDA_MPS_PIPE_DIRECTORY}/control_lock"
+  fi
 else
   cat >/dev/null || true
   printf 'stdin\n' >>"${MPS_ARG_LOG}"

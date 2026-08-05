@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import queue
+import time
 
 import jax
 import jax.numpy as jnp
@@ -23,11 +24,13 @@ from openpi.serving.va_split_jax.vlm_process import _vlm_request_queue_timings
 class FakeJaxSplitModel:
     def __init__(self):
         self.prefix_batch_sizes: list[int] = []
+        self.image_dtypes: list[dict[str, str]] = []
 
     def build_prefix_feature(self, rng, observation):
         del rng
         batch = int(observation.state.shape[0])
         self.prefix_batch_sizes.append(batch)
+        self.image_dtypes.append({key: str(value.dtype) for key, value in observation.images.items()})
         return JaxPrefixFeature(
             past_key_values=(
                 jnp.ones((3, batch, 2, 4), dtype=jnp.float32),
@@ -58,6 +61,35 @@ class SimpleQueue:
         self.items.append(item)
 
 
+class SlowFeederQueue:
+    def __init__(self, messages=(), *, message_delay_s: float):
+        self._messages = list(messages)
+        self._message_delay_s = message_delay_s
+        self._next_ready_s = 0.0
+
+    def get(self, timeout=None):
+        if not self._messages:
+            raise queue.Empty
+        now_s = time.monotonic()
+        wait_s = self._next_ready_s - now_s
+        if wait_s > 0:
+            if timeout is not None and timeout < wait_s:
+                time.sleep(timeout)
+                raise queue.Empty
+            time.sleep(wait_s)
+        return self._pop_ready()
+
+    def get_nowait(self):
+        if not self._messages or time.monotonic() < self._next_ready_s:
+            raise queue.Empty
+        return self._pop_ready()
+
+    def _pop_ready(self):
+        message = self._messages.pop(0)
+        self._next_ready_s = time.monotonic() + self._message_delay_s
+        return message
+
+
 def _request_observation(*, prompt_len: int = 8) -> dict:
     image = jnp.zeros((1, 224, 224, 3), dtype=jnp.float32)
     return {
@@ -77,12 +109,12 @@ def _request_observation(*, prompt_len: int = 8) -> dict:
     }
 
 
-def _request(request_id: str, *, prompt_len: int = 8) -> JaxRequestEnvelope:
+def _request(request_id: str, *, prompt_len: int = 8, enqueue_ns: int = 123) -> JaxRequestEnvelope:
     return JaxRequestEnvelope(
         request_id=request_id,
         observation=_request_observation(prompt_len=prompt_len),
         sample_kwargs={"num_steps": 4},
-        enqueue_ns=123,
+        enqueue_ns=enqueue_ns,
     )
 
 
@@ -128,6 +160,11 @@ def test_jax_vlm_worker_writes_ae_lane_and_recycles_credit_on_release():
     assert ready.timing["vlm_observation_stack_ms"] >= 0.0
     assert ready.timing["vlm_to_jax_tree_ms"] >= 0.0
     assert ready.timing["vlm_observation_from_dict_ms"] >= 0.0
+    assert ready.timing["vlm_observation_uint8_normalize_ms"] >= 0.0
+    assert ready.timing["vlm_observation_construct_ms"] >= 0.0
+    assert ready.timing["vlm_observation_uint8_images"] == 0.0
+    assert ready.timing["vlm_observation_float32_images"] == 3.0
+    assert ready.timing["vlm_observation_other_images"] == 0.0
     assert ready.timing["vlm_batch_wait_ms"] >= 0.0
     assert ready.timing["vlm_queue_wait_ms"] == ready.timing["vlm_batch_wait_ms"]
     assert worker.available_live_feature_slots == 1
@@ -152,6 +189,47 @@ def test_jax_vlm_input_stage_keeps_uint8_until_observation_from_dict():
     staged = _asarray_model_input(np.zeros((1, 224, 224, 3), dtype=np.uint8))
 
     assert staged.dtype == jnp.uint8
+
+
+def test_jax_vlm_input_stage_keeps_existing_jax_arrays_on_device():
+    array = jnp.zeros((2, 4), dtype=jnp.float32)
+
+    staged = _asarray_model_input(array)
+
+    assert staged is array
+
+
+def test_jax_vlm_worker_normalizes_unexpected_uint8_images_before_model():
+    model = FakeJaxSplitModel()
+    pool = _shared_pool(max_lanes=2)
+    worker = JaxVLMWorker(
+        model=model,
+        max_live_features=2,
+        backend=make_default_device_slab_backend(),
+        shared_pool=pool,
+    )
+    worker.attach_shared_pool(pool, JaxLaneCredits(lane_ids=(0, 1)))
+    obs = _request_observation()
+    image = np.zeros((1, 224, 224, 3), dtype=np.uint8)
+    obs["image"] = {
+        "base_0_rgb": image,
+        "left_wrist_0_rgb": image,
+        "right_wrist_0_rgb": image,
+    }
+
+    ready = worker.handle_request(
+        JaxRequestEnvelope(
+            request_id="req-uint8",
+            observation=obs,
+            sample_kwargs={"num_steps": 4},
+            enqueue_ns=123,
+        )
+    )
+
+    assert ready.timing is not None
+    assert ready.timing["vlm_observation_uint8_images"] == 3.0
+    assert ready.timing["vlm_observation_float32_images"] == 0.0
+    assert all(dtype == "float32" for dtype in model.image_dtypes[-1].values())
 
 
 def test_jax_vlm_process_fcfs_batches_compatible_requests_without_slab_export():
@@ -179,6 +257,66 @@ def test_jax_vlm_process_fcfs_batches_compatible_requests_without_slab_export():
     assert [item.request_id for item in ready] == ["req-1", "req-2"]
     assert [item.slot_handle.slot_id for item in ready] == [0, 1]
     assert [item.timing["vlm_effective_batch"] for item in ready] == [2.0, 2.0]
+    assert [item.timing["vlm_slab_write_contiguous_batch"] for item in ready] == [1.0, 1.0]
+    assert all(item.timing["vlm_slab_write_total_ms"] >= item.timing["vlm_slab_write_ms"] for item in ready)
+    assert isinstance(prefix_queue.items[-1], JaxShutdown)
+
+
+def test_jax_vlm_process_fcfs_drains_pending_credits_before_fixing_batch_limit():
+    model = FakeJaxSplitModel()
+    pool = _shared_pool(max_lanes=4)
+    request_queue = SimpleQueue([_request(f"req-{idx}") for idx in range(4)] + [JaxShutdown()])
+    prefix_queue = SimpleQueue()
+    process = JaxVLMProcess(
+        model=model,
+        request_queue=request_queue,
+        prefix_queue=prefix_queue,
+        release_queue=SimpleQueue([JaxLaneCredits(lane_ids=(1, 2, 3))]),
+        max_batch_size=4,
+        max_wait_ms=0.0,
+        max_live_features=4,
+        shared_pool=pool,
+    )
+    process.worker.attach_shared_pool(pool, JaxLaneCredits(lane_ids=(0,)))
+    process._ae_export_ready = True
+
+    process.run()
+
+    ready = [item for item in prefix_queue.items if isinstance(item, JaxPrefixReady)]
+    assert model.prefix_batch_sizes == [4]
+    assert [item.request_id for item in ready] == [f"req-{idx}" for idx in range(4)]
+    assert [item.slot_handle.slot_id for item in ready] == [0, 1, 2, 3]
+    assert [item.timing["vlm_slab_write_contiguous_batch"] for item in ready] == [1.0] * 4
+
+
+def test_jax_vlm_process_fcfs_drains_slow_feeder_when_head_request_is_already_late():
+    model = FakeJaxSplitModel()
+    pool = _shared_pool(max_lanes=8)
+    old_enqueue_ns = time.monotonic_ns() - 50_000_000
+    request_queue = SlowFeederQueue(
+        [_request(f"req-{idx}", enqueue_ns=old_enqueue_ns) for idx in range(8)] + [JaxShutdown()],
+        message_delay_s=0.0015,
+    )
+    prefix_queue = SimpleQueue()
+    process = JaxVLMProcess(
+        model=model,
+        request_queue=request_queue,
+        prefix_queue=prefix_queue,
+        release_queue=SimpleQueue(),
+        max_batch_size=8,
+        max_wait_ms=1.0,
+        max_live_features=8,
+        shared_pool=pool,
+    )
+    process.worker.attach_shared_pool(pool, JaxLaneCredits(lane_ids=tuple(range(8))))
+    process._ae_export_ready = True
+
+    process.run()
+
+    ready = [item for item in prefix_queue.items if isinstance(item, JaxPrefixReady)]
+    assert model.prefix_batch_sizes == [8]
+    assert [item.request_id for item in ready] == [f"req-{idx}" for idx in range(8)]
+    assert [item.timing["vlm_effective_batch"] for item in ready] == [8.0] * 8
     assert isinstance(prefix_queue.items[-1], JaxShutdown)
 
 

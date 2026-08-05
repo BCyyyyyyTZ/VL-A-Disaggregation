@@ -78,7 +78,7 @@ def test_create_checkpoint_policy_forwards_pytorch_device_to_va_split(monkeypatc
     )
 
     policy = serve_policy._create_checkpoint_policy(
-        serve_policy.Args(va_split=True, pytorch_device="cuda:0"),
+        serve_policy.Args(va_split=True, pytorch_device="cuda:0", enable_component_timing=False),
         serve_policy.Checkpoint(config="pi05_libero", dir="/tmp/checkpoint"),
     )
 
@@ -88,6 +88,7 @@ def test_create_checkpoint_policy_forwards_pytorch_device_to_va_split(monkeypatc
     assert calls["pytorch_device"] == "cuda:0"
     assert calls["max_vlm_batch_size"] == 8
     assert calls["max_vlm_wait_ms"] == 2.0
+    assert calls["enable_component_timing"] is False
 
 
 def test_create_checkpoint_policy_allows_explicit_pytorch_compile_opt_in(monkeypatch):

@@ -97,8 +97,26 @@ class DeviceSlabBackend:
     ) -> DeviceSlab:
         del sync  # JAX local path has no write stream; always complete the update.
         _validate_lane_update(slab, lane_id, value)
+        value = _storage_value_for_spec(value, slab.spec)
         update = jax.lax.dynamic_update_slice_in_dim(
             slab.array, value, lane_id, axis=slab.spec.normalized_lane_axis
+        )
+        update.block_until_ready()
+        return DeviceSlab(slab.spec, update, slab.handle, slab._close_stack)
+
+    def copy_batch_from_array(
+        self,
+        slab: DeviceSlab,
+        lane_start: int,
+        value: jax.Array,
+        *,
+        sync: bool = True,
+    ) -> DeviceSlab:
+        del sync  # JAX local path has no write stream; always complete the update.
+        _validate_batch_update(slab, lane_start, value)
+        value = _storage_value_for_spec(value, slab.spec)
+        update = jax.lax.dynamic_update_slice_in_dim(
+            slab.array, value, lane_start, axis=slab.spec.normalized_lane_axis
         )
         update.block_until_ready()
         return DeviceSlab(slab.spec, update, slab.handle, slab._close_stack)
@@ -195,6 +213,29 @@ class CudaIpcDeviceSlabBackend(DeviceSlabBackend):
             stream.synchronize()
         return slab
 
+    def copy_batch_from_array(
+        self,
+        slab: DeviceSlab,
+        lane_start: int,
+        value: jax.Array,
+        *,
+        sync: bool = True,
+    ) -> DeviceSlab:
+        """Copy a contiguous batch into an IPC slab with one kernel per leaf."""
+        _validate_batch_update(slab, lane_start, value)
+        if slab.handle.transport != self.transport:
+            raise RuntimeError(f"expected {self.transport!r} slab, got {slab.handle.transport!r}")
+        value.block_until_ready()
+        device_ordinal = int(slab.handle.device_ordinal)
+        cuda.select_device(device_ordinal)
+        stream = self._write_stream(device_ordinal)
+        dst = cuda.from_cuda_array_interface(_cuda_array_interface_for_array(slab.array), owner=slab)
+        src = cuda.from_cuda_array_interface(_cuda_array_interface_for_array(value), owner=value)
+        _copy_batch_with_kernel(dst, src, lane_start, slab.spec, stream=stream)
+        if sync:
+            stream.synchronize()
+        return slab
+
     def sync_write_stream(self, device_ordinal: int | None = None) -> None:
         """Synchronize the dedicated lane-write stream (not the whole device)."""
         ordinal = self._device_ordinal if device_ordinal is None else device_ordinal
@@ -282,6 +323,26 @@ def _validate_lane_update(slab: DeviceSlab, lane_id: int, value: jax.Array) -> N
         raise ValueError(f"lane update dtype must be {slab.spec.dtype}, got {value.dtype}")
 
 
+def _validate_batch_update(slab: DeviceSlab, lane_start: int, value: jax.Array) -> None:
+    axis = slab.spec.normalized_lane_axis
+    if lane_start < 0 or lane_start >= slab.spec.max_lanes:
+        raise ValueError(f"lane_start {lane_start} outside slab capacity {slab.spec.max_lanes}")
+    batch_lanes = int(value.shape[axis])
+    if batch_lanes <= 0:
+        raise ValueError("batch update must contain at least one lane")
+    if lane_start + batch_lanes > slab.spec.max_lanes:
+        raise ValueError(
+            f"batch update lanes [{lane_start}, {lane_start + batch_lanes}) exceed slab capacity "
+            f"{slab.spec.max_lanes}"
+        )
+    expected_shape = list(slab.spec.shape)
+    expected_shape[axis] = batch_lanes
+    if tuple(value.shape) != tuple(expected_shape):
+        raise ValueError(f"batch update shape must be {tuple(expected_shape)}, got {tuple(value.shape)}")
+    if np.dtype(value.dtype) != np.dtype(slab.spec.dtype):
+        raise ValueError(f"batch update dtype must be {slab.spec.dtype}, got {value.dtype}")
+
+
 def _is_gpu_array(array: jax.Array) -> bool:
     return len(array.devices()) == 1 and next(iter(array.devices())).platform == "gpu"
 
@@ -313,6 +374,12 @@ def _storage_dtype_for_jax_dtype(dtype: Any) -> np.dtype:
     if dtype == np.dtype(jnp.bfloat16):
         return np.dtype(np.uint16)
     return dtype
+
+
+def _storage_value_for_spec(value: jax.Array, spec: DeviceSlabSpec) -> jax.Array:
+    if np.dtype(spec.dtype) == np.dtype(jnp.bfloat16):
+        return jax.lax.bitcast_convert_type(value, jnp.uint16)
+    return value
 
 
 def _logical_view_for_spec(array: jax.Array, spec: DeviceSlabSpec) -> jax.Array:
@@ -369,6 +436,30 @@ def _copy_lane_with_kernel(
         )
 
 
+def _copy_batch_with_kernel(
+    dst: Any,
+    src: Any,
+    lane_start: int,
+    spec: DeviceSlabSpec,
+    *,
+    stream: Any | None = None,
+) -> None:
+    axis = spec.normalized_lane_axis
+    batch_lanes = int(src.shape[axis])
+    inner_elems = int(np.prod(spec.shape[axis + 1 :], dtype=np.int64))
+    total_elems = int(np.prod(src.shape, dtype=np.int64))
+    threads_per_block = 256
+    blocks = (total_elems + threads_per_block - 1) // threads_per_block
+    if stream is None:
+        _copy_batch_kernel[blocks, threads_per_block](
+            dst, src, total_elems, lane_start, spec.max_lanes, batch_lanes, inner_elems
+        )
+    else:
+        _copy_batch_kernel[blocks, threads_per_block, stream](
+            dst, src, total_elems, lane_start, spec.max_lanes, batch_lanes, inner_elems
+        )
+
+
 @cuda.jit
 def _copy_lane_kernel(dst, src, total_elems, lane_id, lane_axis_size, inner_elems):  # pragma: no cover
     index = cuda.grid(1)
@@ -377,6 +468,21 @@ def _copy_lane_kernel(dst, src, total_elems, lane_id, lane_axis_size, inner_elem
     outer = index // inner_elems
     inner = index - outer * inner_elems
     dst_index = outer * lane_axis_size * inner_elems + lane_id * inner_elems + inner
+    dst.flat[dst_index] = src.flat[index]
+
+
+@cuda.jit
+def _copy_batch_kernel(  # pragma: no cover
+    dst, src, total_elems, lane_start, lane_axis_size, batch_lanes, inner_elems
+):
+    index = cuda.grid(1)
+    if index >= total_elems:
+        return
+    outer = index // (batch_lanes * inner_elems)
+    rem = index - outer * batch_lanes * inner_elems
+    lane = rem // inner_elems
+    inner = rem - lane * inner_elems
+    dst_index = outer * lane_axis_size * inner_elems + (lane_start + lane) * inner_elems + inner
     dst.flat[dst_index] = src.flat[index]
 
 

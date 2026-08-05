@@ -8,8 +8,10 @@ import os
 import queue
 import threading
 import time
+from typing import Any
 import uuid
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 
@@ -28,6 +30,7 @@ from openpi.serving.va_split_jax.device_slab import make_default_device_slab_bac
 from openpi.serving.va_split_jax.prefix_cache_pool import JaxVlmPrefixCacheLanePool
 from openpi.serving.va_split_jax.timing import queue_wait_and_transfer_ms
 from openpi.serving.va_split_jax.timing import timed_queue_get
+from openpi.serving.va_split_jax.types import JaxActionBatchRow
 from openpi.serving.va_split_jax.types import JaxActionResult
 from openpi.serving.va_split_jax.types import JaxBatchRequestEnvelope
 from openpi.serving.va_split_jax.types import JaxCompileWarmupDone
@@ -101,7 +104,7 @@ class JaxLocalVASplitRuntime:
                 self.vlm_worker.release(release)
             for result in results:
                 if result.request_id == request_id:
-                    return result
+                    return replace(result, actions=_result_actions_array(result.actions))
         raise RuntimeError(f"Request {request_id} finished without an action result")
 
     def infer_batch(self, observation: dict, sample_kwargs: dict) -> JaxActionResult:
@@ -471,9 +474,15 @@ def _combine_ordered_results(
     results_by_id: dict[str, JaxActionResult],
 ) -> JaxActionResult:
     ordered = [results_by_id[request_id] for request_id in request_ids]
-    actions = jnp.concatenate([jnp.asarray(result.actions) for result in ordered], axis=0)
+    actions = jnp.concatenate([_result_actions_array(result.actions) for result in ordered], axis=0)
     timing = _aggregate_batch_timing([dict(result.timing or {}) for result in ordered], batch_size=len(request_ids))
     return JaxActionResult(request_id=batch_id, actions=actions, timing=timing)
+
+
+def _result_actions_array(actions: Any) -> jax.Array:
+    if isinstance(actions, JaxActionBatchRow):
+        return jnp.asarray(actions.batch[actions.row : actions.row + 1])
+    return jnp.asarray(actions)
 
 
 def _aggregate_batch_timing(row_timings: list[dict[str, float]], *, batch_size: int) -> dict[str, float]:
@@ -490,11 +499,34 @@ def _aggregate_batch_timing(row_timings: list[dict[str, float]], *, batch_size: 
         "vlm_observation_stack_ms",
         "vlm_to_jax_tree_ms",
         "vlm_observation_from_dict_ms",
+        "vlm_observation_uint8_normalize_ms",
+        "vlm_observation_construct_ms",
+        "vlm_observation_uint8_images",
+        "vlm_observation_float32_images",
+        "vlm_observation_other_images",
         "vlm_effective_batch",
         "vlm_slab_write_ms",
+        "vlm_slab_write_total_ms",
+        "vlm_slab_write_contiguous_batch",
+        "vlm_slab_write_rows",
         "ae_init_denoise_ms",
+        "ae_init_denoise_noise_fast_path",
         "ae_step_ms",
         "ae_step_total_ms",
+        "ae_prefix_view_ms",
+        "ae_prefix_view_cache_hit",
+        "ae_prefix_view_total_ms",
+        "ae_state_batch_stage_ms",
+        "ae_state_batch_stage_total_ms",
+        "ae_denoise_enqueue_ms",
+        "ae_denoise_enqueue_total_ms",
+        "ae_update_stage_ms",
+        "ae_update_stage_total_ms",
+        "ae_complete_block_ms",
+        "ae_complete_block_total_ms",
+        "ae_result_slice_ms",
+        "ae_result_slice_total_ms",
+        "ae_result_device_get_ms",
         "prefix_slab_map_ms",
         "prefix_lane_ingest_ms",
     ):

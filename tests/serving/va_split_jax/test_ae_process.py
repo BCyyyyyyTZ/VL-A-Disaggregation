@@ -17,6 +17,7 @@ from openpi.serving.va_split_jax.ae_process import JaxAEProcess
 from openpi.serving.va_split_jax.ae_process import JaxAEWorker
 from openpi.serving.va_split_jax.device_slab import make_default_device_slab_backend
 from openpi.serving.va_split_jax.prefix_cache_pool import JaxVlmPrefixCacheLanePool
+from openpi.serving.va_split_jax.types import JaxActionBatchRow
 from openpi.serving.va_split_jax.types import JaxLaneCredits
 from openpi.serving.va_split_jax.types import JaxPrefixReady
 from openpi.serving.va_split_jax.types import JaxPrefixSlabReady
@@ -30,9 +31,11 @@ class FakeJaxAEModel:
         self.config = SimpleNamespace(action_horizon=2, action_dim=1)
         self.batch_sizes: list[int] = []
         self.prefix_slot_batch_shapes: list[tuple[int, ...]] = []
+        self.init_denoise_calls = 0
 
     def init_denoise_state(self, rng, batch_size: int, noise: jax.Array | None, num_steps: int) -> JaxDenoiseState:
         del rng
+        self.init_denoise_calls += 1
         if noise is None:
             noise = jnp.zeros((batch_size, self.config.action_horizon, self.config.action_dim), dtype=jnp.float32)
         return JaxDenoiseState(
@@ -110,6 +113,12 @@ def _ready(request_id: str, slot_id: int, *, num_steps: int = 1) -> JaxPrefixRea
     )
 
 
+def _actions_array(actions):
+    if isinstance(actions, JaxActionBatchRow):
+        return actions.batch[actions.row : actions.row + 1]
+    return actions
+
+
 def test_jax_ae_worker_batches_two_ready_requests_for_two_denoise_steps():
     model = FakeJaxAEModel()
     backend, pool = _owned_pool_with_written_lanes(1.0, 2.0)
@@ -128,17 +137,24 @@ def test_jax_ae_worker_batches_two_ready_requests_for_two_denoise_steps():
     assert [result.request_id for result in second_results] == ["req-1", "req-2"]
     assert [release.request_id for release in second_releases] == ["req-1", "req-2"]
     for result in second_results:
-        np.testing.assert_allclose(result.actions, -jnp.ones((1, 2, 1), dtype=jnp.float32))
+        np.testing.assert_allclose(_actions_array(result.actions), -jnp.ones((1, 2, 1), dtype=jnp.float32))
         assert result.timing is not None
         assert result.timing["ae_effective_batch"] == 2.0
         assert result.timing["ae_init_denoise_ms"] >= 0.0
+        assert result.timing["ae_prefix_view_ms"] >= 0.0
+        assert result.timing["ae_prefix_view_cache_hit"] == pytest.approx(0.5)
+        assert result.timing["ae_state_batch_stage_ms"] >= 0.0
+        assert result.timing["ae_denoise_enqueue_ms"] >= 0.0
+        assert result.timing["ae_update_stage_ms"] >= 0.0
+        assert result.timing["ae_complete_block_ms"] >= 0.0
         assert result.timing["prefix_lane_ingest_ms"] == 0.0
         assert result.timing["prefix_pool_compact_ms"] >= 0.0
 
 
 def test_jax_ae_worker_accepts_host_noise_from_prefix_ready():
+    model = FakeJaxAEModel()
     backend, pool = _owned_pool_with_written_lanes(1.0)
-    worker = JaxAEWorker(model=FakeJaxAEModel(), max_batch_size=1, max_prefix_slots=4, backend=backend, owned_pool=pool)
+    worker = JaxAEWorker(model=model, max_batch_size=1, max_prefix_slots=4, backend=backend, owned_pool=pool)
     worker.attach_initialized_pool(pool)
     ready = dataclasses.replace(
         _ready("req-1", 0, num_steps=1),
@@ -149,7 +165,9 @@ def test_jax_ae_worker_accepts_host_noise_from_prefix_ready():
     results, releases = worker.step_once()
 
     assert [release.request_id for release in releases] == ["req-1"]
-    np.testing.assert_allclose(results[0].actions, np.full((1, 2, 1), 2.0, dtype=np.float32))
+    np.testing.assert_allclose(_actions_array(results[0].actions), np.full((1, 2, 1), 2.0, dtype=np.float32))
+    assert model.init_denoise_calls == 0
+    assert results[0].timing["ae_init_denoise_noise_fast_path"] == 1.0
 
 
 def test_jax_ae_worker_compacts_locally_without_slot_moved():

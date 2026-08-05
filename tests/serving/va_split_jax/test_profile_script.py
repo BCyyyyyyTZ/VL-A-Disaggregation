@@ -17,9 +17,9 @@ def test_run_profile_va_split_jax_defaults_and_invocation(tmp_path):
     assert os.access(script_path, os.X_OK)
     assert 'MODE="${MODE:-jax-split-ipc}"' in script
     assert 'POLICY_CONFIG="${POLICY_CONFIG:-pi05_libero}"' in script
-    assert 'PYTHON_BIN="${PYTHON_BIN:-${REPO_ROOT}/.venv/bin/python}"' in script
-    assert 'POLICY_DIR="${POLICY_DIR:-/data/miliang/huggingface/hub/openpi-assets/checkpoints/pi05_libero}"' in script
-    assert 'LOG_ROOT="${LOG_ROOT:-${REPO_ROOT}/logs}"' in script
+    assert 'PYTHON_BIN="${PYTHON_BIN:-/data1/miliang/RLinf/openpi_libero/bin/python}"' in script
+    assert 'POLICY_DIR="${POLICY_DIR:-/data1/miliang/models/pi05_libero}"' in script
+    assert 'LOG_ROOT="${LOG_ROOT:-/data1/miliang/VL-A-Disaggregation/logs/JAX}"' in script
     assert 'JAX_COMPILE="${JAX_COMPILE:-1}"' in script
     assert 'JAX_COMPILE_WARMUP="${JAX_COMPILE_WARMUP:-1}"' in script
     assert 'JAX_COMPILE_WARMUP_MAX_BATCH_SIZE="${JAX_COMPILE_WARMUP_MAX_BATCH_SIZE:-$((MAX_VLM_BATCH_SIZE * 3))}"' in script
@@ -44,14 +44,7 @@ set -euo pipefail
 : "${MPS_ARG_LOG:?}"
 if [[ $# -gt 0 ]]; then
   printf '%s\n' "$@" >>"${MPS_ARG_LOG}"
-  /usr/bin/python3 - <<'PY'
-import os
-import socket
-
-path = os.path.join(os.environ["CUDA_MPS_PIPE_DIRECTORY"], "control")
-sock = socket.socket(socket.AF_UNIX)
-sock.bind(path)
-PY
+  touch "${CUDA_MPS_PIPE_DIRECTORY}/control_lock"
 else
   cat >/dev/null || true
   printf 'stdin\n' >>"${MPS_ARG_LOG}"
@@ -99,7 +92,7 @@ fi
     assert args[:2] == [str(repo_root / "scripts/profile_va_split.py"), "--policy.config"]
     assert _flag_value(args, "--policy.config") == "pi05_libero"
     assert _flag_value(args, "--mode") == "jax-split-ipc"
-    assert _flag_value(args, "--policy.dir") == "/data/miliang/huggingface/hub/openpi-assets/checkpoints/pi05_libero"
+    assert _flag_value(args, "--policy.dir") == "/data1/miliang/models/pi05_libero"
     assert _flag_value(args, "--ae-sm-percent") == "20"
     assert _flag_value(args, "--vlm-sm-percent") == "0"
     assert _flag_value(args, "--jax-compile-warmup-max-batch-size") == "24"

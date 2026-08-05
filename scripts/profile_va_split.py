@@ -115,6 +115,7 @@ class Args:
     slo_ms: float = 200.0
     pytorch_device: str | None = None
     pytorch_compile_mode: CompileMode | None = None
+    enable_component_timing: bool = True
     max_ae_batch_size: int = 8
     max_vlm_batch_size: int = 8
     max_vlm_wait_ms: float = 2.0
@@ -565,6 +566,19 @@ def summarize_traces(
         "vlm_observation_from_dict_mean_ms": _timing_mean(completed, "vlm_observation_from_dict_ms"),
         "vlm_observation_from_dict_p50_ms": _timing_percentile(completed, "vlm_observation_from_dict_ms", 50),
         "vlm_observation_from_dict_p95_ms": _timing_percentile(completed, "vlm_observation_from_dict_ms", 95),
+        "vlm_observation_uint8_normalize_mean_ms": _timing_mean(completed, "vlm_observation_uint8_normalize_ms"),
+        "vlm_observation_uint8_normalize_p50_ms": _timing_percentile(
+            completed, "vlm_observation_uint8_normalize_ms", 50
+        ),
+        "vlm_observation_uint8_normalize_p95_ms": _timing_percentile(
+            completed, "vlm_observation_uint8_normalize_ms", 95
+        ),
+        "vlm_observation_construct_mean_ms": _timing_mean(completed, "vlm_observation_construct_ms"),
+        "vlm_observation_construct_p50_ms": _timing_percentile(completed, "vlm_observation_construct_ms", 50),
+        "vlm_observation_construct_p95_ms": _timing_percentile(completed, "vlm_observation_construct_ms", 95),
+        "vlm_observation_uint8_images_mean": _timing_mean(completed, "vlm_observation_uint8_images"),
+        "vlm_observation_float32_images_mean": _timing_mean(completed, "vlm_observation_float32_images"),
+        "vlm_observation_other_images_mean": _timing_mean(completed, "vlm_observation_other_images"),
         "vlm_parent_image_stage_mean_ms": _timing_mean(completed, "vlm_parent_image_stage_ms"),
         "vlm_parent_image_stage_p50_ms": _timing_percentile(completed, "vlm_parent_image_stage_ms", 50),
         "vlm_parent_image_stage_p95_ms": _timing_percentile(completed, "vlm_parent_image_stage_ms", 95),
@@ -615,6 +629,31 @@ def summarize_traces(
         "ae_init_denoise_p95_ms": _timing_percentile(completed, "ae_init_denoise_ms", 95),
         "ae_step_mean_ms": _timing_mean(completed, "ae_step_ms"),
         "ae_step_p50_ms": _timing_percentile(completed, "ae_step_ms", 50),
+        "ae_step_p95_ms": _timing_percentile(completed, "ae_step_ms", 95),
+        "ae_prefix_view_mean_ms": _timing_mean(completed, "ae_prefix_view_ms"),
+        "ae_prefix_view_p50_ms": _timing_percentile(completed, "ae_prefix_view_ms", 50),
+        "ae_prefix_view_p95_ms": _timing_percentile(completed, "ae_prefix_view_ms", 95),
+        "ae_state_batch_stage_mean_ms": _timing_mean(completed, "ae_state_batch_stage_ms"),
+        "ae_state_batch_stage_p50_ms": _timing_percentile(completed, "ae_state_batch_stage_ms", 50),
+        "ae_state_batch_stage_p95_ms": _timing_percentile(completed, "ae_state_batch_stage_ms", 95),
+        "ae_denoise_enqueue_mean_ms": _timing_mean(completed, "ae_denoise_enqueue_ms"),
+        "ae_denoise_enqueue_p50_ms": _timing_percentile(completed, "ae_denoise_enqueue_ms", 50),
+        "ae_denoise_enqueue_p95_ms": _timing_percentile(completed, "ae_denoise_enqueue_ms", 95),
+        "ae_update_stage_mean_ms": _timing_mean(completed, "ae_update_stage_ms"),
+        "ae_update_stage_p50_ms": _timing_percentile(completed, "ae_update_stage_ms", 50),
+        "ae_update_stage_p95_ms": _timing_percentile(completed, "ae_update_stage_ms", 95),
+        "ae_complete_block_mean_ms": _timing_mean(completed, "ae_complete_block_ms"),
+        "ae_complete_block_p50_ms": _timing_percentile(completed, "ae_complete_block_ms", 50),
+        "ae_complete_block_p95_ms": _timing_percentile(completed, "ae_complete_block_ms", 95),
+        "ae_result_slice_mean_ms": _timing_mean(completed, "ae_result_slice_ms"),
+        "ae_result_slice_p50_ms": _timing_percentile(completed, "ae_result_slice_ms", 50),
+        "ae_result_slice_p95_ms": _timing_percentile(completed, "ae_result_slice_ms", 95),
+        "ae_result_device_get_mean_ms": _timing_mean(completed, "ae_result_device_get_ms"),
+        "ae_result_device_get_p50_ms": _timing_percentile(completed, "ae_result_device_get_ms", 50),
+        "ae_result_device_get_p95_ms": _timing_percentile(completed, "ae_result_device_get_ms", 95),
+        "ae_result_cpu_copy_mean_ms": _timing_mean(completed, "ae_result_cpu_copy_ms"),
+        "ae_result_cpu_copy_p50_ms": _timing_percentile(completed, "ae_result_cpu_copy_ms", 50),
+        "ae_result_cpu_copy_p95_ms": _timing_percentile(completed, "ae_result_cpu_copy_ms", 95),
         "ae_effective_batch_mean": _timing_mean(completed, "ae_effective_batch"),
         "vlm_effective_batch_mean": _timing_mean(completed, "vlm_effective_batch"),
         "policy_effective_batch_mean": _timing_mean(completed, "policy_effective_batch"),
@@ -1065,12 +1104,14 @@ def create_policy_for_mode(args: Args, mode: Mode):
             args.policy.dir,
             sample_kwargs=sample_kwargs,
             pytorch_device=args.pytorch_device,
+            enable_component_timing=args.enable_component_timing,
         )
     if mode == "jax-monolithic":
         return _policy_config.create_trained_policy(
             train_config,
             args.policy.dir,
             sample_kwargs=sample_kwargs,
+            enable_component_timing=args.enable_component_timing,
         )
     if mode == "jax-split-ipc":
         return _jax_va_split_policy.create_trained_jax_va_split_policy(
@@ -1100,6 +1141,7 @@ def create_policy_for_mode(args: Args, mode: Mode):
         ae_sm_percent=ae_sm_percent,
         vlm_sm_percent=vlm_sm_percent,
         result_timeout_s=args.timeout_s,
+        enable_component_timing=args.enable_component_timing,
     )
 
 

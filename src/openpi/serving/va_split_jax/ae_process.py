@@ -23,6 +23,7 @@ from openpi.serving.va_split_jax.prefix_cache_pool import JaxVlmPrefixCacheLaneP
 from openpi.serving.va_split_jax import timeline_log
 from openpi.serving.va_split_jax.timing import queue_wait_and_transfer_ms
 from openpi.serving.va_split_jax.timing import timed_queue_get
+from openpi.serving.va_split_jax.types import JaxActionBatchRow
 from openpi.serving.va_split_jax.types import JaxActionResult
 from openpi.serving.va_split_jax.types import JaxLaneCredits
 from openpi.serving.va_split_jax.types import JaxPrefixReady
@@ -43,6 +44,13 @@ class JaxAERequestState:
     started_ns: int
     timing: dict[str, float]
     ae_step_ms: list[float]
+    ae_prefix_view_ms: list[float]
+    ae_prefix_view_cache_hit: list[float]
+    ae_state_batch_stage_ms: list[float]
+    ae_denoise_enqueue_ms: list[float]
+    ae_update_stage_ms: list[float]
+    ae_complete_block_ms: list[float]
+    ae_result_slice_ms: list[float]
     ae_batch_sizes: list[int]
     lane_compact_ms: float = 0.0
 
@@ -86,6 +94,11 @@ class JaxAEWorker:
         self.active: dict[str, JaxAERequestState] = {}
         self._rng = jax.random.key(0)
         self._pending_lane_credits: list[int] = []
+        self._x_t_active: jax.Array | None = None
+        self._step_idx_active: jax.Array | None = None
+        self._dt_active: jax.Array | None = None
+        self._prefix_batch_cache: JaxPrefixFeature | None = None
+        self._prefix_batch_cache_size: int | None = None
 
     @property
     def owned_pool(self) -> JaxVlmPrefixCacheLanePool:
@@ -153,6 +166,7 @@ class JaxAEWorker:
         self._owned_pool = pool
         self._pool_ready = True
         self._ipc_warmup_done = True
+        self._invalidate_prefix_batch_cache()
 
     def _maybe_warmup_owned_pool(self) -> None:
         if self._ipc_warmup_done or not self._pool_ready:
@@ -189,6 +203,7 @@ class JaxAEWorker:
             config=self._compile_config,
             make_prefix_batch=make_prefix_batch,
         )
+        self._warmup_dense_state_paths()
         self._clear_owned_pool_active()
         self._ipc_warmup_batches = float(stats["jax_warmup_batches"])
         self._ipc_warmup_done = True
@@ -198,6 +213,40 @@ class JaxAEWorker:
             f"wall_ms={warm_ms:.1f}",
             flush=True,
         )
+
+    def _warmup_dense_state_paths(self) -> None:
+        if self._compile_config is None or self._noise_factory is None:
+            return
+        cap = min(
+            self._max_batch_size,
+            self._max_prefix_slots,
+            self._compile_config.warmup_max_batch_size,
+        )
+        if cap <= 0:
+            return
+        saved = (
+            self._active_count,
+            self._x_t_active,
+            self._step_idx_active,
+            self._dt_active,
+        )
+        try:
+            for batch_size in range(1, cap + 1):
+                self._active_count = 0
+                self._x_t_active = None
+                self._step_idx_active = None
+                self._dt_active = None
+                for _ in range(batch_size):
+                    x_t = self._noise_factory(1)
+                    dt = jnp.full((1,), -1.0 / float(self._compile_config.num_steps), dtype=jnp.float32)
+                    self._ensure_dense_state_compatible(x_t=x_t, dt=dt)
+                    self._append_dense_state_lane(x_t=x_t, step_idx=jnp.zeros((1,), dtype=jnp.int32), dt=dt)
+                    self._active_count += 1
+                x_t, step_idx, _dt = self._view_dense_state_batch(batch_size)
+                self._write_dense_state_batch(0, x_t=x_t, step_idx=step_idx + 1)
+                x_t.block_until_ready()
+        finally:
+            self._active_count, self._x_t_active, self._step_idx_active, self._dt_active = saved
 
     def _clear_owned_pool_active(self) -> None:
         while self._owned_pool.active_count > 0:
@@ -210,6 +259,7 @@ class JaxAEWorker:
         self._clear_owned_pool_active()
         self._ipc_warmup_done = False
         self._ipc_warmup_batches = 0.0
+        self._invalidate_prefix_batch_cache()
 
     def add_prefix(self, ready: JaxPrefixReady) -> None:
         if not self._pool_ready:
@@ -244,12 +294,23 @@ class JaxAEWorker:
             timing["prefix_admit_wait_ms"] = 0.0
 
         init_denoise_start_ns = time.monotonic_ns()
-        self._rng, request_rng = jax.random.split(self._rng)
-        denoise_state = self._model.init_denoise_state(
-            request_rng, ready.slot_handle.batch_rows, noise, ready.num_steps
-        )
+        if noise is None:
+            self._rng, request_rng = jax.random.split(self._rng)
+            denoise_state = self._model.init_denoise_state(
+                request_rng, ready.slot_handle.batch_rows, noise, ready.num_steps
+            )
+            x_t = jnp.asarray(denoise_state.x_t)
+            timing["ae_init_denoise_noise_fast_path"] = 0.0
+        else:
+            x_t = jnp.asarray(noise)
+            timing["ae_init_denoise_noise_fast_path"] = 1.0
         timing["ae_init_denoise_ms"] = (time.monotonic_ns() - init_denoise_start_ns) / 1_000_000
-        dt = jnp.asarray(-1.0 / float(ready.num_steps), dtype=jnp.float32)
+        if int(x_t.shape[0]) != int(ready.slot_handle.batch_rows):
+            raise RuntimeError(
+                f"AE denoise state batch size {x_t.shape[0]} does not match prefix rows "
+                f"{ready.slot_handle.batch_rows}"
+            )
+        dt = jnp.full((ready.slot_handle.batch_rows,), -1.0 / float(ready.num_steps), dtype=jnp.float32)
         lane_id = self._active_count
         admit_start_ns = time.monotonic_ns()
         dense_lane, vacated = self._owned_pool.claim_written_lane(ready.request_id, ready.slot_handle.slot_id)
@@ -257,9 +318,12 @@ class JaxAEWorker:
             raise RuntimeError(f"AE owned prefix lane mismatch: pool={dense_lane} ae={lane_id}")
         if vacated is not None:
             self._pending_lane_credits.append(int(vacated))
+        dense_state_start_ns = time.monotonic_ns()
+        self._ensure_dense_state_compatible(x_t=x_t, dt=dt)
+        self._append_dense_state_lane(x_t=x_t, step_idx=jnp.zeros_like(dt, dtype=jnp.int32), dt=dt)
+        timing["ae_state_admit_stage_ms"] = (time.monotonic_ns() - dense_state_start_ns) / 1_000_000
         timing["prefix_lane_ingest_ms"] = 0.0
         timing["prefix_pool_write_ms"] = (time.monotonic_ns() - admit_start_ns) / 1_000_000
-        x_t = jnp.array(denoise_state.x_t)
         state = JaxAERequestState(
             request_id=ready.request_id,
             active_lane_id=lane_id,
@@ -270,11 +334,19 @@ class JaxAEWorker:
             started_ns=time.monotonic_ns(),
             timing=timing,
             ae_step_ms=[],
+            ae_prefix_view_ms=[],
+            ae_prefix_view_cache_hit=[],
+            ae_state_batch_stage_ms=[],
+            ae_denoise_enqueue_ms=[],
+            ae_update_stage_ms=[],
+            ae_complete_block_ms=[],
+            ae_result_slice_ms=[],
             ae_batch_sizes=[],
         )
         self.active[ready.request_id] = state
         self._lanes[lane_id] = state
         self._active_count += 1
+        self._invalidate_prefix_batch_cache()
 
     def select_ready_lanes(self) -> list[JaxAERequestState]:
         if self._active_count == 0:
@@ -298,22 +370,54 @@ class JaxAEWorker:
             reqs=[request.request_id for request in batch],
             step_idx=batch[0].step_idx,
         )
-        prefix_batch = self._owned_pool.view_prefix_batch(len(batch))
-        x_t = jnp.concatenate([request.x_t for request in batch], axis=0)
-        step_idx = jnp.asarray([request.step_idx for request in batch], dtype=jnp.int32)
-        dt = jnp.stack([jnp.asarray(request.dt) for request in batch])
+        prefix_view_start_ns = time.monotonic_ns()
+        prefix_batch, prefix_view_cache_hit = self._view_active_prefix_batch(len(batch))
+        prefix_view_ms = (time.monotonic_ns() - prefix_view_start_ns) / 1_000_000
+
+        state_stage_start_ns = time.monotonic_ns()
+        x_t, step_idx, dt = self._view_dense_state_batch(len(batch))
         denoise_batch = JaxDenoiseState(x_t=x_t, step_idx=step_idx, num_steps=batch[0].num_steps, dt=dt)
+        state_batch_stage_ms = (time.monotonic_ns() - state_stage_start_ns) / 1_000_000
+
+        denoise_start_ns = time.monotonic_ns()
         v_t = self._model.denoise_one_batch(prefix_batch, denoise_batch)
+        denoise_enqueue_ms = (time.monotonic_ns() - denoise_start_ns) / 1_000_000
+
+        update_start_ns = time.monotonic_ns()
         dt_b = dt.reshape((-1,) + (1,) * (v_t.ndim - 1))
-        x_t = x_t + dt_b * v_t
+        x_t_next = x_t + dt_b * v_t
+        self._write_dense_state_batch(
+            0,
+            x_t=x_t_next,
+            step_idx=step_idx + 1,
+        )
         results: list[JaxActionResult] = []
         releases: list[JaxReleaseFeature] = []
         completed: list[JaxAERequestState] = []
         for row, request in enumerate(batch):
-            request.x_t = x_t[row : row + 1]
             request.step_idx += 1
             if request.step_idx == request.num_steps:
-                request.x_t.block_until_ready()
+                completed.append(request)
+        update_stage_ms = (time.monotonic_ns() - update_start_ns) / 1_000_000
+        complete_block_ms_by_request: dict[str, float] = {}
+        result_slice_ms_by_request: dict[str, float] = {}
+        completed_actions_by_request: dict[str, JaxActionBatchRow] = {}
+        if completed:
+            block_start_ns = time.monotonic_ns()
+            x_t_next.block_until_ready()
+            complete_block_ms = (time.monotonic_ns() - block_start_ns) / 1_000_000
+            per_completed_block_ms = complete_block_ms / max(len(completed), 1)
+            slice_start_ns = time.monotonic_ns()
+            for request in completed:
+                complete_block_ms_by_request[request.request_id] = per_completed_block_ms
+                completed_actions_by_request[request.request_id] = JaxActionBatchRow(
+                    batch=x_t_next,
+                    row=request.active_lane_id,
+                )
+            result_slice_ms = (time.monotonic_ns() - slice_start_ns) / 1_000_000
+            per_completed_slice_ms = result_slice_ms / max(len(completed), 1)
+            for request in completed:
+                result_slice_ms_by_request[request.request_id] = per_completed_slice_ms
         step_ms = (time.monotonic_ns() - step_start_ns) / 1_000_000
         timeline_log.emit(
             "ae_denoise_end",
@@ -325,19 +429,28 @@ class JaxAEWorker:
 
         for request in batch:
             request.ae_step_ms.append(step_ms)
+            request.ae_prefix_view_ms.append(prefix_view_ms)
+            request.ae_prefix_view_cache_hit.append(1.0 if prefix_view_cache_hit else 0.0)
+            request.ae_state_batch_stage_ms.append(state_batch_stage_ms)
+            request.ae_denoise_enqueue_ms.append(denoise_enqueue_ms)
+            request.ae_update_stage_ms.append(update_stage_ms)
+            request.ae_complete_block_ms.append(complete_block_ms_by_request.get(request.request_id, 0.0))
+            request.ae_result_slice_ms.append(result_slice_ms_by_request.get(request.request_id, 0.0))
             request.ae_batch_sizes.append(len(batch))
             if request.step_idx == request.num_steps:
                 results.append(
                     JaxActionResult(
                         request_id=request.request_id,
-                        actions=request.x_t,
+                        actions=completed_actions_by_request[request.request_id],
                         timing=_finish_timing(request),
                     )
                 )
-                completed.append(request)
         freed_by_request: dict[str, int] = {}
-        for request in sorted(completed, key=lambda item: item.active_lane_id, reverse=True):
-            freed_by_request[request.request_id] = self._remove_active_lane(request.active_lane_id)
+        if len(completed) == self._active_count:
+            freed_by_request = self._remove_all_active_lanes(completed)
+        else:
+            for request in sorted(completed, key=lambda item: item.active_lane_id, reverse=True):
+                freed_by_request[request.request_id] = self._remove_active_lane(request.active_lane_id)
         for request in completed:
             releases.append(JaxReleaseFeature(request_id=request.request_id, slot_id=freed_by_request[request.request_id]))
         return results, releases
@@ -351,7 +464,112 @@ class JaxAEWorker:
         self.active.clear()
         self._lanes = [None for _ in range(self._max_prefix_slots)]
         self._active_count = 0
+        self._x_t_active = None
+        self._step_idx_active = None
+        self._dt_active = None
+        self._invalidate_prefix_batch_cache()
         return releases
+
+    def _view_active_prefix_batch(self, batch_size: int) -> tuple[JaxPrefixFeature, bool]:
+        if self._prefix_batch_cache is not None and self._prefix_batch_cache_size == batch_size:
+            return self._prefix_batch_cache, True
+        prefix_batch = self._owned_pool.view_prefix_batch(batch_size)
+        self._prefix_batch_cache = prefix_batch
+        self._prefix_batch_cache_size = batch_size
+        return prefix_batch, False
+
+    def _invalidate_prefix_batch_cache(self) -> None:
+        self._prefix_batch_cache = None
+        self._prefix_batch_cache_size = None
+
+    def _ensure_dense_state_compatible(self, *, x_t: jax.Array, dt: jax.Array) -> None:
+        if x_t.ndim < 1 or int(x_t.shape[0]) != 1:
+            raise ValueError(f"AE dense state currently expects one row per request, got x_t shape {x_t.shape}")
+        if dt.ndim != 1 or int(dt.shape[0]) != 1:
+            raise ValueError(f"AE dense state currently expects one dt per request, got dt shape {dt.shape}")
+        if self._x_t_active is None:
+            return
+        if tuple(self._x_t_active.shape[1:]) != tuple(x_t.shape[1:]):
+            raise ValueError(f"AE dense x_t row shape changed from {self._x_t_active.shape[1:]} to {x_t.shape[1:]}")
+        if self._x_t_active.dtype != x_t.dtype:
+            raise ValueError(f"AE dense x_t dtype changed from {self._x_t_active.dtype} to {x_t.dtype}")
+        assert self._dt_active is not None
+        if self._dt_active.dtype != dt.dtype:
+            raise ValueError(f"AE dense dt dtype changed from {self._dt_active.dtype} to {dt.dtype}")
+
+    def _append_dense_state_lane(self, *, x_t: jax.Array, step_idx: jax.Array, dt: jax.Array) -> None:
+        if self._x_t_active is None:
+            self._x_t_active = x_t
+            self._step_idx_active = step_idx
+            self._dt_active = dt
+            return
+        assert self._step_idx_active is not None
+        assert self._dt_active is not None
+        self._x_t_active = jnp.concatenate([self._x_t_active, x_t], axis=0)
+        self._step_idx_active = jnp.concatenate([self._step_idx_active, step_idx], axis=0)
+        self._dt_active = jnp.concatenate([self._dt_active, dt], axis=0)
+
+    def _view_dense_state_batch(self, batch_size: int) -> tuple[jax.Array, jax.Array, jax.Array]:
+        if self._x_t_active is None or self._step_idx_active is None or self._dt_active is None:
+            raise RuntimeError("AE dense denoise state is not initialized")
+        if batch_size > self._active_count:
+            raise ValueError(f"batch_size {batch_size} exceeds active dense state rows {self._active_count}")
+        if batch_size == self._active_count:
+            return self._x_t_active, self._step_idx_active, self._dt_active
+        return (
+            jax.lax.dynamic_slice_in_dim(self._x_t_active, 0, batch_size, axis=0),
+            jax.lax.dynamic_slice_in_dim(self._step_idx_active, 0, batch_size, axis=0),
+            jax.lax.dynamic_slice_in_dim(self._dt_active, 0, batch_size, axis=0),
+        )
+
+    def _write_dense_state_batch(
+        self,
+        lane_id: int,
+        *,
+        x_t: jax.Array,
+        step_idx: jax.Array,
+        dt: jax.Array | None = None,
+    ) -> None:
+        if self._x_t_active is None or self._step_idx_active is None or self._dt_active is None:
+            raise RuntimeError("AE dense denoise state is not initialized")
+        if lane_id == 0 and int(x_t.shape[0]) == self._active_count:
+            self._x_t_active = x_t
+            self._step_idx_active = step_idx
+        else:
+            self._x_t_active = jax.lax.dynamic_update_slice_in_dim(self._x_t_active, x_t, lane_id, axis=0)
+            self._step_idx_active = jax.lax.dynamic_update_slice_in_dim(
+                self._step_idx_active, step_idx, lane_id, axis=0
+            )
+        if dt is not None:
+            self._dt_active = jax.lax.dynamic_update_slice_in_dim(self._dt_active, dt, lane_id, axis=0)
+
+    def _remove_dense_state_lane(self, lane_id: int, last_lane: int) -> None:
+        if self._x_t_active is None or self._step_idx_active is None or self._dt_active is None:
+            raise RuntimeError("AE dense denoise state is not initialized")
+        if lane_id != last_lane:
+            moved_x_t = self._x_t_active[last_lane : last_lane + 1]
+            moved_step_idx = self._step_idx_active[last_lane : last_lane + 1]
+            moved_dt = self._dt_active[last_lane : last_lane + 1]
+            self._write_dense_state_batch(lane_id, x_t=moved_x_t, step_idx=moved_step_idx, dt=moved_dt)
+        self._x_t_active = self._x_t_active[:last_lane]
+        self._step_idx_active = self._step_idx_active[:last_lane]
+        self._dt_active = self._dt_active[:last_lane]
+
+    def _remove_all_active_lanes(self, completed: list[JaxAERequestState]) -> dict[str, int]:
+        freed_by_request: dict[str, int] = {}
+        for request in sorted(completed, key=lambda item: item.active_lane_id, reverse=True):
+            freed = self._owned_pool.release_lane(request.request_id)
+            if freed is None:
+                raise RuntimeError(f"Owned pool missing lane for {request.request_id}")
+            freed_by_request[request.request_id] = freed
+            del self.active[request.request_id]
+            self._lanes[request.active_lane_id] = None
+        self._active_count = 0
+        self._x_t_active = None
+        self._step_idx_active = None
+        self._dt_active = None
+        self._invalidate_prefix_batch_cache()
+        return freed_by_request
 
     def _remove_active_lane(self, lane_id: int) -> int:
         request = self._lanes[lane_id]
@@ -370,8 +588,10 @@ class JaxAEWorker:
             moved.active_lane_id = lane_id
             self._lanes[lane_id] = moved
             moved.lane_compact_ms += (time.monotonic_ns() - compact_start_ns) / 1_000_000
+        self._remove_dense_state_lane(lane_id, last_lane)
         self._lanes[last_lane] = None
         self._active_count -= 1
+        self._invalidate_prefix_batch_cache()
         return freed
 
 
@@ -416,6 +636,18 @@ def _finish_timing(request: JaxAERequestState) -> dict[str, float]:
     if request.ae_step_ms:
         timing["ae_step_ms"] = sum(request.ae_step_ms) / len(request.ae_step_ms)
         timing["ae_step_total_ms"] = sum(request.ae_step_ms)
+    for name, values in (
+        ("ae_prefix_view_ms", request.ae_prefix_view_ms),
+        ("ae_prefix_view_cache_hit", request.ae_prefix_view_cache_hit),
+        ("ae_state_batch_stage_ms", request.ae_state_batch_stage_ms),
+        ("ae_denoise_enqueue_ms", request.ae_denoise_enqueue_ms),
+        ("ae_update_stage_ms", request.ae_update_stage_ms),
+        ("ae_complete_block_ms", request.ae_complete_block_ms),
+        ("ae_result_slice_ms", request.ae_result_slice_ms),
+    ):
+        if values:
+            timing[name] = sum(values) / len(values)
+            timing[f"{name.removesuffix('_ms')}_total_ms"] = sum(values)
     if request.ae_batch_sizes:
         timing["ae_effective_batch"] = sum(request.ae_batch_sizes) / len(request.ae_batch_sizes)
     compact_ms = float(request.lane_compact_ms)
@@ -425,6 +657,36 @@ def _finish_timing(request: JaxAERequestState) -> dict[str, float]:
     timing["prefix_lane_compact_ms"] = compact_ms
     timing["prefix_lane_overhead_ms"] = timing["prefix_pool_overhead_ms"]
     return timing
+
+
+def _materialize_result_actions(results: list[JaxActionResult]) -> tuple[dict[str, np.ndarray], dict[str, float]]:
+    actions_by_request: dict[str, np.ndarray] = {}
+    device_get_ms_by_request: dict[str, float] = {}
+    batch_groups: dict[int, tuple[Any, list[tuple[JaxActionResult, int]]]] = {}
+    direct_results: list[JaxActionResult] = []
+    for result in results:
+        actions = result.actions
+        if isinstance(actions, JaxActionBatchRow):
+            group = batch_groups.setdefault(id(actions.batch), (actions.batch, []))
+            group[1].append((result, int(actions.row)))
+        else:
+            direct_results.append(result)
+
+    for batch, rows in batch_groups.values():
+        start_ns = time.monotonic_ns()
+        host_batch = np.asarray(batch)
+        elapsed_ms = (time.monotonic_ns() - start_ns) / 1_000_000
+        per_row_ms = elapsed_ms / max(len(rows), 1)
+        for result, row in rows:
+            actions_by_request[result.request_id] = host_batch[row : row + 1]
+            device_get_ms_by_request[result.request_id] = per_row_ms
+
+    for result in direct_results:
+        start_ns = time.monotonic_ns()
+        actions_by_request[result.request_id] = np.asarray(result.actions)
+        device_get_ms_by_request[result.request_id] = (time.monotonic_ns() - start_ns) / 1_000_000
+
+    return actions_by_request, device_get_ms_by_request
 
 
 class JaxAEProcess:
@@ -485,9 +747,11 @@ class JaxAEProcess:
             self._release_queue.put(pending)
         # Publish results after releases so the parent cannot submit the next batch
         # while VLM still holds a stale outstanding credit for an AE-active lane.
+        materialized_actions, device_get_ms = _materialize_result_actions(results)
         for result in results:
-            actions = np.asarray(result.actions)
+            actions = materialized_actions[result.request_id]
             timing = dict(result.timing or {})
+            timing["ae_result_device_get_ms"] = device_get_ms.get(result.request_id, 0.0)
             timing["_ae_result_enqueue_ns"] = float(time.monotonic_ns())
             self._result_queue.put(JaxActionResult(request_id=result.request_id, actions=actions, timing=timing))
 

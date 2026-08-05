@@ -1,0 +1,44 @@
+{
+  "case_id": "mps-sm80-bs1",
+  "status": "pass",
+  "mps_sm": 80,
+  "batch_size": 1,
+  "gpu_id": 3,
+  "elapsed_s": 30.570186361670494,
+  "returncode": 0,
+  "metrics": {
+    "total": {
+      "avg_ms": 73.68718506768346,
+      "p50_ms": 73.1716537848115,
+      "p95_ms": 74.94753412902355
+    },
+    "vlm": {
+      "avg_ms": 44.05395174399018,
+      "p50_ms": 43.7284242361784,
+      "p95_ms": 45.37262553349137
+    },
+    "action_head": {
+      "avg_ms": 29.380373191088438,
+      "p50_ms": 29.191157780587673,
+      "p95_ms": 29.50750663876534
+    },
+    "other": {
+      "avg_ms": 0.2528601326048374,
+      "p50_ms": 0.2522505819797516,
+      "p95_ms": 0.26890346780419355
+    }
+  },
+  "model": {
+    "config": "pi05_libero",
+    "checkpoint_dir": "/data1/miliang/models/pi05_libero",
+    "num_steps": 10,
+    "action_horizon": 10,
+    "action_dim": 32,
+    "max_token_len": 200,
+    "jax_jit": true,
+    "devices": [
+      "cuda:0"
+    ]
+  },
+  "error_message": null
+}

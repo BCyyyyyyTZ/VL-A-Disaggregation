@@ -68,6 +68,9 @@ cover/
 
 # Django stuff:
 *.log
+# Re-ignore noisy runtime logs under otherwise-tracked experiment trees.
+logs/JAX/**/*.log
+logs/V-A/**/*.log
 local_settings.py
 db.sqlite3
 db.sqlite3-journal

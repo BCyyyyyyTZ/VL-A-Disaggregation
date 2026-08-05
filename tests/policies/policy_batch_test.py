@@ -139,3 +139,23 @@ def test_policy_infer_batch_reports_baseline_vlm_and_ae_component_timing():
     assert timing["baseline_ae_step_ms"] >= 0.0
     assert timing["baseline_ae_steps"] == 2
     assert timing["baseline_effective_batch"] == 2
+
+
+def test_policy_infer_batch_can_disable_component_timing_for_full_sample_actions():
+    model = FakeTorchPolicyModel()
+    policy = Policy(
+        model,
+        is_pytorch=True,
+        pytorch_device="cpu",
+        sample_kwargs={"num_steps": 2},
+        enable_component_timing=False,
+    )
+    noise_batch = np.zeros((2, 2, 3), dtype=np.float32)
+
+    result = policy.infer_batch(_model_input_obs_batch(), noise=noise_batch)
+
+    assert model.batch_sizes == [2]
+    assert "baseline_vlm_ms" not in result["policy_timing"]
+    assert "baseline_ae_ms" not in result["policy_timing"]
+    expected = noise_batch + np.asarray([[[1.0]], [[2.0]]], dtype=np.float32)
+    np.testing.assert_allclose(result["actions"], expected)

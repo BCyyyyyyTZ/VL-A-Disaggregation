@@ -47,6 +47,12 @@ class JaxActionResult:
 
 
 @dataclass(frozen=True, slots=True)
+class JaxActionBatchRow:
+    batch: Any
+    row: int
+
+
+@dataclass(frozen=True, slots=True)
 class JaxReleaseFeature:
     """AE finished a request; ``slot_id`` is the recycled physical lane credit for VLM."""
 

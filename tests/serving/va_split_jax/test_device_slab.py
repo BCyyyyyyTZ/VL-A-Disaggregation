@@ -41,6 +41,52 @@ def test_device_slab_preserves_bfloat16_logical_dtype():
         slab.close()
 
 
+def test_device_slab_copy_batch_from_array_writes_contiguous_lanes():
+    backend = make_default_device_slab_backend()
+    slab = backend.create_slab(DeviceSlabSpec(name="x", shape=(1, 2, 3), dtype="float32", max_lanes=4))
+    try:
+        slab = backend.copy_lane_from_array(slab, 0, jnp.full((1, 2, 3), 7.0, dtype=jnp.float32))
+        slab = backend.copy_batch_from_array(
+            slab,
+            1,
+            jnp.stack(
+                [
+                    jnp.full((2, 3), 2.0, dtype=jnp.float32),
+                    jnp.full((2, 3), 3.0, dtype=jnp.float32),
+                ],
+                axis=0,
+            ),
+        )
+        batch = backend.view_batch(slab, 3)
+        np.testing.assert_allclose(np.asarray(batch[0]), np.full((2, 3), 7.0, dtype=np.float32))
+        np.testing.assert_allclose(np.asarray(batch[1]), np.full((2, 3), 2.0, dtype=np.float32))
+        np.testing.assert_allclose(np.asarray(batch[2]), np.full((2, 3), 3.0, dtype=np.float32))
+    finally:
+        slab.close()
+
+
+def test_device_slab_copy_batch_from_array_supports_nonzero_lane_axis_and_bfloat16():
+    backend = make_default_device_slab_backend()
+    slab = backend.create_slab(
+        DeviceSlabSpec(name="past", shape=(3, 1, 2), dtype="bfloat16", max_lanes=4, lane_axis=1)
+    )
+    try:
+        value = jnp.concatenate(
+            [
+                jnp.full((3, 1, 2), 4.0, dtype=jnp.bfloat16),
+                jnp.full((3, 1, 2), 5.0, dtype=jnp.bfloat16),
+            ],
+            axis=1,
+        )
+        slab = backend.copy_batch_from_array(slab, 1, value)
+        batch = backend.view_batch(slab, 3)
+        assert batch.dtype == jnp.bfloat16
+        np.testing.assert_allclose(np.asarray(batch[:, 1]), np.full((3, 2), 4.0, dtype=np.float32))
+        np.testing.assert_allclose(np.asarray(batch[:, 2]), np.full((3, 2), 5.0, dtype=np.float32))
+    finally:
+        slab.close()
+
+
 def _producer(control_queue: mp.Queue, result_queue: mp.Queue) -> None:
     backend = CudaIpcDeviceSlabBackend()
     slab = backend.create_slab(DeviceSlabSpec(name="ipc", shape=(1, 2, 3), dtype="bfloat16", max_lanes=4))

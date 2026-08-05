@@ -33,6 +33,7 @@ VA_SPLIT_MAX_VLM_WAIT_MS="${VA_SPLIT_MAX_VLM_WAIT_MS:-1.0}"
 MAX_VLM_WAIT_MS="${MAX_VLM_WAIT_MS:-${VA_SPLIT_MAX_VLM_WAIT_MS}}"
 BATCH_SIZE="${BATCH_SIZE:-${MAX_VLM_BATCH_SIZE}}"
 ENABLE_POLICY_BATCH="${ENABLE_POLICY_BATCH:-true}"
+ENABLE_COMPONENT_TIMING="${ENABLE_COMPONENT_TIMING:-true}"
 if [[ "${RUN_MODE}" == "smoke" ]]; then
   NUM_REQUESTS="${NUM_REQUESTS:-1}"
   REQUEST_RATE_HZ="${REQUEST_RATE_HZ:-1}"
@@ -145,14 +146,14 @@ if [[ "${NEEDS_MPS}" -eq 1 ]]; then
   mps_ready=0
   # Wait up to ~10s; daemon sometimes needs a few seconds after -d.
   for _ in $(seq 1 50); do
-    if [[ -S "${MPS_PIPE_DIR}/control" ]]; then
+    if [[ -S "${MPS_PIPE_DIR}/control" || -e "${MPS_PIPE_DIR}/control_lock" || -p "${MPS_PIPE_DIR}/log" ]]; then
       mps_ready=1
       break
     fi
     sleep 0.2
   done
   if [[ "${mps_ready}" -ne 1 ]]; then
-    echo "Failed to start MPS control daemon (missing ${MPS_PIPE_DIR}/control)" >&2
+    echo "Failed to start MPS control daemon (missing control/control_lock/log in ${MPS_PIPE_DIR})" >&2
     echo "--- control.log ---" >&2
     cat "${MPS_LOG_DIR}/control.log" >&2 || true
     echo "--- pipe dir ---" >&2
@@ -191,6 +192,7 @@ fi
   echo "MAX_VLM_WAIT_MS=${MAX_VLM_WAIT_MS}"
   echo "BATCH_SIZE=${BATCH_SIZE}"
   echo "ENABLE_POLICY_BATCH=${ENABLE_POLICY_BATCH}"
+  echo "ENABLE_COMPONENT_TIMING=${ENABLE_COMPONENT_TIMING}"
 } | tee "${RUN_LOG_DIR}/gpu_binding.log"
 
 echo "RUN_LOG_DIR=${RUN_LOG_DIR}"
@@ -219,6 +221,11 @@ if [[ "${RUN_MODE}" == "server" ]]; then
     --ae-sm-percent "${AE_SM_PERCENT}" \
     --vlm-sm-percent "${VLM_SM_PERCENT}"
   )
+  if [[ "${ENABLE_COMPONENT_TIMING}" == "true" ]]; then
+    server_cmd+=(--enable-component-timing)
+  else
+    server_cmd+=(--no-enable-component-timing)
+  fi
   append_pytorch_compile_mode_arg server_cmd
   server_cmd+=(
     policy:checkpoint \
@@ -258,6 +265,11 @@ else
     --json-output "${JSON_OUTPUT}"
   )
   append_pytorch_compile_mode_arg profile_cmd
+  if [[ "${ENABLE_COMPONENT_TIMING}" == "true" ]]; then
+    profile_cmd+=(--enable-component-timing)
+  else
+    profile_cmd+=(--no-enable-component-timing)
+  fi
   if [[ "${PROFILE_MODE}" != "split-mps" ]]; then
     profile_cmd+=(--no-require-mps-env)
   fi

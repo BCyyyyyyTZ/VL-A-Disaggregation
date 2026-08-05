@@ -8,8 +8,8 @@ cd "${REPO_ROOT}"
 GPU_ID="${GPU_ID:-0}"
 MODE="${MODE:-jax-split-ipc}"
 POLICY_CONFIG="${POLICY_CONFIG:-pi05_libero}"
-POLICY_DIR="${POLICY_DIR:-/data/miliang/huggingface/hub/openpi-assets/checkpoints/pi05_libero}"
-LOG_ROOT="${LOG_ROOT:-${REPO_ROOT}/logs/tests}"
+POLICY_DIR="${POLICY_DIR:-/data1/miliang/models/pi05_libero}"
+LOG_ROOT="${LOG_ROOT:-/data1/miliang/VL-A-Disaggregation/logs/JAX}"
 RUN_TS="${RUN_TS:-$(date +%Y%m%d_%H%M%S)}"
 RUN_LOG_DIR="${RUN_LOG_DIR:-${LOG_ROOT}/jax-${RUN_TS}}"
 MPS_PIPE_DIR="${MPS_PIPE_DIR:-${RUN_LOG_DIR}/mps-pipe}"
@@ -34,7 +34,7 @@ JAX_COMPILE_WARMUP="${JAX_COMPILE_WARMUP:-1}"
 # Default warmup ceiling follows VA-split prefix capacity: max_vlm_batch_size * 3.
 JAX_COMPILE_WARMUP_MAX_BATCH_SIZE="${JAX_COMPILE_WARMUP_MAX_BATCH_SIZE:-$((MAX_VLM_BATCH_SIZE * 3))}"
 JSON_OUTPUT="${JSON_OUTPUT:-${RUN_LOG_DIR}/profile.json}"
-PYTHON_BIN="${PYTHON_BIN:-${REPO_ROOT}/.venv/bin/python}"
+PYTHON_BIN="${PYTHON_BIN:-/data1/miliang/RLinf/openpi_libero/bin/python}"
 
 MPS_STARTED=0
 

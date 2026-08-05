@@ -10,6 +10,7 @@ import torch
 
 from openpi.models_pytorch.pi0_split_types import DenoiseState
 from openpi.models_pytorch.pi0_split_types import PrefixFeature
+from openpi.serving.va_split import runtime as runtime_module
 from openpi.serving.va_split.runtime import LocalVASplitRuntime
 from openpi.serving.va_split.runtime import ProcessVASplitRuntime
 from openpi.serving.va_split.types import ActionResult
@@ -145,3 +146,67 @@ def test_process_runtime_collect_results_records_ae_result_transfer_latency():
     assert timing["va_split_transfer_ms"] == timing["ae_result_transfer_ms"]
     assert timing["va_split_queue_wait_ms"] == timing["ae_result_queue_wait_ms"]
     assert "_ae_result_enqueue_ns" not in timing
+
+
+def test_process_runtime_passes_role_specific_model_factories(monkeypatch):
+    process_args = []
+
+    class FakeQueue:
+        def put(self, value):
+            del value
+
+        def get(self):
+            return Shutdown()
+
+    class FakeProcess:
+        def __init__(self, *, target, args, daemon):
+            del target
+            self.args = args
+            self.daemon = daemon
+            process_args.append(args)
+
+        def start(self):
+            pass
+
+        def join(self, timeout=None):
+            del timeout
+
+        def is_alive(self):
+            return False
+
+    class FakeContext:
+        def Queue(self):
+            return FakeQueue()
+
+        def Process(self, *, target, args, daemon):
+            return FakeProcess(target=target, args=args, daemon=daemon)
+
+    class FakeThread:
+        def __init__(self, *, target, daemon):
+            del target
+            self.daemon = daemon
+
+        def start(self):
+            pass
+
+        def join(self, timeout=None):
+            del timeout
+
+    base_factory = object()
+    vlm_factory = object()
+    ae_factory = object()
+    monkeypatch.setattr(runtime_module.torch.multiprocessing, "get_context", lambda _start_method: FakeContext())
+    monkeypatch.setattr(runtime_module.threading, "Thread", FakeThread)
+
+    runtime = ProcessVASplitRuntime(
+        model_factory=base_factory,
+        vlm_model_factory=vlm_factory,
+        ae_model_factory=ae_factory,
+        device="cpu",
+    )
+
+    assert runtime._model_factory is base_factory
+    assert runtime._vlm_model_factory is vlm_factory
+    assert runtime._ae_model_factory is ae_factory
+    assert process_args[0][0] is vlm_factory
+    assert process_args[1][0] is ae_factory
