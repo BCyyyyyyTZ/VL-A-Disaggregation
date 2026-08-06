@@ -11,6 +11,8 @@ os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 import jax
 import jax.numpy as jnp
 from numba import cuda
+from numba.cuda.api_util import prepare_shape_strides_dtype
+from numba.cuda.cudadrv import devicearray
 from numba.cuda.cudadrv import driver
 from numba.cuda.cudadrv import drvapi
 import numpy as np
@@ -204,10 +206,13 @@ class CudaIpcDeviceSlabBackend(DeviceSlabBackend):
             raise RuntimeError(f"expected {self.transport!r} slab, got {slab.handle.transport!r}")
         value.block_until_ready()
         device_ordinal = int(slab.handle.device_ordinal)
-        _select_numba_device(device_ordinal)
         stream = self._write_stream(device_ordinal)
-        dst = cuda.from_cuda_array_interface(_cuda_array_interface_for_array(slab.array), owner=slab)
-        src = cuda.from_cuda_array_interface(_cuda_array_interface_for_array(value), owner=value)
+        dst = _device_array_view_from_cuda_array_interface(
+            _cuda_array_interface_for_array(slab.array), owner=slab, device_ordinal=device_ordinal
+        )
+        src = _device_array_view_from_cuda_array_interface(
+            _cuda_array_interface_for_array(value), owner=value, device_ordinal=device_ordinal
+        )
         _copy_lane_with_kernel(dst, src, lane_id, slab.spec, stream=stream)
         if sync:
             stream.synchronize()
@@ -227,10 +232,13 @@ class CudaIpcDeviceSlabBackend(DeviceSlabBackend):
             raise RuntimeError(f"expected {self.transport!r} slab, got {slab.handle.transport!r}")
         value.block_until_ready()
         device_ordinal = int(slab.handle.device_ordinal)
-        _select_numba_device(device_ordinal)
         stream = self._write_stream(device_ordinal)
-        dst = cuda.from_cuda_array_interface(_cuda_array_interface_for_array(slab.array), owner=slab)
-        src = cuda.from_cuda_array_interface(_cuda_array_interface_for_array(value), owner=value)
+        dst = _device_array_view_from_cuda_array_interface(
+            _cuda_array_interface_for_array(slab.array), owner=slab, device_ordinal=device_ordinal
+        )
+        src = _device_array_view_from_cuda_array_interface(
+            _cuda_array_interface_for_array(value), owner=value, device_ordinal=device_ordinal
+        )
         _copy_batch_with_kernel(dst, src, lane_start, slab.spec, stream=stream)
         if sync:
             stream.synchronize()
@@ -352,6 +360,29 @@ def _array_device_ordinal(array: jax.Array) -> int:
 def _select_numba_device(device_ordinal: int):
     """Select a Numba CUDA context using process-visible device ordinal."""
     return cuda.current_context(int(device_ordinal))
+
+
+def _device_array_view_from_cuda_array_interface(
+    desc: dict[str, Any], *, owner: Any, device_ordinal: int
+) -> devicearray.DeviceNDArray:
+    """Create a Numba device array view in the selected process-visible context."""
+    version = int(desc.get("version", 0))
+    if version >= 1:
+        mask = desc.get("mask")
+        if mask is not None:
+            raise NotImplementedError("Masked arrays are not supported")
+
+    shape = desc["shape"]
+    strides = desc.get("strides")
+    dtype = np.dtype(desc["typestr"])
+    shape, strides, dtype = prepare_shape_strides_dtype(shape, strides, dtype, order="C")
+    size = driver.memory_size_from_info(shape, strides, dtype.itemsize)
+    context = _select_numba_device(device_ordinal)
+    devptr = driver.get_devptr_for_active_ctx(desc["data"][0])
+    data = driver.MemoryPointer(context, devptr, size=size, owner=owner)
+    stream_ptr = desc.get("stream")
+    stream = context.create_external_stream(stream_ptr) if stream_ptr is not None else 0
+    return devicearray.DeviceNDArray(shape=shape, strides=strides, dtype=dtype, gpu_data=data, stream=stream)
 
 
 def _numba_device_ordinal_for_jax_device(device: jax.Device) -> int:

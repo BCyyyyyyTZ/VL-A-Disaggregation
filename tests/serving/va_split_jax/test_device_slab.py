@@ -3,6 +3,7 @@ from __future__ import annotations
 import multiprocessing as mp
 import threading
 import time
+from types import SimpleNamespace
 from unittest import mock
 
 import jax.numpy as jnp
@@ -192,6 +193,50 @@ def test_cuda_write_stream_uses_selected_device_context():
     select_device.assert_called_once_with(2)
     fake_context.create_stream.assert_called_once_with()
     assert stream is fake_stream
+
+
+def test_cuda_copy_lane_uses_context_aware_array_views():
+    backend = CudaIpcDeviceSlabBackend()
+    spec = DeviceSlabSpec(name="x", shape=(1, 2, 3), dtype="float32", max_lanes=4)
+    slab = mock.Mock()
+    slab.handle.transport = backend.transport
+    slab.handle.device_ordinal = 2
+    slab.spec = spec
+    slab.array = SimpleNamespace(
+        shape=(1, 2, 3),
+        dtype=np.dtype("float32"),
+        unsafe_buffer_pointer=lambda: 123,
+    )
+    value = SimpleNamespace(
+        shape=(1, 2, 3),
+        dtype=np.dtype("float32"),
+        unsafe_buffer_pointer=lambda: 456,
+        block_until_ready=mock.Mock(),
+    )
+    dst = mock.Mock()
+    src = mock.Mock()
+    fake_stream = mock.Mock()
+
+    with mock.patch(
+        "openpi.serving.va_split_jax.device_slab._device_array_view_from_cuda_array_interface",
+        side_effect=[dst, src],
+    ) as array_view, mock.patch.object(
+        backend,
+        "_write_stream",
+        return_value=fake_stream,
+    ), mock.patch(
+        "openpi.serving.va_split_jax.device_slab.cuda.from_cuda_array_interface",
+        side_effect=AssertionError("cuda.from_cuda_array_interface() should not be used"),
+    ), mock.patch(
+        "openpi.serving.va_split_jax.device_slab._copy_lane_with_kernel"
+    ) as copy_kernel:
+        backend.copy_lane_from_array(slab, 1, value)
+
+    assert array_view.call_count == 2
+    assert array_view.call_args_list[0].kwargs == {"owner": slab, "device_ordinal": 2}
+    assert array_view.call_args_list[1].kwargs == {"owner": value, "device_ordinal": 2}
+    copy_kernel.assert_called_once_with(dst, src, 1, spec, stream=fake_stream)
+    fake_stream.synchronize.assert_called_once_with()
 
 
 def test_cuda_deferred_lane_writes_sync_once_and_preserve_content():
