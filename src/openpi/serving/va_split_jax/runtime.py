@@ -25,6 +25,7 @@ from openpi.serving.va_split_jax.compile import maybe_jit_vlm_model
 from openpi.serving.va_split_jax.compile import prune_split_model_for_role
 from openpi.serving.va_split_jax.compile import warmup_vlm_ae_slab_writes
 from openpi.serving.va_split_jax.compile import warmup_vlm_prefix_model
+from openpi.serving.va_split_jax.device_slab import DeviceSlabHandle
 from openpi.serving.va_split_jax.device_slab import make_default_device_slab_backend
 from openpi.serving.va_split_jax.multigpu_config import JaxMultiGpuVASplitConfig
 from openpi.serving.va_split_jax.multigpu_router import JaxVlmRouteState
@@ -269,17 +270,20 @@ def _run_jax_ae_process(
 class JaxMultiGpuReleaseFanout:
     """Route AE control messages back to the VLM worker that owns each lane."""
 
-    def __init__(self, release_queues: dict[str, Any]):
+    def __init__(self, release_queues: dict[str, Any], *, slab_device_ordinals: dict[str, int] | None = None):
         if not release_queues:
             raise ValueError("release_queues must be non-empty")
         self._release_queues = dict(release_queues)
         self._worker_ids = tuple(release_queues)
         self._next_credit_worker = 0
+        self._slab_device_ordinals = dict(slab_device_ordinals or {})
 
     def put(self, message: object) -> None:
         if isinstance(message, JaxPrefixSlabReady):
             for worker_id in self._worker_ids:
-                self._release_queues[worker_id].put(message)
+                self._release_queues[worker_id].put(
+                    _prefix_slab_ready_for_worker(message, self._slab_device_ordinals.get(worker_id))
+                )
             return
         if isinstance(message, JaxLaneCredits):
             for worker_id, credits in self._partition_lane_credits(message).items():
@@ -303,6 +307,33 @@ class JaxMultiGpuReleaseFanout:
             lanes_by_worker[worker_id].append(int(lane_id))
             self._next_credit_worker += 1
         return {worker_id: JaxLaneCredits(lane_ids=tuple(lanes)) for worker_id, lanes in lanes_by_worker.items()}
+
+
+def _prefix_slab_ready_for_worker(message: JaxPrefixSlabReady, device_ordinal: int | None) -> JaxPrefixSlabReady:
+    if device_ordinal is None:
+        return message
+    rewritten_tree = _replace_slab_handle_device_ordinal(
+        message.slab.slab_handle_tree,
+        device_ordinal=device_ordinal,
+    )
+    if rewritten_tree is message.slab.slab_handle_tree:
+        return message
+    return replace(message, slab=replace(message.slab, slab_handle_tree=rewritten_tree))
+
+
+def _replace_slab_handle_device_ordinal(value: Any, *, device_ordinal: int) -> Any:
+    if isinstance(value, DeviceSlabHandle):
+        return replace(value, device_ordinal=int(device_ordinal))
+    if isinstance(value, tuple):
+        return tuple(_replace_slab_handle_device_ordinal(item, device_ordinal=device_ordinal) for item in value)
+    if isinstance(value, list):
+        return [_replace_slab_handle_device_ordinal(item, device_ordinal=device_ordinal) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: _replace_slab_handle_device_ordinal(item, device_ordinal=device_ordinal)
+            for key, item in value.items()
+        }
+    return value
 
 
 class JaxMultiGpuProcessVASplitRuntime:
@@ -339,7 +370,10 @@ class JaxMultiGpuProcessVASplitRuntime:
         self._prefix_queue = ctx.Queue()
         self._result_queue = ctx.Queue()
         self._warmup_queue = ctx.Queue()
-        release_fanout = JaxMultiGpuReleaseFanout(self._release_queues)
+        release_fanout = JaxMultiGpuReleaseFanout(
+            self._release_queues,
+            slab_device_ordinals=dict.fromkeys(config.vlm_worker_ids, 1),
+        )
 
         self._ae_process = ctx.Process(
             target=run_ae_worker_entry,
@@ -374,7 +408,8 @@ class JaxMultiGpuProcessVASplitRuntime:
                     self._warmup_queue,
                     worker_id,
                 ),
-                kwargs={"device": device, "env_updates": vlm_env_updates},
+                # VLM sees its compute GPU first and the AE slab GPU second.
+                kwargs={"device": f"{device},{config.ae_device}", "env_updates": vlm_env_updates},
                 daemon=True,
             )
 

@@ -29,7 +29,6 @@ def run_vlm_worker_entry(
 
     from openpi.serving.va_split_jax.runtime import _run_jax_vlm_process
 
-    kwargs["env_updates"] = None
     _run_jax_vlm_process(*args, **kwargs)
 
 
@@ -42,5 +41,4 @@ def run_ae_worker_entry(
 
     from openpi.serving.va_split_jax.runtime import _run_jax_ae_process
 
-    kwargs["env_updates"] = None
     _run_jax_ae_process(*args, **kwargs)

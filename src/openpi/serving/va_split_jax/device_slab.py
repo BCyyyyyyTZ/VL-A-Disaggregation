@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import contextlib
 from collections.abc import Iterator
+import contextlib
 from dataclasses import dataclass
 import os
 from typing import Any
@@ -10,10 +10,10 @@ os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 from numba import cuda
 from numba.cuda.cudadrv import driver
 from numba.cuda.cudadrv import drvapi
+import numpy as np
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,7 +102,7 @@ class DeviceSlabBackend:
             slab.array, value, lane_id, axis=slab.spec.normalized_lane_axis
         )
         update.block_until_ready()
-        return DeviceSlab(slab.spec, update, slab.handle, slab._close_stack)
+        return DeviceSlab(slab.spec, update, slab.handle, slab._close_stack)  # noqa: SLF001
 
     def copy_batch_from_array(
         self,
@@ -119,7 +119,7 @@ class DeviceSlabBackend:
             slab.array, value, lane_start, axis=slab.spec.normalized_lane_axis
         )
         update.block_until_ready()
-        return DeviceSlab(slab.spec, update, slab.handle, slab._close_stack)
+        return DeviceSlab(slab.spec, update, slab.handle, slab._close_stack)  # noqa: SLF001
 
     def sync_write_stream(self, device_ordinal: int | None = None) -> None:
         """No-op for backends that complete each lane copy synchronously."""
@@ -298,10 +298,7 @@ def _export_cuda_ipc_handle(spec: DeviceSlabSpec, array: jax.Array) -> DeviceSla
         owner=array,
     )
     ipc_handle = context.get_ipc_handle(memory)
-    if driver.USE_NV_BINDING:
-        handle_bytes = bytes(ipc_handle.handle.reserved)
-    else:
-        handle_bytes = bytes(ipc_handle.handle)
+    handle_bytes = bytes(ipc_handle.handle.reserved) if driver.USE_NV_BINDING else bytes(ipc_handle.handle)
     return DeviceSlabHandle(
         spec=spec,
         transport=CudaIpcDeviceSlabBackend.transport,
@@ -366,6 +363,15 @@ def _numba_device_ordinal_for_jax_device(device: jax.Device) -> int:
     visible GPU must be selected as ordinal 0 even if JAX reports a different id.
     """
     jax_device_id = int(getattr(device, "id", 0))
+    visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    visible_tokens = [token.strip() for token in visible_devices.split(",") if token.strip()]
+    if visible_tokens:
+        if len(visible_tokens) == 1:
+            return 0
+        for ordinal, token in enumerate(visible_tokens):
+            if token.isdigit() and int(token) == jax_device_id:
+                return ordinal
+
     try:
         numba_device_count = len(cuda.gpus)
     except Exception:
@@ -373,15 +379,6 @@ def _numba_device_ordinal_for_jax_device(device: jax.Device) -> int:
 
     if 0 <= jax_device_id < numba_device_count:
         return jax_device_id
-
-    visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", "")
-    visible_tokens = [token.strip() for token in visible_devices.split(",") if token.strip()]
-    if visible_tokens:
-        for ordinal, token in enumerate(visible_tokens):
-            if token.isdigit() and int(token) == jax_device_id:
-                return ordinal
-        if len(visible_tokens) == 1:
-            return 0
 
     if numba_device_count == 1:
         return 0
