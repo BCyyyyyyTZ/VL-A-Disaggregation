@@ -1,0 +1,44 @@
+{
+  "case_id": "mps-sm60-bs32",
+  "status": "pass",
+  "mps_sm": 60,
+  "batch_size": 32,
+  "gpu_id": 3,
+  "elapsed_s": 121.06527955830097,
+  "returncode": 0,
+  "metrics": {
+    "total": {
+      "avg_ms": 1822.2822718322277,
+      "p50_ms": 1822.1107348799706,
+      "p95_ms": 1824.3024908006191
+    },
+    "vlm": {
+      "avg_ms": 1751.1795673519373,
+      "p50_ms": 1751.0881088674068,
+      "p95_ms": 1753.2477099448442
+    },
+    "action_head": {
+      "avg_ms": 70.2271718531847,
+      "p50_ms": 70.19900530576706,
+      "p95_ms": 70.40001712739468
+    },
+    "other": {
+      "avg_ms": 0.8755326271057129,
+      "p50_ms": 0.803973525762558,
+      "p95_ms": 1.3423960655927658
+    }
+  },
+  "model": {
+    "config": "pi05_libero",
+    "checkpoint_dir": "/mnt/tianze/models/pi05_libero",
+    "num_steps": 10,
+    "action_horizon": 10,
+    "action_dim": 32,
+    "max_token_len": 200,
+    "jax_jit": true,
+    "devices": [
+      "cuda:0"
+    ]
+  },
+  "error_message": null
+}

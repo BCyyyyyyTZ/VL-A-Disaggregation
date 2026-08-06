@@ -1,7 +1,7 @@
 {
   "counts": {
-    "total": 25,
-    "pass": 25,
+    "total": 42,
+    "pass": 42,
     "failed": 0
   },
   "cases": [
@@ -214,6 +214,138 @@
       "model": {
         "config": "pi05_libero",
         "checkpoint_dir": "/data1/miliang/models/pi05_libero",
+        "num_steps": 10,
+        "action_horizon": 10,
+        "action_dim": 32,
+        "max_token_len": 200,
+        "jax_jit": true,
+        "devices": [
+          "cuda:0"
+        ]
+      },
+      "error_message": null
+    },
+    {
+      "case_id": "mps-sm20-bs32",
+      "status": "pass",
+      "mps_sm": 20,
+      "batch_size": 32,
+      "gpu_id": 3,
+      "elapsed_s": 209.6483153924346,
+      "returncode": 0,
+      "metrics": {
+        "total": {
+          "avg_ms": 5111.95109449327,
+          "p50_ms": 5110.468856990337,
+          "p95_ms": 5125.070940330625
+        },
+        "vlm": {
+          "avg_ms": 4972.432275488973,
+          "p50_ms": 4971.213024109602,
+          "p95_ms": 4985.171854123473
+        },
+        "action_head": {
+          "avg_ms": 138.4662128984928,
+          "p50_ms": 138.4715661406517,
+          "p95_ms": 138.8544473797083
+        },
+        "other": {
+          "avg_ms": 1.0526061058044434,
+          "p50_ms": 0.9222552180290222,
+          "p95_ms": 1.5346772968769076
+        }
+      },
+      "model": {
+        "config": "pi05_libero",
+        "checkpoint_dir": "/mnt/tianze/models/pi05_libero",
+        "num_steps": 10,
+        "action_horizon": 10,
+        "action_dim": 32,
+        "max_token_len": 200,
+        "jax_jit": true,
+        "devices": [
+          "cuda:0"
+        ]
+      },
+      "error_message": null
+    },
+    {
+      "case_id": "mps-sm20-bs48",
+      "status": "pass",
+      "mps_sm": 20,
+      "batch_size": 48,
+      "gpu_id": 3,
+      "elapsed_s": 279.540800742805,
+      "returncode": 0,
+      "metrics": {
+        "total": {
+          "avg_ms": 7622.808281332254,
+          "p50_ms": 7622.702647000551,
+          "p95_ms": 7624.346972629428
+        },
+        "vlm": {
+          "avg_ms": 7428.080782294273,
+          "p50_ms": 7427.877143025398,
+          "p95_ms": 7429.178034514189
+        },
+        "action_head": {
+          "avg_ms": 193.80979426205158,
+          "p50_ms": 193.84188950061798,
+          "p95_ms": 194.15620267391205
+        },
+        "other": {
+          "avg_ms": 0.917704775929451,
+          "p50_ms": 0.8254610002040863,
+          "p95_ms": 1.4499500393867493
+        }
+      },
+      "model": {
+        "config": "pi05_libero",
+        "checkpoint_dir": "/mnt/tianze/models/pi05_libero",
+        "num_steps": 10,
+        "action_horizon": 10,
+        "action_dim": 32,
+        "max_token_len": 200,
+        "jax_jit": true,
+        "devices": [
+          "cuda:0"
+        ]
+      },
+      "error_message": null
+    },
+    {
+      "case_id": "mps-sm20-bs64",
+      "status": "pass",
+      "mps_sm": 20,
+      "batch_size": 64,
+      "gpu_id": 3,
+      "elapsed_s": 344.04528822749853,
+      "returncode": 0,
+      "metrics": {
+        "total": {
+          "avg_ms": 10214.288234338164,
+          "p50_ms": 10209.508996456861,
+          "p95_ms": 10240.564636141062
+        },
+        "vlm": {
+          "avg_ms": 9955.024912208319,
+          "p50_ms": 9955.043159425259,
+          "p95_ms": 9957.630019262433
+        },
+        "action_head": {
+          "avg_ms": 257.7656351029873,
+          "p50_ms": 253.12506407499313,
+          "p95_ms": 259.2946790158749
+        },
+        "other": {
+          "avg_ms": 1.4976870268583298,
+          "p50_ms": 1.2929774820804596,
+          "p95_ms": 2.752148732542994
+        }
+      },
+      "model": {
+        "config": "pi05_libero",
+        "checkpoint_dir": "/mnt/tianze/models/pi05_libero",
         "num_steps": 10,
         "action_horizon": 10,
         "action_dim": 32,
@@ -446,6 +578,138 @@
       "error_message": null
     },
     {
+      "case_id": "mps-sm40-bs32",
+      "status": "pass",
+      "mps_sm": 40,
+      "batch_size": 32,
+      "gpu_id": 3,
+      "elapsed_s": 139.54452066123486,
+      "returncode": 0,
+      "metrics": {
+        "total": {
+          "avg_ms": 2593.709447979927,
+          "p50_ms": 2595.547426491976,
+          "p95_ms": 2597.193381562829
+        },
+        "vlm": {
+          "avg_ms": 2508.3575554192066,
+          "p50_ms": 2510.345157235861,
+          "p95_ms": 2511.5857511758804
+        },
+        "action_head": {
+          "avg_ms": 84.4818513840437,
+          "p50_ms": 84.48469266295433,
+          "p95_ms": 84.80333238840103
+        },
+        "other": {
+          "avg_ms": 0.8700411766767502,
+          "p50_ms": 0.7891543209552765,
+          "p95_ms": 1.3530142605304718
+        }
+      },
+      "model": {
+        "config": "pi05_libero",
+        "checkpoint_dir": "/mnt/tianze/models/pi05_libero",
+        "num_steps": 10,
+        "action_horizon": 10,
+        "action_dim": 32,
+        "max_token_len": 200,
+        "jax_jit": true,
+        "devices": [
+          "cuda:0"
+        ]
+      },
+      "error_message": null
+    },
+    {
+      "case_id": "mps-sm40-bs48",
+      "status": "pass",
+      "mps_sm": 40,
+      "batch_size": 48,
+      "gpu_id": 3,
+      "elapsed_s": 174.7987035214901,
+      "returncode": 0,
+      "metrics": {
+        "total": {
+          "avg_ms": 3879.6269059181213,
+          "p50_ms": 3880.719244480133,
+          "p95_ms": 3882.9551614820957
+        },
+        "vlm": {
+          "avg_ms": 3762.2039314359426,
+          "p50_ms": 3763.32475990057,
+          "p95_ms": 3765.3461188077927
+        },
+        "action_head": {
+          "avg_ms": 116.44799001514912,
+          "p50_ms": 116.45658314228058,
+          "p95_ms": 116.71554483473301
+        },
+        "other": {
+          "avg_ms": 0.9749844670295715,
+          "p50_ms": 0.8634403347969055,
+          "p95_ms": 1.424467936158181
+        }
+      },
+      "model": {
+        "config": "pi05_libero",
+        "checkpoint_dir": "/mnt/tianze/models/pi05_libero",
+        "num_steps": 10,
+        "action_horizon": 10,
+        "action_dim": 32,
+        "max_token_len": 200,
+        "jax_jit": true,
+        "devices": [
+          "cuda:0"
+        ]
+      },
+      "error_message": null
+    },
+    {
+      "case_id": "mps-sm40-bs64",
+      "status": "pass",
+      "mps_sm": 40,
+      "batch_size": 64,
+      "gpu_id": 3,
+      "elapsed_s": 207.88810116797686,
+      "returncode": 0,
+      "metrics": {
+        "total": {
+          "avg_ms": 5162.433131784201,
+          "p50_ms": 5162.360452115536,
+          "p95_ms": 5164.656732976437
+        },
+        "vlm": {
+          "avg_ms": 5014.645821228623,
+          "p50_ms": 5014.82268422842,
+          "p95_ms": 5016.8418895453215
+        },
+        "action_head": {
+          "avg_ms": 146.83532267808914,
+          "p50_ms": 146.87048643827438,
+          "p95_ms": 147.14395366609097
+        },
+        "other": {
+          "avg_ms": 0.9519878774881363,
+          "p50_ms": 0.8250400424003601,
+          "p95_ms": 1.3294797390699389
+        }
+      },
+      "model": {
+        "config": "pi05_libero",
+        "checkpoint_dir": "/mnt/tianze/models/pi05_libero",
+        "num_steps": 10,
+        "action_horizon": 10,
+        "action_dim": 32,
+        "max_token_len": 200,
+        "jax_jit": true,
+        "devices": [
+          "cuda:0"
+        ]
+      },
+      "error_message": null
+    },
+    {
       "case_id": "mps-sm60-bs1",
       "status": "pass",
       "mps_sm": 60,
@@ -654,6 +918,138 @@
       "model": {
         "config": "pi05_libero",
         "checkpoint_dir": "/data1/miliang/models/pi05_libero",
+        "num_steps": 10,
+        "action_horizon": 10,
+        "action_dim": 32,
+        "max_token_len": 200,
+        "jax_jit": true,
+        "devices": [
+          "cuda:0"
+        ]
+      },
+      "error_message": null
+    },
+    {
+      "case_id": "mps-sm60-bs32",
+      "status": "pass",
+      "mps_sm": 60,
+      "batch_size": 32,
+      "gpu_id": 3,
+      "elapsed_s": 121.06527955830097,
+      "returncode": 0,
+      "metrics": {
+        "total": {
+          "avg_ms": 1822.2822718322277,
+          "p50_ms": 1822.1107348799706,
+          "p95_ms": 1824.3024908006191
+        },
+        "vlm": {
+          "avg_ms": 1751.1795673519373,
+          "p50_ms": 1751.0881088674068,
+          "p95_ms": 1753.2477099448442
+        },
+        "action_head": {
+          "avg_ms": 70.2271718531847,
+          "p50_ms": 70.19900530576706,
+          "p95_ms": 70.40001712739468
+        },
+        "other": {
+          "avg_ms": 0.8755326271057129,
+          "p50_ms": 0.803973525762558,
+          "p95_ms": 1.3423960655927658
+        }
+      },
+      "model": {
+        "config": "pi05_libero",
+        "checkpoint_dir": "/mnt/tianze/models/pi05_libero",
+        "num_steps": 10,
+        "action_horizon": 10,
+        "action_dim": 32,
+        "max_token_len": 200,
+        "jax_jit": true,
+        "devices": [
+          "cuda:0"
+        ]
+      },
+      "error_message": null
+    },
+    {
+      "case_id": "mps-sm60-bs48",
+      "status": "pass",
+      "mps_sm": 60,
+      "batch_size": 48,
+      "gpu_id": 3,
+      "elapsed_s": 150.42033669352531,
+      "returncode": 0,
+      "metrics": {
+        "total": {
+          "avg_ms": 2722.4981237202883,
+          "p50_ms": 2722.499266266823,
+          "p95_ms": 2726.9040685147047
+        },
+        "vlm": {
+          "avg_ms": 2627.2940535098314,
+          "p50_ms": 2627.1596774458885,
+          "p95_ms": 2631.6864017397165
+        },
+        "action_head": {
+          "avg_ms": 94.34829354286194,
+          "p50_ms": 94.22658011317253,
+          "p95_ms": 94.95818428695202
+        },
+        "other": {
+          "avg_ms": 0.8557766675949097,
+          "p50_ms": 0.8145608007907867,
+          "p95_ms": 1.1876851320266726
+        }
+      },
+      "model": {
+        "config": "pi05_libero",
+        "checkpoint_dir": "/mnt/tianze/models/pi05_libero",
+        "num_steps": 10,
+        "action_horizon": 10,
+        "action_dim": 32,
+        "max_token_len": 200,
+        "jax_jit": true,
+        "devices": [
+          "cuda:0"
+        ]
+      },
+      "error_message": null
+    },
+    {
+      "case_id": "mps-sm60-bs64",
+      "status": "pass",
+      "mps_sm": 60,
+      "batch_size": 64,
+      "gpu_id": 3,
+      "elapsed_s": 167.43188236653805,
+      "returncode": 0,
+      "metrics": {
+        "total": {
+          "avg_ms": 3612.0602510869503,
+          "p50_ms": 3610.013272613287,
+          "p95_ms": 3618.3938540518284
+        },
+        "vlm": {
+          "avg_ms": 3492.1971403062344,
+          "p50_ms": 3490.132849663496,
+          "p95_ms": 3498.638029769063
+        },
+        "action_head": {
+          "avg_ms": 119.04827766120434,
+          "p50_ms": 119.0115362405777,
+          "p95_ms": 119.53825503587723
+        },
+        "other": {
+          "avg_ms": 0.8148331195116043,
+          "p50_ms": 0.7985271513462067,
+          "p95_ms": 1.0526884347200396
+        }
+      },
+      "model": {
+        "config": "pi05_libero",
+        "checkpoint_dir": "/mnt/tianze/models/pi05_libero",
         "num_steps": 10,
         "action_horizon": 10,
         "action_dim": 32,
@@ -886,6 +1282,138 @@
       "error_message": null
     },
     {
+      "case_id": "mps-sm80-bs32",
+      "status": "pass",
+      "mps_sm": 80,
+      "batch_size": 32,
+      "gpu_id": 3,
+      "elapsed_s": 109.53374089300632,
+      "returncode": 0,
+      "metrics": {
+        "total": {
+          "avg_ms": 1440.8974569290876,
+          "p50_ms": 1440.7035000622272,
+          "p95_ms": 1443.2483833283186
+        },
+        "vlm": {
+          "avg_ms": 1378.8407891988754,
+          "p50_ms": 1378.7769079208374,
+          "p95_ms": 1380.7830702513456
+        },
+        "action_head": {
+          "avg_ms": 61.14845499396324,
+          "p50_ms": 61.19144335389137,
+          "p95_ms": 61.532530933618546
+        },
+        "other": {
+          "avg_ms": 0.90821273624897,
+          "p50_ms": 0.87752565741539,
+          "p95_ms": 1.1630166321992879
+        }
+      },
+      "model": {
+        "config": "pi05_libero",
+        "checkpoint_dir": "/mnt/tianze/models/pi05_libero",
+        "num_steps": 10,
+        "action_horizon": 10,
+        "action_dim": 32,
+        "max_token_len": 200,
+        "jax_jit": true,
+        "devices": [
+          "cuda:0"
+        ]
+      },
+      "error_message": null
+    },
+    {
+      "case_id": "mps-sm80-bs48",
+      "status": "pass",
+      "mps_sm": 80,
+      "batch_size": 48,
+      "gpu_id": 3,
+      "elapsed_s": 131.87071173638105,
+      "returncode": 0,
+      "metrics": {
+        "total": {
+          "avg_ms": 2163.4910982102156,
+          "p50_ms": 2163.704037666321,
+          "p95_ms": 2164.7503055632114
+        },
+        "vlm": {
+          "avg_ms": 2080.222760513425,
+          "p50_ms": 2080.589361488819,
+          "p95_ms": 2081.060751527548
+        },
+        "action_head": {
+          "avg_ms": 82.38535448908806,
+          "p50_ms": 82.39869028329849,
+          "p95_ms": 82.722969353199
+        },
+        "other": {
+          "avg_ms": 0.8829832077026367,
+          "p50_ms": 0.8285976946353912,
+          "p95_ms": 1.275523379445076
+        }
+      },
+      "model": {
+        "config": "pi05_libero",
+        "checkpoint_dir": "/mnt/tianze/models/pi05_libero",
+        "num_steps": 10,
+        "action_horizon": 10,
+        "action_dim": 32,
+        "max_token_len": 200,
+        "jax_jit": true,
+        "devices": [
+          "cuda:0"
+        ]
+      },
+      "error_message": null
+    },
+    {
+      "case_id": "mps-sm80-bs64",
+      "status": "pass",
+      "mps_sm": 80,
+      "batch_size": 64,
+      "gpu_id": 3,
+      "elapsed_s": 150.59139605611563,
+      "returncode": 0,
+      "metrics": {
+        "total": {
+          "avg_ms": 2882.9035215079784,
+          "p50_ms": 2883.3909183740616,
+          "p95_ms": 2886.795610561967
+        },
+        "vlm": {
+          "avg_ms": 2777.9723212122917,
+          "p50_ms": 2779.245238751173,
+          "p95_ms": 2780.4810624569654
+        },
+        "action_head": {
+          "avg_ms": 104.12339456379414,
+          "p50_ms": 103.10769826173782,
+          "p95_ms": 106.0148883610964
+        },
+        "other": {
+          "avg_ms": 0.8078057318925858,
+          "p50_ms": 0.7492788136005402,
+          "p95_ms": 1.177174597978592
+        }
+      },
+      "model": {
+        "config": "pi05_libero",
+        "checkpoint_dir": "/mnt/tianze/models/pi05_libero",
+        "num_steps": 10,
+        "action_horizon": 10,
+        "action_dim": 32,
+        "max_token_len": 200,
+        "jax_jit": true,
+        "devices": [
+          "cuda:0"
+        ]
+      },
+      "error_message": null
+    },
+    {
       "case_id": "mps-sm100-bs1",
       "status": "pass",
       "mps_sm": 100,
@@ -918,6 +1446,50 @@
       "model": {
         "config": "pi05_libero",
         "checkpoint_dir": "/data1/miliang/models/pi05_libero",
+        "num_steps": 10,
+        "action_horizon": 10,
+        "action_dim": 32,
+        "max_token_len": 200,
+        "jax_jit": true,
+        "devices": [
+          "cuda:0"
+        ]
+      },
+      "error_message": null
+    },
+    {
+      "case_id": "mps-sm100-bs2",
+      "status": "pass",
+      "mps_sm": 100,
+      "batch_size": 2,
+      "gpu_id": 3,
+      "elapsed_s": 76.91554976254702,
+      "returncode": 0,
+      "metrics": {
+        "total": {
+          "avg_ms": 120.5192781984806,
+          "p50_ms": 117.34707280993462,
+          "p95_ms": 139.26810286939147
+        },
+        "vlm": {
+          "avg_ms": 88.12817856669426,
+          "p50_ms": 88.02302554249763,
+          "p95_ms": 88.9509741216898
+        },
+        "action_head": {
+          "avg_ms": 31.511833518743515,
+          "p50_ms": 27.95521542429924,
+          "p95_ms": 49.87407177686691
+        },
+        "other": {
+          "avg_ms": 0.8792661130428314,
+          "p50_ms": 0.5787312984466553,
+          "p95_ms": 1.324409246444706
+        }
+      },
+      "model": {
+        "config": "pi05_libero",
+        "checkpoint_dir": "/mnt/tianze/models/pi05_libero",
         "num_steps": 10,
         "action_horizon": 10,
         "action_dim": 32,
@@ -1094,6 +1666,182 @@
       "model": {
         "config": "pi05_libero",
         "checkpoint_dir": "/data1/miliang/models/pi05_libero",
+        "num_steps": 10,
+        "action_horizon": 10,
+        "action_dim": 32,
+        "max_token_len": 200,
+        "jax_jit": true,
+        "devices": [
+          "cuda:0"
+        ]
+      },
+      "error_message": null
+    },
+    {
+      "case_id": "mps-sm100-bs32",
+      "status": "pass",
+      "mps_sm": 100,
+      "batch_size": 32,
+      "gpu_id": 3,
+      "elapsed_s": 109.50485841184855,
+      "returncode": 0,
+      "metrics": {
+        "total": {
+          "avg_ms": 1253.0773926526308,
+          "p50_ms": 1253.191888332367,
+          "p95_ms": 1260.8173105865717
+        },
+        "vlm": {
+          "avg_ms": 1194.7058007121086,
+          "p50_ms": 1195.0786039233208,
+          "p95_ms": 1202.2399671375751
+        },
+        "action_head": {
+          "avg_ms": 57.53382779657841,
+          "p50_ms": 57.498008012771606,
+          "p95_ms": 58.05456079542637
+        },
+        "other": {
+          "avg_ms": 0.8377641439437866,
+          "p50_ms": 0.8217357099056244,
+          "p95_ms": 1.0209035128355026
+        }
+      },
+      "model": {
+        "config": "pi05_libero",
+        "checkpoint_dir": "/mnt/tianze/models/pi05_libero",
+        "num_steps": 10,
+        "action_horizon": 10,
+        "action_dim": 32,
+        "max_token_len": 200,
+        "jax_jit": true,
+        "devices": [
+          "cuda:0"
+        ]
+      },
+      "error_message": null
+    },
+    {
+      "case_id": "mps-sm100-bs48",
+      "status": "pass",
+      "mps_sm": 100,
+      "batch_size": 48,
+      "gpu_id": 3,
+      "elapsed_s": 123.41135374456644,
+      "returncode": 0,
+      "metrics": {
+        "total": {
+          "avg_ms": 1877.2660944610834,
+          "p50_ms": 1881.4995028078556,
+          "p95_ms": 1885.4104097932577
+        },
+        "vlm": {
+          "avg_ms": 1801.8410876393318,
+          "p50_ms": 1805.9626631438732,
+          "p95_ms": 1809.8611369729042
+        },
+        "action_head": {
+          "avg_ms": 74.53378029167652,
+          "p50_ms": 74.53305646777153,
+          "p95_ms": 74.97055269777775
+        },
+        "other": {
+          "avg_ms": 0.8912265300750732,
+          "p50_ms": 0.7945150136947632,
+          "p95_ms": 1.2765862047672272
+        }
+      },
+      "model": {
+        "config": "pi05_libero",
+        "checkpoint_dir": "/mnt/tianze/models/pi05_libero",
+        "num_steps": 10,
+        "action_horizon": 10,
+        "action_dim": 32,
+        "max_token_len": 200,
+        "jax_jit": true,
+        "devices": [
+          "cuda:0"
+        ]
+      },
+      "error_message": null
+    },
+    {
+      "case_id": "mps-sm100-bs64",
+      "status": "pass",
+      "mps_sm": 100,
+      "batch_size": 64,
+      "gpu_id": 3,
+      "elapsed_s": 140.3256632760167,
+      "returncode": 0,
+      "metrics": {
+        "total": {
+          "avg_ms": 2467.4336317926645,
+          "p50_ms": 2468.791387975216,
+          "p95_ms": 2475.4195980727673
+        },
+        "vlm": {
+          "avg_ms": 2372.951625287533,
+          "p50_ms": 2374.593395739794,
+          "p95_ms": 2380.6162156164646
+        },
+        "action_head": {
+          "avg_ms": 93.56357231736183,
+          "p50_ms": 93.5514084994793,
+          "p95_ms": 93.98747906088829
+        },
+        "other": {
+          "avg_ms": 0.9184341877698898,
+          "p50_ms": 0.9328685700893402,
+          "p95_ms": 1.2312289327383041
+        }
+      },
+      "model": {
+        "config": "pi05_libero",
+        "checkpoint_dir": "/mnt/tianze/models/pi05_libero",
+        "num_steps": 10,
+        "action_horizon": 10,
+        "action_dim": 32,
+        "max_token_len": 200,
+        "jax_jit": true,
+        "devices": [
+          "cuda:0"
+        ]
+      },
+      "error_message": null
+    },
+    {
+      "case_id": "mps-sm100-bs128",
+      "status": "pass",
+      "mps_sm": 100,
+      "batch_size": 128,
+      "gpu_id": 3,
+      "elapsed_s": 217.96157357096672,
+      "returncode": 0,
+      "metrics": {
+        "total": {
+          "avg_ms": 5006.903121620417,
+          "p50_ms": 5010.507673025131,
+          "p95_ms": 5012.28495799005
+        },
+        "vlm": {
+          "avg_ms": 4816.885993629694,
+          "p50_ms": 4820.285696536303,
+          "p95_ms": 4822.082064673305
+        },
+        "action_head": {
+          "avg_ms": 188.98616321384907,
+          "p50_ms": 188.9536865055561,
+          "p95_ms": 189.44221548736095
+        },
+        "other": {
+          "avg_ms": 1.0309647768735886,
+          "p50_ms": 0.9182170033454895,
+          "p95_ms": 1.472467929124833
+        }
+      },
+      "model": {
+        "config": "pi05_libero",
+        "checkpoint_dir": "/mnt/tianze/models/pi05_libero",
         "num_steps": 10,
         "action_horizon": 10,
         "action_dim": 32,

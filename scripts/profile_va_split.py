@@ -20,20 +20,11 @@ Mode = Literal["monolithic", "split-no-mps", "split-mps", "jax-monolithic", "jax
 CompileMode = Literal["default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"]
 TraceStatus = Literal["ok", "error", "timeout"]
 DEFAULT_PROFILE_CHECKPOINT_CONFIG = "pi05_libero"
-DEFAULT_PROFILE_CHECKPOINT_DIR = "/data1/miliang/models/RLinf-Pi05-LIBERO-SFT"
-# When torch.compile is enabled, warm these batch shapes before timed measurement.
-# Actual warmup sizes are clamped to profile_warmup_max_batch_size(), which for
-# VA-split follows runtime prefix capacity (max_vlm_batch_size * 3, typically 24).
+DEFAULT_PROFILE_CHECKPOINT_DIR = "/mnt/tianze/models/pi05_libero_pytorch"
+# Torch compile warmup covers every batch shape up to the runtime capacity.
+# Dynamo's default recompile/cache limit is raised in the PyTorch model loader so
+# the warmup does not fall back to eager after the eighth shape.
 COMPILE_WARMUP_MAX_BATCH_SIZE = 32
-COMPILE_WARMUP_BATCH_PLAN: tuple[tuple[int, int], ...] = (
-    (1, 2),
-    (4, 1),
-    (8, 2),
-    (16, 1),
-    (20, 2),
-    (24, 1),
-    (32, 1),
-)
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -72,6 +63,11 @@ class BenchmarkResult:
     consistency: dict[str, Any] | None = None
 
 
+@dataclasses.dataclass(frozen=True, slots=True)
+class RateSweepResult:
+    results: list[BenchmarkResult]
+
+
 @dataclasses.dataclass(frozen=True)
 class Checkpoint:
     config: str
@@ -88,6 +84,7 @@ class Args:
     mode: Mode = "split-mps"
     num_requests: int = 128
     request_rate_hz: float = 16.0
+    request_rate_hz_values: str = ""
     max_inflight: int = 64
     batch_size: int = 8
     seed: int = 0
@@ -100,8 +97,8 @@ class Args:
     fixed_noise: bool = True
     timeout_s: float = 60.0
     warmup_requests: int = 2
-    # After compile/shape warmup, keep issuing real e2e requests until latency is steady
-    # (jax-split / jax-monolithic only). Avoids counting first-request cold spikes in profile.
+    # After compile/shape warmup, keep issuing real e2e requests until latency is steady.
+    # Avoids counting first-request queue/IPC/secondary-graph cold spikes in profile.
     warmup_until_steady: bool = True
     warmup_steady_window: int = 4
     warmup_steady_max_requests: int = 48
@@ -732,9 +729,43 @@ def compute_inflight_peak(traces: list[RequestTrace]) -> int:
 
 
 def run_profile(args: Args) -> BenchmarkResult:
-    requests = make_synthetic_libero_requests(
+    rates = profile_request_rates(args)
+    if len(rates) != 1:
+        raise ValueError("run_profile expects one request rate; use run_profile_rate_sweep for multiple rates")
+    requests = make_profile_requests(args, request_rate_hz=rates[0])
+    policy = create_policy_for_mode(args, args.mode)
+    try:
+        with make_profile_executor(policy, args) as executor:
+            _warmup_before_timed_workload(policy, requests, args=args, executor=executor)
+            return run_timed_profile_with_policy(policy, requests, args=args, executor=executor)
+    finally:
+        close_policy(policy)
+
+
+def run_profile_rate_sweep(args: Args) -> RateSweepResult:
+    rates = profile_request_rates(args)
+    if len(rates) <= 1:
+        return RateSweepResult(results=[run_profile(dataclasses.replace(args, request_rate_hz=rates[0]))])
+
+    warmup_requests = make_profile_requests(args, request_rate_hz=rates[0])
+    policy = create_policy_for_mode(args, args.mode)
+    try:
+        with make_profile_executor(policy, args) as executor:
+            _warmup_before_timed_workload(policy, warmup_requests, args=args, executor=executor)
+            results = []
+            for rate in rates:
+                rate_args = dataclasses.replace(args, request_rate_hz=rate)
+                requests = make_profile_requests(rate_args, request_rate_hz=rate)
+                results.append(run_timed_profile_with_policy(policy, requests, args=rate_args, executor=executor))
+    finally:
+        close_policy(policy)
+    return RateSweepResult(results=results)
+
+
+def make_profile_requests(args: Args, *, request_rate_hz: float) -> list[SyntheticRequest]:
+    return make_synthetic_libero_requests(
         num_requests=args.num_requests,
-        request_rate_hz=args.request_rate_hz,
+        request_rate_hz=request_rate_hz,
         seed=args.seed,
         action_horizon=args.action_horizon,
         action_dim=args.action_dim,
@@ -743,44 +774,80 @@ def run_profile(args: Args) -> BenchmarkResult:
         prompt=args.prompt,
         fixed_noise=args.fixed_noise,
     )
-    policy = create_policy_for_mode(args, args.mode)
+
+
+def profile_request_rates(args: Args) -> tuple[float, ...]:
+    if not args.request_rate_hz_values.strip():
+        return (float(args.request_rate_hz),)
+    normalized = args.request_rate_hz_values.replace(",", " ")
+    rates = tuple(float(item) for item in normalized.split())
+    if not rates:
+        raise ValueError("request_rate_hz_values must contain at least one rate")
+    if any(rate <= 0.0 for rate in rates):
+        raise ValueError("request_rate_hz_values must contain only positive rates")
+    return rates
+
+
+def make_profile_executor(policy: Any, args: Args) -> ThreadPoolExecutor:
+    if args.mode in ("monolithic", "jax-monolithic") and args.batch_size > 1:
+        return ThreadPoolExecutor(max_workers=1, thread_name_prefix="va-profile-baseline-model")
+    supports_concurrent_infer = bool(getattr(policy, "supports_concurrent_infer", False))
+    max_workers = args.max_inflight if supports_concurrent_infer else 1
+    return ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="va-profile")
+
+
+def run_timed_profile_with_policy(
+    policy: Any,
+    requests: list[SyntheticRequest],
+    *,
+    args: Args,
+    executor: ThreadPoolExecutor,
+) -> BenchmarkResult:
     policy_device = getattr(policy, "_pytorch_device", args.pytorch_device)
     sampler = GpuUtilizationSampler(device_index=resolve_gpu_device_index(policy_device, args.gpu_device_index))
     try:
-        if args.mode in ("monolithic", "jax-monolithic") and args.batch_size > 1:
-            with ThreadPoolExecutor(max_workers=1, thread_name_prefix="va-profile-baseline-model") as executor:
-                _warmup_before_timed_workload(policy, requests, args=args, executor=executor)
-                sampler.start()
-                traces = asyncio.run(
-                    run_benchmark_runtime_batch_requests(
-                        policy,
-                        requests,
-                        max_inflight=args.max_inflight,
-                        timeout_s=args.timeout_s,
-                        max_batch_size=args.batch_size,
-                        max_wait_ms=args.max_vlm_wait_ms,
-                        executor=executor,
-                    )
-                )
-        else:
-            supports_concurrent_infer = bool(getattr(policy, "supports_concurrent_infer", False))
-            max_workers = args.max_inflight if supports_concurrent_infer else 1
-            with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="va-profile") as executor:
-                _warmup_before_timed_workload(policy, requests, args=args, executor=executor)
-                sampler.start()
-                traces = asyncio.run(
-                    run_benchmark_requests(
-                        policy,
-                        requests,
-                        max_inflight=args.max_inflight,
-                        timeout_s=args.timeout_s,
-                        executor=executor,
-                    )
-                )
+        sampler.start()
+        traces = asyncio.run(run_timed_workload(policy, requests, args=args, executor=executor))
     finally:
         sampler.stop()
-        close_policy(policy)
+    summary = summarize_profile_traces(policy, traces, args=args, sampler=sampler)
+    consistency = _run_consistency_check(args, requests) if args.check_consistency else None
+    return BenchmarkResult(traces=traces, summary=summary, consistency=consistency)
 
+
+async def run_timed_workload(
+    policy: Any,
+    requests: list[SyntheticRequest],
+    *,
+    args: Args,
+    executor: ThreadPoolExecutor,
+) -> list[RequestTrace]:
+    if args.mode in ("monolithic", "jax-monolithic") and args.batch_size > 1:
+        return await run_benchmark_runtime_batch_requests(
+            policy,
+            requests,
+            max_inflight=args.max_inflight,
+            timeout_s=args.timeout_s,
+            max_batch_size=args.batch_size,
+            max_wait_ms=args.max_vlm_wait_ms,
+            executor=executor,
+        )
+    return await run_benchmark_requests(
+        policy,
+        requests,
+        max_inflight=args.max_inflight,
+        timeout_s=args.timeout_s,
+        executor=executor,
+    )
+
+
+def summarize_profile_traces(
+    policy: Any,
+    traces: list[RequestTrace],
+    *,
+    args: Args,
+    sampler: GpuUtilizationSampler,
+) -> dict[str, float | int | None]:
     summary = summarize_traces(
         traces,
         target_request_rate_hz=args.request_rate_hz,
@@ -800,8 +867,7 @@ def run_profile(args: Args) -> BenchmarkResult:
         summary["e2e_warmup_wall_ms"] = float(e2e_warmup.get("e2e_warmup_wall_ms", 0.0))
         if e2e_warmup.get("e2e_warmup_steady_p50_ms") is not None:
             summary["e2e_warmup_steady_p50_ms"] = float(e2e_warmup["e2e_warmup_steady_p50_ms"])
-    consistency = _run_consistency_check(args, requests) if args.check_consistency else None
-    return BenchmarkResult(traces=traces, summary=summary, consistency=consistency)
+    return summary
 
 
 def warmup_policy(
@@ -831,10 +897,10 @@ def warmup_policy_batch(
 
 
 def pytorch_compile_warmup_batch_plan(max_batch_size: int) -> tuple[tuple[int, int], ...]:
-    """Return compile warmup (batch_size, repeats), clamped to max_batch_size."""
+    """Return every compile warmup batch shape up to max_batch_size."""
     if max_batch_size <= 0:
         raise ValueError("max_batch_size must be positive")
-    return tuple((min(batch_size, max_batch_size), repeats) for batch_size, repeats in COMPILE_WARMUP_BATCH_PLAN)
+    return tuple((batch_size, 1) for batch_size in range(1, max_batch_size + 1))
 
 
 def make_fixed_size_batch_request(
@@ -863,24 +929,22 @@ def warmup_pytorch_compile_shapes(
     max_batch_size: int,
     executor: ThreadPoolExecutor,
 ) -> None:
-    """Warm torch.compile paths with explicit batch shapes before timed runs."""
+    """Warm torch.compile paths for every timed batch shape before profiling."""
     for batch_size, repeats in pytorch_compile_warmup_batch_plan(max_batch_size):
+        print(f"[profile] pytorch compile shape warmup B={batch_size} repeats={repeats}", flush=True)
+        wall_start = time.perf_counter()
         batch_request = make_fixed_size_batch_request(requests, batch_size=batch_size)
         warmup_policy_batch(policy, batch_request, num_requests=repeats, executor=executor)
+        wall_ms = (time.perf_counter() - wall_start) * 1000.0
+        print(f"[profile] pytorch compile shape warmup B={batch_size} done wall={wall_ms:.1f}ms", flush=True)
 
 
 def profile_warmup_max_batch_size(args: Args) -> int:
-    """Compile-shape warmup ceiling.
-
-    For VA-split this follows runtime prefix/live-feature capacity
-    (`max_vlm_batch_size * 3` in VASplitRuntime), not the VLM FCFS cap alone.
-    """
-    absolute_cap = COMPILE_WARMUP_MAX_BATCH_SIZE
+    """Return the largest batch size covered by PyTorch compile warmup."""
     if args.mode in ("monolithic", "jax-monolithic"):
-        return min(absolute_cap, max(1, int(args.batch_size)))
-    # Keep in sync with openpi.serving.va_split.runtime.VASplitRuntime default slots.
-    prefix_capacity = max(1, int(args.max_vlm_batch_size) * 3)
-    return min(absolute_cap, prefix_capacity, max(1, int(args.max_ae_batch_size)))
+        return min(COMPILE_WARMUP_MAX_BATCH_SIZE, max(1, int(args.batch_size)))
+    # Keep in sync with openpi.serving.va_split.runtime.ProcessVASplitRuntime default slots.
+    return max(1, int(args.max_vlm_batch_size) * 3)
 
 
 def _median_ms(values: Sequence[float]) -> float:
@@ -909,9 +973,7 @@ def is_e2e_latency_steady(
         return False
     if abs(recent_p50 - prev_p50) / prev_p50 > rel_tol:
         return False
-    if max(recent) > recent_p50 * spike_factor:
-        return False
-    return True
+    return max(recent) <= recent_p50 * spike_factor
 
 
 def warmup_jax_e2e_pipeline_until_steady(
@@ -923,8 +985,8 @@ def warmup_jax_e2e_pipeline_until_steady(
 ) -> dict[str, float]:
     """Warm the full VLM→AE serving path until e2e latency looks steady.
 
-    Component XLA warmup does not cover first real queue/IPC/credit handoff; those cold
-    spikes must finish before timed profile measurement.
+    Component compile warmup does not cover every real queue/IPC/credit handoff or
+    scheduler path; those cold spikes must finish before timed profile measurement.
     """
     if not requests:
         raise ValueError("requests must be non-empty")
@@ -1053,8 +1115,13 @@ def _warmup_before_timed_workload(
             max_batch_size=profile_warmup_max_batch_size(args),
             executor=executor,
         )
+        if args.mode in ("split-mps", "split-no-mps") and args.warmup_requests > 0:
+            stats = warmup_jax_e2e_pipeline_until_steady(policy, requests, args=args, executor=executor)
+            policy._profile_e2e_warmup_stats = stats  # noqa: SLF001 — profile-only annotation
         return
-    if args.mode in ("jax-split-ipc", "jax-monolithic"):
+    if args.warmup_requests <= 0:
+        return
+    if args.mode in ("split-mps", "split-no-mps", "jax-split-ipc", "jax-monolithic"):
         stats = warmup_jax_e2e_pipeline_until_steady(policy, requests, args=args, executor=executor)
         policy._profile_e2e_warmup_stats = stats  # noqa: SLF001 — profile-only annotation
         return
@@ -1091,10 +1158,10 @@ def _with_pytorch_compile_mode(train_config, compile_mode: CompileMode | None):
 def create_policy_for_mode(args: Args, mode: Mode):
     validate_mps_environment(mode, require_mps_env=args.require_mps_env)
 
-    from openpi.policies import policy_config as _policy_config  # noqa: PLC0415
-    from openpi.policies import jax_va_split_policy as _jax_va_split_policy  # noqa: PLC0415
-    from openpi.policies import va_split_policy as _va_split_policy  # noqa: PLC0415
-    from openpi.training import config as _config  # noqa: PLC0415
+    from openpi.policies import jax_va_split_policy as _jax_va_split_policy
+    from openpi.policies import policy_config as _policy_config
+    from openpi.policies import va_split_policy as _va_split_policy
+    from openpi.training import config as _config
 
     train_config = _with_pytorch_compile_mode(_config.get_config(args.policy.config), args.pytorch_compile_mode)
     sample_kwargs = {"num_steps": args.num_steps}
@@ -1160,7 +1227,7 @@ class GpuUtilizationSampler:
         if self._device_index is None:
             return
         try:
-            import pynvml  # noqa: PLC0415
+            import pynvml
 
             pynvml.nvmlInit()
             self._nvml = pynvml
@@ -1631,21 +1698,43 @@ def close_policy(policy: Any) -> None:
 
 
 def main(args: Args) -> None:
-    result = run_profile(args)
-    print_summary(result.summary)
-    if result.consistency is not None:
-        print("consistency:")
-        print(json.dumps(result.consistency, default=_json_default, indent=2, sort_keys=True))
+    rates = profile_request_rates(args)
+    if len(rates) == 1:
+        result = run_profile(args)
+        print_summary(result.summary)
+        if result.consistency is not None:
+            print("consistency:")
+            print(json.dumps(result.consistency, default=_json_default, indent=2, sort_keys=True))
+        if args.json_output is not None:
+            args.json_output.write_text(
+                json.dumps(benchmark_result_payload(result), default=_json_default, indent=2, sort_keys=True),
+                encoding="utf-8",
+            )
+        return
+
+    sweep = run_profile_rate_sweep(args)
+    for result in sweep.results:
+        print(f"request_rate_hz={result.summary['target_request_rate_hz']}")
+        print_summary(result.summary)
     if args.json_output is not None:
         payload = {
-            "summary": result.summary,
-            "per_request_e2e_ms": per_request_e2e_ms(result.traces),
-            "consistency": result.consistency,
+            "runs": [benchmark_result_payload(result) for result in sweep.results],
+            "summary_by_rate": {
+                str(result.summary["target_request_rate_hz"]): result.summary for result in sweep.results
+            },
         }
         args.json_output.write_text(
             json.dumps(payload, default=_json_default, indent=2, sort_keys=True),
             encoding="utf-8",
         )
+
+
+def benchmark_result_payload(result: BenchmarkResult) -> dict[str, Any]:
+    return {
+        "summary": result.summary,
+        "per_request_e2e_ms": per_request_e2e_ms(result.traces),
+        "consistency": result.consistency,
+    }
 
 
 def per_request_e2e_ms(traces: list[RequestTrace]) -> dict[str, float]:

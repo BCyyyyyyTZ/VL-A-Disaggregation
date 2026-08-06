@@ -102,10 +102,33 @@ def test_va_split_policy_shutdown_delegates_to_runtime():
     assert runtime.shutdown_called is True
 
 
+def test_configure_torch_compile_shape_cache_raises_dynamo_limits(monkeypatch):
+    import torch._dynamo as dynamo
+
+    config = dynamo.config
+    names = [name for name in ("recompile_limit", "cache_size_limit") if hasattr(config, name)]
+    if not names:
+        pytest.skip("torch._dynamo.config has no shape cache limit knobs")
+
+    old_values = {name: getattr(config, name) for name in names}
+    try:
+        for name in names:
+            setattr(config, name, 8)
+        monkeypatch.setenv("PYTORCH_COMPILE_RECOMPILE_LIMIT", "64")
+
+        va_split_policy._configure_torch_compile_shape_cache()  # noqa: SLF001
+
+        for name in names:
+            assert getattr(config, name) >= 64
+    finally:
+        for name, value in old_values.items():
+            setattr(config, name, value)
+
+
 @pytest.mark.parametrize(
     ("compile_mode", "expected_compilations"),
     [
-        ("max-autotune", [("build_prefix_feature", "max-autotune", True), ("denoise_one_batch", "max-autotune", True)]),
+        ("max-autotune", [("build_prefix_feature", "max-autotune", False), ("denoise_one_batch", "max-autotune", False)]),
         (None, []),
     ],
 )
@@ -203,7 +226,7 @@ def test_load_pytorch_model_prunes_split_role_weights(
     def compile_spy(function, *, mode, dynamic):
         compilations.append(function.__name__)
         assert mode == "max-autotune"
-        assert dynamic is True
+        assert dynamic is False
         return function
 
     monkeypatch.setattr(va_split_policy.torch, "compile", compile_spy)

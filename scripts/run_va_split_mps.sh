@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Start OpenPI VA-split policy server under NVIDIA MPS.
-# All logs for one run go under: /data1/miliang/VL-A-Disaggregation/logs/V-A/<timestamp>/*.log
+# All logs for one run go under: ${REPO_ROOT}/logs/V-A/<timestamp>/*.log
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -10,13 +10,14 @@ cd "${REPO_ROOT}"
 GPU_ID="${GPU_ID:-1}"
 PORT="${PORT:-8000}"
 POLICY_CONFIG="${POLICY_CONFIG:-pi05_libero}"
-POLICY_DIR="${POLICY_DIR:-/data1/miliang/models/RLinf-Pi05-LIBERO-SFT}"
+POLICY_DIR="${POLICY_DIR:-/mnt/tianze/models/pi05_libero_pytorch}"
 RUN_MODE="${RUN_MODE:-server}"
 # ours mode : PROFILE_MODE=split-mps
 # baseline mode : PROFILE_MODE=monolithic
 PROFILE_MODE="${PROFILE_MODE:-split-mps}"
+REQUEST_RATE_HZ_LIST="${REQUEST_RATE_HZ_LIST:-}"
 RUN_TS="${RUN_TS:-$(date +%Y%m%d_%H%M%S)}"
-LOG_ROOT="${LOG_ROOT:-/data1/miliang/VL-A-Disaggregation/logs/V-A}"
+LOG_ROOT="${LOG_ROOT:-${REPO_ROOT}/logs/V-A}"
 RUN_LOG_DIR="${RUN_LOG_DIR:-${LOG_ROOT}/${RUN_TS}}"
 # MPS pipe sockets stay under the run dir but are not *.log files.
 MPS_PIPE_DIR="${MPS_PIPE_DIR:-${RUN_LOG_DIR}/mps-pipe}"
@@ -50,9 +51,13 @@ else
   WARMUP_REQUESTS="${WARMUP_REQUESTS:-2}"
 fi
 SEED="${SEED:-0}"
+WARMUP_UNTIL_STEADY="${WARMUP_UNTIL_STEADY:-1}"
+WARMUP_STEADY_WINDOW="${WARMUP_STEADY_WINDOW:-4}"
+WARMUP_STEADY_MAX_REQUESTS="${WARMUP_STEADY_MAX_REQUESTS:-48}"
+WARMUP_CONCURRENT_INFLIGHT="${WARMUP_CONCURRENT_INFLIGHT:-${MAX_VLM_BATCH_SIZE}}"
 PROFILE_LOG="${PROFILE_LOG:-${RUN_LOG_DIR}/profile.log}"
 JSON_OUTPUT="${JSON_OUTPUT:-${RUN_LOG_DIR}/profile.json}"
-PYTHON_BIN="${PYTHON_BIN:-/data1/miliang/RLinf/openpi_libero/bin/python}"
+PYTHON_BIN="${PYTHON_BIN:-${REPO_ROOT}/.venv/bin/python}"
 PYTORCH_COMPILE_MODE="${PYTORCH_COMPILE_MODE:-}"
 
 append_pytorch_compile_mode_arg() {
@@ -67,9 +72,9 @@ append_pytorch_compile_mode_arg() {
 }
 
 case "${RUN_MODE}" in
-  server|profile|smoke) ;;
+  server|profile|profile-rates|smoke) ;;
   *)
-    echo "Unsupported RUN_MODE=${RUN_MODE}; expected server|profile|smoke" >&2
+    echo "Unsupported RUN_MODE=${RUN_MODE}; expected server|profile|profile-rates|smoke" >&2
     exit 1
     ;;
 esac
@@ -177,10 +182,15 @@ fi
   echo "POLICY_DIR=${POLICY_DIR}"
   echo "NUM_REQUESTS=${NUM_REQUESTS}"
   echo "REQUEST_RATE_HZ=${REQUEST_RATE_HZ}"
+  echo "REQUEST_RATE_HZ_LIST=${REQUEST_RATE_HZ_LIST}"
   echo "MAX_INFLIGHT=${MAX_INFLIGHT}"
   echo "NUM_STEPS=${NUM_STEPS}"
   echo "TIMEOUT_S=${TIMEOUT_S}"
   echo "WARMUP_REQUESTS=${WARMUP_REQUESTS}"
+  echo "WARMUP_UNTIL_STEADY=${WARMUP_UNTIL_STEADY}"
+  echo "WARMUP_STEADY_WINDOW=${WARMUP_STEADY_WINDOW}"
+  echo "WARMUP_STEADY_MAX_REQUESTS=${WARMUP_STEADY_MAX_REQUESTS}"
+  echo "WARMUP_CONCURRENT_INFLIGHT=${WARMUP_CONCURRENT_INFLIGHT}"
   echo "PYTORCH_COMPILE_MODE=${PYTORCH_COMPILE_MODE:-disabled}"
   echo "AE_SM_PERCENT=${AE_SM_PERCENT}"
   echo "VLM_SM_PERCENT=${VLM_SM_PERCENT}"
@@ -200,7 +210,12 @@ echo "  run_mode=${RUN_MODE}"
 echo "  profile_mode=${PROFILE_MODE}"
 echo "  physical_gpu=${GPU_ID} (${GPU_NAME})"
 echo "  CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
-echo "  workload: requests=${NUM_REQUESTS} rate=${REQUEST_RATE_HZ}/s max_inflight=${MAX_INFLIGHT} baseline_max_batch=${BATCH_SIZE} steps=${NUM_STEPS} warmup=${WARMUP_REQUESTS}"
+if [[ -n "${REQUEST_RATE_HZ_LIST}" ]]; then
+  echo "  workload: requests=${NUM_REQUESTS} rates=${REQUEST_RATE_HZ_LIST}/s max_inflight=${MAX_INFLIGHT} baseline_max_batch=${BATCH_SIZE} steps=${NUM_STEPS} warmup_once=${WARMUP_REQUESTS}"
+else
+  echo "  workload: requests=${NUM_REQUESTS} rate=${REQUEST_RATE_HZ}/s max_inflight=${MAX_INFLIGHT} baseline_max_batch=${BATCH_SIZE} steps=${NUM_STEPS} warmup=${WARMUP_REQUESTS}"
+fi
+echo "  e2e_warmup: until_steady=${WARMUP_UNTIL_STEADY} window=${WARMUP_STEADY_WINDOW} max=${WARMUP_STEADY_MAX_REQUESTS} burst=${WARMUP_CONCURRENT_INFLIGHT}"
 echo "  split: max_ae_batch=${MAX_AE_BATCH_SIZE} max_vlm_batch=${MAX_VLM_BATCH_SIZE} max_vlm_wait_ms=${MAX_VLM_WAIT_MS} ae_sm=${AE_SM_PERCENT} vlm_sm=${VLM_SM_PERCENT}"
 if [[ "${NEEDS_MPS}" -eq 1 ]]; then
   echo "  MPS:   ${MPS_LOG_DIR}/control.log ${MPS_LOG_DIR}/server.log"
@@ -256,6 +271,9 @@ else
     --num-steps "${NUM_STEPS}" \
     --timeout-s "${TIMEOUT_S}" \
     --warmup-requests "${WARMUP_REQUESTS}" \
+    --warmup-steady-window "${WARMUP_STEADY_WINDOW}" \
+    --warmup-steady-max-requests "${WARMUP_STEADY_MAX_REQUESTS}" \
+    --warmup-concurrent-inflight "${WARMUP_CONCURRENT_INFLIGHT}" \
     --max-ae-batch-size "${MAX_AE_BATCH_SIZE}" \
     --max-vlm-batch-size "${MAX_VLM_BATCH_SIZE}" \
     --max-vlm-wait-ms "${MAX_VLM_WAIT_MS}" \
@@ -264,7 +282,13 @@ else
     --gpu-device-index "${GPU_ID}" \
     --json-output "${JSON_OUTPUT}"
   )
+  if [[ -n "${REQUEST_RATE_HZ_LIST}" ]]; then
+    profile_cmd+=(--request-rate-hz-values "${REQUEST_RATE_HZ_LIST}")
+  fi
   append_pytorch_compile_mode_arg profile_cmd
+  if [[ "${WARMUP_UNTIL_STEADY}" == "0" || "${WARMUP_UNTIL_STEADY}" == "false" ]]; then
+    profile_cmd+=(--no-warmup-until-steady)
+  fi
   if [[ "${ENABLE_COMPONENT_TIMING}" == "true" ]]; then
     profile_cmd+=(--enable-component-timing)
   else

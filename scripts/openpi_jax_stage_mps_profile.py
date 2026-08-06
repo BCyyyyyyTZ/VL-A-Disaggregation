@@ -30,8 +30,8 @@ from typing import Any
 
 
 DEFAULT_CONFIG = "pi05_libero"
-DEFAULT_CHECKPOINT_DIR = "/data1/miliang/models/pi05_libero"
-DEFAULT_OUTPUT_DIR = "/data1/miliang/VL-A-Disaggregation/logs/JAX/openpi_jax_stage_mps_profile"
+DEFAULT_CHECKPOINT_DIR = "/mnt/tianze/models/pi05_libero"
+DEFAULT_OUTPUT_DIR = "/mnt/tianze/VL-A-Disaggregation/logs/JAX/openpi_jax_stage_mps_profile"
 
 
 @dataclass(frozen=True)

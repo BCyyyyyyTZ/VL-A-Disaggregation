@@ -1,0 +1,45 @@
+{
+  "status": "pass",
+  "case_id": "mps-sm80-bs64",
+  "mps_sm": 80,
+  "batch_size": 64,
+  "gpu_id": 3,
+  "warmup_steps": 3,
+  "measure_steps": 20,
+  "elapsed_s": 147.81080010533333,
+  "metrics": {
+    "total": {
+      "avg_ms": 2882.9035215079784,
+      "p50_ms": 2883.3909183740616,
+      "p95_ms": 2886.795610561967
+    },
+    "vlm": {
+      "avg_ms": 2777.9723212122917,
+      "p50_ms": 2779.245238751173,
+      "p95_ms": 2780.4810624569654
+    },
+    "action_head": {
+      "avg_ms": 104.12339456379414,
+      "p50_ms": 103.10769826173782,
+      "p95_ms": 106.0148883610964
+    },
+    "other": {
+      "avg_ms": 0.8078057318925858,
+      "p50_ms": 0.7492788136005402,
+      "p95_ms": 1.177174597978592
+    }
+  },
+  "model": {
+    "config": "pi05_libero",
+    "checkpoint_dir": "/mnt/tianze/models/pi05_libero",
+    "num_steps": 10,
+    "action_horizon": 10,
+    "action_dim": 32,
+    "max_token_len": 200,
+    "jax_jit": true,
+    "devices": [
+      "cuda:0"
+    ]
+  },
+  "timing_kind": "synchronous_jax_wall_clock_ms"
+}

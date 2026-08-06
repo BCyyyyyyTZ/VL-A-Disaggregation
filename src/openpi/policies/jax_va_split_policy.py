@@ -224,7 +224,7 @@ def _mps_env_updates(sm_percent: int) -> dict[str, str | None]:
 
 def create_trained_jax_va_split_policy(
     train_config: _config.TrainConfig,
-    checkpoint_dir: pathlib.Path | str = "/data1/miliang/models/RLinf-Pi05-LIBERO-SFT",
+    checkpoint_dir: pathlib.Path | str = "/mnt/tianze/models/pi05_libero",
     *,
     repack_transforms: _transforms.Group | None = None,
     sample_kwargs: dict[str, Any] | None = None,

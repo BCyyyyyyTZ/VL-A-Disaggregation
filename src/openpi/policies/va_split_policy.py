@@ -156,6 +156,24 @@ def _delete_attr_if_present(obj: object, name: str) -> None:
         delattr(obj, name)
 
 
+def _configure_torch_compile_shape_cache() -> None:
+    """Raise Dynamo shape cache limits before warming many static batch graphs."""
+    limit = int(os.environ.get("PYTORCH_COMPILE_RECOMPILE_LIMIT", "128"))
+    try:
+        import torch._dynamo as dynamo
+    except Exception:
+        return
+    config = getattr(dynamo, "config", None)
+    if config is None:
+        return
+    for name in ("recompile_limit", "cache_size_limit"):
+        if hasattr(config, name):
+            try:
+                setattr(config, name, max(limit, int(getattr(config, name))))
+            except Exception:
+                setattr(config, name, limit)
+
+
 def _prune_pytorch_split_model_for_role(model: object, role: str | None) -> None:
     """Drop modules unused by a split inference role before moving the model to GPU."""
     if role is None:
@@ -185,10 +203,11 @@ def _load_pytorch_model(train_config: _config.TrainConfig, weight_path: str, *, 
     _prune_pytorch_split_model_for_role(model, role)
     compile_mode = train_config.model.pytorch_compile_mode
     if compile_mode is not None:
+        _configure_torch_compile_shape_cache()
         if role in (None, "vlm"):
-            model.build_prefix_feature = torch.compile(model.build_prefix_feature, mode=compile_mode, dynamic=True)
+            model.build_prefix_feature = torch.compile(model.build_prefix_feature, mode=compile_mode, dynamic=False)
         if role in (None, "ae"):
-            model.denoise_one_batch = torch.compile(model.denoise_one_batch, mode=compile_mode, dynamic=True)
+            model.denoise_one_batch = torch.compile(model.denoise_one_batch, mode=compile_mode, dynamic=False)
     return model
 
 

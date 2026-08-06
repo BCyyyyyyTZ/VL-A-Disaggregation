@@ -63,7 +63,7 @@ def _time_step_once_like(model, prefix, xs, dts, step_idxs, num_steps: int) -> f
 def main() -> None:
     print("jax devices:", jax.devices())
     train_config = _config.get_config("pi05_libero")
-    ckpt = "/data/miliang/huggingface/hub/openpi-assets/checkpoints/pi05_libero"
+    ckpt = "/mnt/tianze/models/pi05_libero"
     model = _load_jax_model(train_config, ckpt)
     cfg = JaxCompileConfig(enabled=True, warmup_enabled=True, warmup_max_batch_size=24, num_steps=5)
     model = maybe_jit_split_model(model, cfg)

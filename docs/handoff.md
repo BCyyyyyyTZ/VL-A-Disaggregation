@@ -287,7 +287,7 @@ def denoise_one_batch(
 
    | 条件 | 行为 |
    |---|---|
-   | `PYTORCH_COMPILE_MODE` 已设置 | 走 **compile shape warmup**（见下），完成后直接 return；**不再**额外跑 `WARMUP_REQUESTS` |
+   | `PYTORCH_COMPILE_MODE` 已设置 | 先走 **compile shape warmup**；Torch split 会枚举 `B=1..max_vlm_batch*3`，完成后再进入 timed profile |
    | `mode=monolithic` 且 `BATCH_SIZE>1` | 按 FCFS 规则从合成请求拼出 batched requests，对**第一个 batch** 调用 `infer_batch`，重复 `WARMUP_REQUESTS` 次 |
    | 其余（含 `split-mps` 默认、或 monolithic `BATCH_SIZE=1`） | 对 `requests[0]` 单请求 `infer`，重复 `WARMUP_REQUESTS` 次 |
 
@@ -296,19 +296,20 @@ def denoise_one_batch(
    - 设为 `0` 可关掉普通 warmup（但仍可能因 compile 模式走 shape plan）。  
    - 次数太少：正式样本前几条仍可能偏慢；太多：拉长启动时间，一般 2～4 足够。
 
-   **Compile shape warmup（仅当开了 `PYTORCH_COMPILE_MODE`）**  
-   `torch.compile` 会按 **输入 shape（尤其 batch 维）** 触发不同编译/专用图；只暖 `batch=1` 时，正式跑一旦出现更大 batch，仍会在计时段内首次编译，污染延迟。因此用固定 plan `COMPILE_WARMUP_BATCH_PLAN` 依次预热多种 batch：
+   **Compile shape warmup（仅当 compile 实际生效）**  
+   `torch.compile` 会按输入 shape（尤其 batch 维）产生专用图；只暖少量 batch 时，正式 profile 一旦遇到未覆盖的 batch，仍会在计时段内首次 compile。当前逻辑会枚举所有 batch shape：
 
    ```
-   (batch_size, repeats): (1,2), (4,1), (8,2), (16,1), (20,2), (24,1), (32,1)
+   (batch_size, repeats): (1,1), (2,1), ..., (cap,1)
    ```
 
-   - 每个 `(B, R)`：用合成请求循环拼出大小为 `B` 的 batch（不够则取模复用），再 `infer_batch` 重复 `R` 次。  
-   - 实际 `B` 会 **clamp** 到 `profile_warmup_max_batch_size()`，避免超过运行时容量：
+   - 每个 batch 用合成请求循环拼出固定大小（不够则取模复用），再 `infer_batch` 一次。  
+   - 为避免 PyTorch/Dynamo 默认 `recompile_limit/cache_size_limit=8` 在第 9 个 shape 后退回 eager，`va_split_policy` 会在子进程 `torch.compile` 前把 limit 抬高到 `PYTORCH_COMPILE_RECOMPILE_LIMIT`（默认 `128`）。  
+   - 之后 split 模式会再跑 E2E pipeline warmup，用 `WARMUP_CONCURRENT_INFLIGHT`（MPS 脚本默认 `MAX_VLM_BATCH_SIZE`）把 FCFS 单请求热路径也打热，避免首个 rate 吃到队列/IPC handoff 或 scheduler 冷启动。  
+   - `cap` 来自 `profile_warmup_max_batch_size()`：
      - **monolithic**：`min(32, BATCH_SIZE)`
-     - **VA-split（split-mps）**：`min(32, max_vlm_batch_size*3, max_ae_batch_size)`  
-       （`max_vlm_batch_size*3` 与 `VASplitRuntime` 默认 prefix/live-feature 槽位容量一致）  
-   - 因此默认 VLM batch=8、AE batch=8 时，plan 里大于 8 的档会被压成 8，大 shape 不会真的跑到 24/32。
+     - **VA-split（split-mps）**：`max_vlm_batch_size*3`，与 `ProcessVASplitRuntime` 默认 prefix/live-feature 槽位容量一致。  
+   - 因此默认 VLM batch=8 时，split compile warmup cap=24，会覆盖 `B=1..24`；正式 profile 的不同实际 batch size 不再现场触发 compile。
 
    **和正式 workload 的关系**  
    - Warmup **不改变**泊松到达时刻，也不占用 `NUM_REQUESTS` 计数。  
@@ -415,8 +416,9 @@ bash scripts/run_va_split_mps.sh
 | `MAX_VLM_BATCH_SIZE` / `MAX_VLM_WAIT_MS` | VLM FCFS 上限与短等待窗口 |
 | `MAX_AE_BATCH_SIZE` | AE 每步最大 lane 数（可用很大值表示基本不封顶） |
 | `AE_SM_PERCENT` / `VLM_SM_PERCENT` | MPS 线程百分比；`0` 表示不设限额 |
-| `PYTORCH_COMPILE_MODE` | 如 `default`；空则关闭（开启则走 compile shape warmup，见 §11.1） |
-| `WARMUP_REQUESTS` | 非 compile 路径的预热次数，默认 `2`；`0` 关闭普通 warmup |
+| `PYTORCH_COMPILE_MODE` | 如 `default`；空则关闭。开启后 Torch split 会先枚举 `B=1..cap` 做 compile warmup |
+| `WARMUP_REQUESTS` | E2E warmup 的最小请求数，默认 `2`；`0` 可减少普通 warmup |
+| `WARMUP_CONCURRENT_INFLIGHT` | E2E warmup 的并发 burst，MPS 脚本默认 `MAX_VLM_BATCH_SIZE` |
 | `NUM_STEPS` | AE 去噪步数 |
 
 功能验证可先 `split-no-mps`；正式对比用 **`monolithic` vs `split-mps`** 即可。

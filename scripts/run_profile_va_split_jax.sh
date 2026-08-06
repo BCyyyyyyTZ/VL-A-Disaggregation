@@ -8,8 +8,8 @@ cd "${REPO_ROOT}"
 GPU_ID="${GPU_ID:-0}"
 MODE="${MODE:-jax-split-ipc}"
 POLICY_CONFIG="${POLICY_CONFIG:-pi05_libero}"
-POLICY_DIR="${POLICY_DIR:-/data1/miliang/models/pi05_libero}"
-LOG_ROOT="${LOG_ROOT:-/data1/miliang/VL-A-Disaggregation/logs/JAX}"
+POLICY_DIR="${POLICY_DIR:-/mnt/tianze/models/pi05_libero}"
+LOG_ROOT="${LOG_ROOT:-${REPO_ROOT}/logs/tests}"
 RUN_TS="${RUN_TS:-$(date +%Y%m%d_%H%M%S)}"
 RUN_LOG_DIR="${RUN_LOG_DIR:-${LOG_ROOT}/jax-${RUN_TS}}"
 MPS_PIPE_DIR="${MPS_PIPE_DIR:-${RUN_LOG_DIR}/mps-pipe}"
@@ -18,6 +18,7 @@ AE_SM_PERCENT="${AE_SM_PERCENT:-20}"
 VLM_SM_PERCENT="${VLM_SM_PERCENT:-0}"
 NUM_REQUESTS="${NUM_REQUESTS:-128}"
 REQUEST_RATE_HZ="${REQUEST_RATE_HZ:-16}"
+REQUEST_RATE_HZ_LIST="${REQUEST_RATE_HZ_LIST:-}"
 MAX_INFLIGHT="${MAX_INFLIGHT:-64}"
 SEED="${SEED:-0}"
 NUM_STEPS="${NUM_STEPS:-5}"
@@ -34,7 +35,7 @@ JAX_COMPILE_WARMUP="${JAX_COMPILE_WARMUP:-1}"
 # Default warmup ceiling follows VA-split prefix capacity: max_vlm_batch_size * 3.
 JAX_COMPILE_WARMUP_MAX_BATCH_SIZE="${JAX_COMPILE_WARMUP_MAX_BATCH_SIZE:-$((MAX_VLM_BATCH_SIZE * 3))}"
 JSON_OUTPUT="${JSON_OUTPUT:-${RUN_LOG_DIR}/profile.json}"
-PYTHON_BIN="${PYTHON_BIN:-/data1/miliang/RLinf/openpi_libero/bin/python}"
+PYTHON_BIN="${PYTHON_BIN:-${REPO_ROOT}/.venv/bin/python}"
 
 MPS_STARTED=0
 
@@ -123,6 +124,10 @@ cmd=(
   --json-output "${JSON_OUTPUT}"
 )
 
+if [[ -n "${REQUEST_RATE_HZ_LIST}" ]]; then
+  cmd+=(--request-rate-hz-values "${REQUEST_RATE_HZ_LIST}")
+fi
+
 if [[ "${JAX_COMPILE}" == "0" || "${JAX_COMPILE}" == "false" ]]; then
   cmd+=(--no-jax-compile)
 fi
@@ -139,6 +144,9 @@ echo "Running JAX V-A profile: mode=${MODE} gpu=${GPU_ID} (${GPU_NAME}) policy_d
 echo "  python: ${PYTHON_BIN}"
 echo "  logs:   ${RUN_LOG_DIR}"
 echo "  json:   ${JSON_OUTPUT}"
+if [[ -n "${REQUEST_RATE_HZ_LIST}" ]]; then
+  echo "  rates:  ${REQUEST_RATE_HZ_LIST} (single warmup before sweep)"
+fi
 echo "  cuda:   visible=${CUDA_VISIBLE_DEVICES}"
 echo "  compile: enabled=${JAX_COMPILE} warmup=${JAX_COMPILE_WARMUP} warmup_max_batch=${JAX_COMPILE_WARMUP_MAX_BATCH_SIZE}"
 echo "  e2e_warmup: min=${WARMUP_REQUESTS} until_steady=${WARMUP_UNTIL_STEADY} window=${WARMUP_STEADY_WINDOW} max=${WARMUP_STEADY_MAX_REQUESTS}"

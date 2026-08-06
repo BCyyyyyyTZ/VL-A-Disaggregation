@@ -140,7 +140,7 @@ def main() -> None:
         ["nvidia-smi", "-i", gpu, "--query-gpu=uuid", "--format=csv,noheader"],
         text=True,
     ).strip()
-    ckpt = "/data/miliang/huggingface/hub/openpi-assets/checkpoints/pi05_libero"
+    ckpt = "/mnt/tianze/models/pi05_libero"
     max_slots = 24
     ctx = mp.get_context("spawn")
     vlm_conn, ae_conn = ctx.Pipe()

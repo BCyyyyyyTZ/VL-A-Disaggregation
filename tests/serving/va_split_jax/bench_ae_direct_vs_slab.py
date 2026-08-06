@@ -15,7 +15,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--gpu-id", default="3")
     parser.add_argument("--config", default="pi05_libero")
-    parser.add_argument("--checkpoint-dir", default="/data1/miliang/models/pi05_libero")
+    parser.add_argument("--checkpoint-dir", default="/mnt/tianze/models/pi05_libero")
     parser.add_argument("--batch-sizes", default="1,8,24")
     parser.add_argument("--max-prefix-slots", type=int, default=24)
     parser.add_argument("--num-steps", type=int, default=5)

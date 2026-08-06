@@ -20,6 +20,9 @@ from numba import cuda
 from numba.cuda.cudadrv import driver
 from numba.cuda.cudadrv import drvapi
 
+from openpi.serving.va_split_jax.device_slab import _numba_device_ordinal_for_jax_device
+from openpi.serving.va_split_jax.device_slab import _select_numba_device
+
 
 LOG_PATH = pathlib.Path("logs/tests/jax_device_ipc_gate.json")
 
@@ -118,8 +121,8 @@ def _export_device_ipc_handle(array: jax.Array) -> Any:
         raise RuntimeError(f"expected a GPU-backed JAX array, got {device!r}")
 
     array.block_until_ready()
-    cuda.select_device(device.id)
-    context = cuda.current_context()
+    device_ordinal = _numba_device_ordinal_for_jax_device(device)
+    context = _select_numba_device(device_ordinal)
     device_pointer = drvapi.cu_device_ptr(array.unsafe_buffer_pointer())
     memory = driver.MemoryPointer(
         context,
@@ -134,7 +137,7 @@ def _export_device_ipc_handle(array: jax.Array) -> Any:
         handle_bytes = bytes(ipc_handle.handle)
     return DeviceIpcHandle(
         transport="cuda-ipc-numba",
-        device_ordinal=device.id,
+        device_ordinal=device_ordinal,
         shape=tuple(array.shape),
         dtype=str(array.dtype),
         handle_bytes=handle_bytes,
@@ -160,7 +163,7 @@ def _open_device_ipc_handle(handle: Any, shape: tuple[int, ...], dtype: str):
     if str(np.dtype(dtype)) != str(np.dtype(handle.dtype)):
         raise RuntimeError(f"dtype mismatch: message={dtype!r}, handle={handle.dtype!r}")
 
-    cuda.select_device(handle.device_ordinal)
+    _select_numba_device(handle.device_ordinal)
     with cuda.open_ipc_array(
         tuple(handle.handle_bytes),
         handle.shape,

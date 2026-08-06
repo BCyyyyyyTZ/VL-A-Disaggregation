@@ -9,7 +9,7 @@
     "cuda:6",
     "cuda:7"
   ],
-  "elapsed_ms": 3128.1772640068084,
+  "elapsed_ms": 38648.99031072855,
   "payload_dtype": "float32",
   "payload_shape": [
     16,
@@ -25,7 +25,7 @@
     "cuda:6",
     "cuda:7"
   ],
-  "reason": "producer_exit=0, consumer_exit=0",
-  "status": "passed",
+  "reason": "producer_exit=1, consumer_exit=-11",
+  "status": "failed",
   "transport": "device-ipc"
 }

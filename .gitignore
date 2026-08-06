@@ -71,6 +71,13 @@ cover/
 # Re-ignore noisy runtime logs under otherwise-tracked experiment trees.
 logs/JAX/**/*.log
 logs/V-A/**/*.log
+# Generated plots under JAX experiment trees.
+logs/JAX/**/*.png
+logs/JAX/**/*.jpg
+logs/JAX/**/*.jpeg
+logs/JAX/**/*.gif
+logs/JAX/**/*.webp
+logs/JAX/**/*.svg
 local_settings.py
 db.sqlite3
 db.sqlite3-journal

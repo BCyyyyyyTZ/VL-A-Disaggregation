@@ -164,7 +164,7 @@ class CudaIpcDeviceSlabBackend(DeviceSlabBackend):
     def open_slab(self, handle: DeviceSlabHandle) -> DeviceSlab:
         if handle.transport != self.transport:
             raise RuntimeError(f"unsupported slab transport {handle.transport!r}")
-        cuda.select_device(handle.device_ordinal)
+        _select_numba_device(handle.device_ordinal)
         stack = contextlib.ExitStack()
         try:
             ipc_array = stack.enter_context(
@@ -204,7 +204,7 @@ class CudaIpcDeviceSlabBackend(DeviceSlabBackend):
             raise RuntimeError(f"expected {self.transport!r} slab, got {slab.handle.transport!r}")
         value.block_until_ready()
         device_ordinal = int(slab.handle.device_ordinal)
-        cuda.select_device(device_ordinal)
+        _select_numba_device(device_ordinal)
         stream = self._write_stream(device_ordinal)
         dst = cuda.from_cuda_array_interface(_cuda_array_interface_for_array(slab.array), owner=slab)
         src = cuda.from_cuda_array_interface(_cuda_array_interface_for_array(value), owner=value)
@@ -227,7 +227,7 @@ class CudaIpcDeviceSlabBackend(DeviceSlabBackend):
             raise RuntimeError(f"expected {self.transport!r} slab, got {slab.handle.transport!r}")
         value.block_until_ready()
         device_ordinal = int(slab.handle.device_ordinal)
-        cuda.select_device(device_ordinal)
+        _select_numba_device(device_ordinal)
         stream = self._write_stream(device_ordinal)
         dst = cuda.from_cuda_array_interface(_cuda_array_interface_for_array(slab.array), owner=slab)
         src = cuda.from_cuda_array_interface(_cuda_array_interface_for_array(value), owner=value)
@@ -251,7 +251,7 @@ class CudaIpcDeviceSlabBackend(DeviceSlabBackend):
         key = int(device_ordinal)
         stream = self._write_streams.get(key)
         if stream is None:
-            cuda.select_device(key)
+            _select_numba_device(key)
             stream = cuda.stream()
             self._write_streams[key] = stream
         return stream
@@ -288,8 +288,8 @@ def has_cuda_device() -> bool:
 
 def _export_cuda_ipc_handle(spec: DeviceSlabSpec, array: jax.Array) -> DeviceSlabHandle:
     device = next(iter(array.devices()))
-    cuda.select_device(device.id)
-    context = cuda.current_context()
+    device_ordinal = _numba_device_ordinal_for_jax_device(device)
+    context = _select_numba_device(device_ordinal)
     device_pointer = drvapi.cu_device_ptr(array.unsafe_buffer_pointer())
     memory = driver.MemoryPointer(
         context,
@@ -305,7 +305,7 @@ def _export_cuda_ipc_handle(spec: DeviceSlabSpec, array: jax.Array) -> DeviceSla
     return DeviceSlabHandle(
         spec=spec,
         transport=CudaIpcDeviceSlabBackend.transport,
-        device_ordinal=device.id,
+        device_ordinal=device_ordinal,
         handle_bytes=handle_bytes,
         ready_event_bytes=None,
         offset=int(ipc_handle.offset),
@@ -349,7 +349,48 @@ def _is_gpu_array(array: jax.Array) -> bool:
 
 def _array_device_ordinal(array: jax.Array) -> int:
     device = next(iter(array.devices()))
-    return int(getattr(device, "id", 0))
+    return _numba_device_ordinal_for_jax_device(device)
+
+
+def _select_numba_device(device_ordinal: int):
+    """Select a Numba CUDA context using process-visible device ordinal."""
+    return cuda.current_context(int(device_ordinal))
+
+
+def _numba_device_ordinal_for_jax_device(device: jax.Device) -> int:
+    """Map a JAX device to the ordinal understood by Numba in this process.
+
+    JAX/XLA device ids can reflect physical GPU ids in some CUDA_VISIBLE_DEVICES
+    setups, while Numba cuda.select_device() indexes the process-visible device
+    list. With CUDA_VISIBLE_DEVICES=5 or CUDA_VISIBLE_DEVICES=GPU-..., a single
+    visible GPU must be selected as ordinal 0 even if JAX reports a different id.
+    """
+    jax_device_id = int(getattr(device, "id", 0))
+    try:
+        numba_device_count = len(cuda.gpus)
+    except Exception:
+        numba_device_count = 0
+
+    if 0 <= jax_device_id < numba_device_count:
+        return jax_device_id
+
+    visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    visible_tokens = [token.strip() for token in visible_devices.split(",") if token.strip()]
+    if visible_tokens:
+        for ordinal, token in enumerate(visible_tokens):
+            if token.isdigit() and int(token) == jax_device_id:
+                return ordinal
+        if len(visible_tokens) == 1:
+            return 0
+
+    if numba_device_count == 1:
+        return 0
+
+    raise RuntimeError(
+        "Cannot map JAX GPU device to a Numba CUDA ordinal: "
+        f"jax_device={device!r} jax_device_id={jax_device_id} "
+        f"numba_device_count={numba_device_count} CUDA_VISIBLE_DEVICES={visible_devices!r}"
+    )
 
 
 def _has_cuda_device() -> bool:

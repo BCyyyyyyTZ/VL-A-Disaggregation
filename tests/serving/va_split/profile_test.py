@@ -92,7 +92,7 @@ def test_args_defaults_to_profile_checkpoint():
     args = profile_va_split.Args()
 
     assert args.policy.config == "pi05_libero"
-    assert args.policy.dir == "/data1/miliang/models/RLinf-Pi05-LIBERO-SFT"
+    assert args.policy.dir == "/mnt/tianze/models/pi05_libero_pytorch"
 
 
 def test_args_defaults_to_two_warmup_requests():
@@ -502,34 +502,11 @@ def test_run_profile_warms_up_policy_before_timed_workload(monkeypatch):
     assert worker_thread_ids[0] != threading.get_ident()
 
 
-def test_pytorch_compile_warmup_batch_plan_matches_requested_shapes():
+def test_pytorch_compile_warmup_batch_plan_enumerates_all_shapes():
     assert profile_va_split.COMPILE_WARMUP_MAX_BATCH_SIZE == 32
-    assert profile_va_split.COMPILE_WARMUP_BATCH_PLAN == (
-        (1, 2),
-        (4, 1),
-        (8, 2),
-        (16, 1),
-        (20, 2),
-        (24, 1),
-        (32, 1),
-    )
-    assert profile_va_split.pytorch_compile_warmup_batch_plan(32) == (
-        (1, 2),
-        (4, 1),
-        (8, 2),
-        (16, 1),
-        (20, 2),
-        (24, 1),
-        (32, 1),
-    )
-    assert profile_va_split.pytorch_compile_warmup_batch_plan(24) == (
-        (1, 2),
-        (4, 1),
-        (8, 2),
-        (16, 1),
-        (20, 2),
-        (24, 1),
-        (24, 1),
+    assert profile_va_split.pytorch_compile_warmup_batch_plan(8) == tuple((batch_size, 1) for batch_size in range(1, 9))
+    assert profile_va_split.pytorch_compile_warmup_batch_plan(24) == tuple(
+        (batch_size, 1) for batch_size in range(1, 25)
     )
     # VA-split default: max_vlm_batch_size=8 -> prefix capacity 24.
     assert profile_va_split.profile_warmup_max_batch_size(
@@ -569,8 +546,7 @@ def test_run_profile_compile_warmup_uses_batch_shapes_for_baseline(monkeypatch):
         )
     )
 
-    # monolithic clamps warmup to batch_size=8
-    expected_warmup = [1, 1, 4, 8, 8, 8, 8, 8, 8, 8]
+    expected_warmup = list(range(1, 9))
     assert policy.infer_calls == 0
     assert policy.observed_batch_sizes[: len(expected_warmup)] == expected_warmup
     assert policy.infer_batch_calls >= len(expected_warmup)
@@ -592,18 +568,50 @@ def test_run_profile_compile_warmup_uses_batch_shapes_for_ours(monkeypatch):
             max_vlm_batch_size=8,
             max_ae_batch_size=999,
             warmup_requests=2,
+            warmup_until_steady=False,
+            warmup_concurrent_inflight=0,
             pytorch_compile_mode="default",
             pytorch_device="cpu",
             require_mps_env=False,
         )
     )
 
-    # prefix capacity = 8*3 = 24, so planned 32 is clamped to 24
-    expected_warmup = [1, 1, 4, 8, 8, 16, 20, 20, 24, 24]
+    expected_warmup = list(range(1, 25))
     assert policy.observed_batch_sizes[: len(expected_warmup)] == expected_warmup
     assert policy.infer_batch_calls == len(expected_warmup)
-    assert policy.infer_calls == 8
+    assert policy.infer_calls == 10
+    assert result.summary["e2e_warmup_requests"] == 2.0
     assert [trace.request_id for trace in result.traces] == [f"req-{idx:06d}" for idx in range(8)]
+
+
+def test_run_profile_rate_sweep_warms_once_and_reuses_policy(monkeypatch):
+    policy = _ConcurrentFakePolicy(sleep_s=0.0)
+    create_calls = []
+    monkeypatch.setattr(profile_va_split, "create_policy_for_mode", lambda args, mode: create_calls.append(mode) or policy)
+    monkeypatch.setattr(profile_va_split, "make_synthetic_libero_requests", lambda **kwargs: _fake_requests(4))
+
+    result = profile_va_split.run_profile_rate_sweep(
+        profile_va_split.Args(
+            mode="split-mps",
+            policy=profile_va_split.Checkpoint(config="dummy", dir="/tmp/checkpoint"),
+            num_requests=4,
+            request_rate_hz_values="8,16,32",
+            max_vlm_batch_size=8,
+            max_ae_batch_size=999,
+            warmup_requests=2,
+            warmup_until_steady=False,
+            warmup_concurrent_inflight=0,
+            pytorch_compile_mode="default",
+            pytorch_device="cpu",
+            require_mps_env=False,
+        )
+    )
+
+    assert create_calls == ["split-mps"]
+    assert [run.summary["target_request_rate_hz"] for run in result.results] == [8.0, 16.0, 32.0]
+    assert policy.observed_batch_sizes == list(range(1, 25))
+    assert policy.infer_calls == 14
+    assert [run.summary["e2e_warmup_requests"] for run in result.results] == [2.0, 2.0, 2.0]
 
 
 def test_run_profile_uses_baseline_fcfs_batching_only_for_monolithic(monkeypatch):
@@ -792,7 +800,7 @@ def test_create_policy_for_mode_forwards_component_timing_to_split_runtime(monke
     assert captured_kwargs["enable_component_timing"] is False
 
 
-def test_create_policy_for_mode_allows_explicit_pytorch_compile_opt_in(monkeypatch):
+def test_create_policy_for_mode_forwards_pytorch_compile_to_split_runtime(monkeypatch):
     @dataclasses.dataclass(frozen=True)
     class FakeModelConfig:
         pytorch_compile_mode: str | None = "max-autotune"

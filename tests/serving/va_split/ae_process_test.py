@@ -82,7 +82,7 @@ class SimpleQueue:
         return list(self._messages)
 
 
-def _ready(request_id: str, *, num_steps: int = 1) -> PrefixReady:
+def _ready(request_id: str, *, num_steps: int = 1, noise_value: float = 0.0) -> PrefixReady:
     return PrefixReady(
         request_id=request_id,
         feature=PrefixFeature(
@@ -91,7 +91,7 @@ def _ready(request_id: str, *, num_steps: int = 1) -> PrefixReady:
             state=torch.zeros(1, 2),
         ),
         num_steps=num_steps,
-        sample_kwargs={"noise": torch.zeros(1, 2, 1)},
+        sample_kwargs={"noise": torch.full((1, 2, 1), noise_value)},
         timing={"vlm_prefix_forward_ms": 1.5},
     )
 
@@ -186,6 +186,18 @@ def test_ae_worker_records_lane_ingest_and_compact_overhead():
     assert second_results[0].timing["prefix_lane_overhead_ms"] == (
         second_results[0].timing["prefix_lane_ingest_ms"] + second_results[0].timing["prefix_lane_compact_ms"]
     )
+
+
+def test_ae_worker_finished_result_is_stable_after_lane_compaction():
+    worker = AEWorker(model=FakeAEModel(), device="cpu", max_batch_size=2)
+    worker.add_prefix(_ready("req-1", num_steps=1, noise_value=0.0))
+    worker.add_prefix(_ready("req-2", num_steps=2, noise_value=10.0))
+
+    results, _ = worker.step_once()
+
+    assert [result.request_id for result in results] == ["req-1"]
+    torch.testing.assert_close(results[0].actions, -torch.ones(1, 2, 1))
+    torch.testing.assert_close(worker.active["req-2"].x_t, torch.full((1, 2, 1), 9.5))
 
 
 def test_ae_process_waits_for_free_prefix_lane_before_draining_more_ready_messages():
