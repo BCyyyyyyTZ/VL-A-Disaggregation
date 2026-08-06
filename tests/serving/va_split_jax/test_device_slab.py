@@ -11,6 +11,7 @@ import numpy as np
 import pytest
 
 from openpi.models.jax_split_types import JaxPrefixFeature
+from openpi.serving.va_split_jax import device_slab
 from openpi.serving.va_split_jax.device_slab import CudaIpcDeviceSlabBackend
 from openpi.serving.va_split_jax.device_slab import DeviceSlabSpec
 from openpi.serving.va_split_jax.device_slab import has_cuda_device
@@ -163,12 +164,12 @@ def test_cuda_copy_lane_uses_stream_sync_not_device_or_slab_sync():
             fake_stream = mock.Mock()
             fake_stream.synchronize = stream_sync
             with mock.patch.object(backend, "_write_stream", return_value=fake_stream), mock.patch(
-                "openpi.serving.va_split_jax.device_slab._copy_lane_with_kernel"
-            ) as copy_kernel:
+                "openpi.serving.va_split_jax.device_slab._copy_lane_with_driver"
+            ) as copy_driver:
                 backend.copy_lane_from_array(slab, 2, value)
 
-            copy_kernel.assert_called_once()
-            assert copy_kernel.call_args.kwargs.get("stream") is fake_stream
+            copy_driver.assert_called_once()
+            assert copy_driver.call_args.kwargs.get("stream") is fake_stream
             stream_sync.assert_called_once()
             device_sync.assert_not_called()
     finally:
@@ -228,15 +229,24 @@ def test_cuda_copy_lane_uses_context_aware_array_views():
         "openpi.serving.va_split_jax.device_slab.cuda.from_cuda_array_interface",
         side_effect=AssertionError("cuda.from_cuda_array_interface() should not be used"),
     ), mock.patch(
-        "openpi.serving.va_split_jax.device_slab._copy_lane_with_kernel"
-    ) as copy_kernel:
+        "openpi.serving.va_split_jax.device_slab._copy_lane_with_driver"
+    ) as copy_driver:
         backend.copy_lane_from_array(slab, 1, value)
 
     assert array_view.call_count == 2
     assert array_view.call_args_list[0].kwargs == {"owner": slab, "device_ordinal": 2}
     assert array_view.call_args_list[1].kwargs == {"owner": value, "device_ordinal": 2}
-    copy_kernel.assert_called_once_with(dst, src, 1, spec, stream=fake_stream)
+    copy_driver.assert_called_once_with(dst, src, 1, spec, stream=fake_stream)
     fake_stream.synchronize.assert_called_once_with()
+
+
+def test_numba_device_ordinal_normalizes_physical_cuda_visible_device(monkeypatch):
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "2")
+    monkeypatch.setattr(device_slab.cuda, "gpus", [object()])
+
+    ordinal = device_slab._normalize_numba_device_ordinal(2)  # noqa: SLF001
+
+    assert ordinal == 0
 
 
 def test_cuda_deferred_lane_writes_sync_once_and_preserve_content():

@@ -205,7 +205,7 @@ class CudaIpcDeviceSlabBackend(DeviceSlabBackend):
         if slab.handle.transport != self.transport:
             raise RuntimeError(f"expected {self.transport!r} slab, got {slab.handle.transport!r}")
         value.block_until_ready()
-        device_ordinal = int(slab.handle.device_ordinal)
+        device_ordinal = _normalize_numba_device_ordinal(slab.handle.device_ordinal)
         _select_numba_device(device_ordinal)
         stream = self._write_stream(device_ordinal)
         dst = _device_array_view_from_cuda_array_interface(
@@ -214,7 +214,7 @@ class CudaIpcDeviceSlabBackend(DeviceSlabBackend):
         src = _device_array_view_from_cuda_array_interface(
             _cuda_array_interface_for_array(value), owner=value, device_ordinal=device_ordinal
         )
-        _copy_lane_with_kernel(dst, src, lane_id, slab.spec, stream=stream)
+        _copy_lane_with_driver(dst, src, lane_id, slab.spec, stream=stream)
         if sync:
             stream.synchronize()
         return slab
@@ -232,7 +232,7 @@ class CudaIpcDeviceSlabBackend(DeviceSlabBackend):
         if slab.handle.transport != self.transport:
             raise RuntimeError(f"expected {self.transport!r} slab, got {slab.handle.transport!r}")
         value.block_until_ready()
-        device_ordinal = int(slab.handle.device_ordinal)
+        device_ordinal = _normalize_numba_device_ordinal(slab.handle.device_ordinal)
         _select_numba_device(device_ordinal)
         stream = self._write_stream(device_ordinal)
         dst = _device_array_view_from_cuda_array_interface(
@@ -241,7 +241,7 @@ class CudaIpcDeviceSlabBackend(DeviceSlabBackend):
         src = _device_array_view_from_cuda_array_interface(
             _cuda_array_interface_for_array(value), owner=value, device_ordinal=device_ordinal
         )
-        _copy_batch_with_kernel(dst, src, lane_start, slab.spec, stream=stream)
+        _copy_batch_with_driver(dst, src, lane_start, slab.spec, stream=stream)
         if sync:
             stream.synchronize()
         return slab
@@ -258,7 +258,7 @@ class CudaIpcDeviceSlabBackend(DeviceSlabBackend):
             stream.synchronize()
 
     def _write_stream(self, device_ordinal: int):
-        key = int(device_ordinal)
+        key = _normalize_numba_device_ordinal(device_ordinal)
         stream = self._write_streams.get(key)
         if stream is None:
             context = _select_numba_device(key)
@@ -361,7 +361,7 @@ def _array_device_ordinal(array: jax.Array) -> int:
 
 def _select_numba_device(device_ordinal: int):
     """Select a Numba CUDA context using process-visible device ordinal."""
-    return cuda.current_context(int(device_ordinal))
+    return cuda.current_context(_normalize_numba_device_ordinal(device_ordinal))
 
 
 def _device_array_view_from_cuda_array_interface(
@@ -383,6 +383,32 @@ def _device_array_view_from_cuda_array_interface(
     stream_ptr = desc.get("stream")
     stream = context.create_external_stream(stream_ptr) if stream_ptr is not None else 0
     return devicearray.DeviceNDArray(shape=shape, strides=strides, dtype=dtype, gpu_data=data, stream=stream)
+
+
+def _normalize_numba_device_ordinal(device_ordinal: int) -> int:
+    ordinal = int(device_ordinal)
+    visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    visible_tokens = [token.strip() for token in visible_devices.split(",") if token.strip()]
+    if visible_tokens:
+        if len(visible_tokens) == 1:
+            return 0
+        for visible_ordinal, token in enumerate(visible_tokens):
+            if token.isdigit() and int(token) == ordinal:
+                return visible_ordinal
+
+    try:
+        numba_device_count = len(cuda.gpus)
+    except Exception:
+        numba_device_count = 0
+    if 0 <= ordinal < numba_device_count:
+        return ordinal
+    if numba_device_count == 1:
+        return 0
+    raise RuntimeError(
+        "Cannot map CUDA device ordinal to a Numba process-visible ordinal: "
+        f"device_ordinal={device_ordinal} numba_device_count={numba_device_count} "
+        f"CUDA_VISIBLE_DEVICES={visible_devices!r}"
+    )
 
 
 def _numba_device_ordinal_for_jax_device(device: jax.Device) -> int:
@@ -480,6 +506,49 @@ def _cuda_array_interface_for_lane(array: jax.Array, spec: DeviceSlabSpec, lane_
         "data": (array.unsafe_buffer_pointer() + lane_offset_bytes, False),
         "version": 3,
     }
+
+
+def _copy_lane_with_driver(dst: Any, src: Any, lane_id: int, spec: DeviceSlabSpec, *, stream: Any) -> None:
+    axis = spec.normalized_lane_axis
+    inner_elems = _prod(spec.shape[axis + 1 :])
+    outer_elems = _prod(spec.shape[:axis])
+    itemsize = _storage_dtype_for_spec(spec).itemsize
+    segment_bytes = inner_elems * itemsize
+    for outer in range(outer_elems):
+        dst_offset = (outer * spec.max_lanes * inner_elems + lane_id * inner_elems) * itemsize
+        src_offset = outer * inner_elems * itemsize
+        driver.device_to_device(
+            dst.gpu_data.view(dst_offset, dst_offset + segment_bytes),
+            src.gpu_data.view(src_offset, src_offset + segment_bytes),
+            segment_bytes,
+            stream=stream,
+        )
+
+
+def _copy_batch_with_driver(dst: Any, src: Any, lane_start: int, spec: DeviceSlabSpec, *, stream: Any) -> None:
+    axis = spec.normalized_lane_axis
+    batch_lanes = int(src.shape[axis])
+    inner_elems = _prod(spec.shape[axis + 1 :])
+    outer_elems = _prod(spec.shape[:axis])
+    itemsize = _storage_dtype_for_spec(spec).itemsize
+    segment_bytes = inner_elems * itemsize
+    for outer in range(outer_elems):
+        for lane in range(batch_lanes):
+            dst_offset = (outer * spec.max_lanes * inner_elems + (lane_start + lane) * inner_elems) * itemsize
+            src_offset = (outer * batch_lanes * inner_elems + lane * inner_elems) * itemsize
+            driver.device_to_device(
+                dst.gpu_data.view(dst_offset, dst_offset + segment_bytes),
+                src.gpu_data.view(src_offset, src_offset + segment_bytes),
+                segment_bytes,
+                stream=stream,
+            )
+
+
+def _prod(values: tuple[int, ...]) -> int:
+    result = 1
+    for value in values:
+        result *= int(value)
+    return result
 
 
 def _copy_lane_with_kernel(
