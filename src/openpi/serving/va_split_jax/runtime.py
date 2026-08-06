@@ -26,13 +26,20 @@ from openpi.serving.va_split_jax.compile import prune_split_model_for_role
 from openpi.serving.va_split_jax.compile import warmup_vlm_ae_slab_writes
 from openpi.serving.va_split_jax.compile import warmup_vlm_prefix_model
 from openpi.serving.va_split_jax.device_slab import make_default_device_slab_backend
+from openpi.serving.va_split_jax.multigpu_config import JaxMultiGpuVASplitConfig
+from openpi.serving.va_split_jax.multigpu_router import JaxVlmRouteState
+from openpi.serving.va_split_jax.multigpu_router import LeastBacklogVlmRouter
 from openpi.serving.va_split_jax.prefix_cache_pool import JaxVlmPrefixCacheLanePool
+from openpi.serving.va_split_jax.process_entry import run_ae_worker_entry
+from openpi.serving.va_split_jax.process_entry import run_vlm_worker_entry
 from openpi.serving.va_split_jax.timing import queue_wait_and_transfer_ms
 from openpi.serving.va_split_jax.timing import timed_queue_get
 from openpi.serving.va_split_jax.types import JaxActionBatchRow
 from openpi.serving.va_split_jax.types import JaxActionResult
 from openpi.serving.va_split_jax.types import JaxBatchRequestEnvelope
 from openpi.serving.va_split_jax.types import JaxCompileWarmupDone
+from openpi.serving.va_split_jax.types import JaxLaneCredits
+from openpi.serving.va_split_jax.types import JaxPrefixSlabReady
 from openpi.serving.va_split_jax.types import JaxReleaseFeature
 from openpi.serving.va_split_jax.types import JaxRequestEnvelope
 from openpi.serving.va_split_jax.types import JaxShutdown
@@ -207,12 +214,12 @@ def _run_jax_vlm_process(
     )
     # AE-first handshake: wait for slab export + credits on release_queue.
     process.wait_for_ae_export()
-    if compile_config is not None and warmup_queue is not None and process.worker._writable_slab_tree is not None:
+    if compile_config is not None and warmup_queue is not None and process.worker._writable_slab_tree is not None:  # noqa: SLF001
         pool_stats = warmup_vlm_ae_slab_writes(
             model=model,
             observation_factory=observation_factory,
             backend=backend,
-            slab_tree=process.worker._writable_slab_tree,
+            slab_tree=process.worker._writable_slab_tree,  # noqa: SLF001
             max_lanes=max_prefix_slots,
             max_vlm_batch_size=max_vlm_batch_size,
             config=compile_config,
@@ -256,6 +263,248 @@ def _run_jax_ae_process(
     if warmup_queue is not None:
         warmup_queue.put(JaxCompileWarmupDone(role="ae", jax_warmup_batches=float(ipc_batches)))
     process.run()
+
+
+
+class JaxMultiGpuReleaseFanout:
+    """Route AE control messages back to the VLM worker that owns each lane."""
+
+    def __init__(self, release_queues: dict[str, Any]):
+        if not release_queues:
+            raise ValueError("release_queues must be non-empty")
+        self._release_queues = dict(release_queues)
+        self._worker_ids = tuple(release_queues)
+        self._next_credit_worker = 0
+
+    def put(self, message: object) -> None:
+        if isinstance(message, JaxPrefixSlabReady):
+            for worker_id in self._worker_ids:
+                self._release_queues[worker_id].put(message)
+            return
+        if isinstance(message, JaxLaneCredits):
+            for worker_id, credits in self._partition_lane_credits(message).items():
+                if credits.lane_ids:
+                    self._release_queues[worker_id].put(credits)
+            return
+        if isinstance(message, JaxReleaseFeature):
+            worker_id = _release_queue_key(message)
+            if worker_id in self._release_queues:
+                self._release_queues[worker_id].put(message)
+                return
+            self._release_queues[self._worker_ids[0]].put(message)
+            return
+        for worker_id in self._worker_ids:
+            self._release_queues[worker_id].put(message)
+
+    def _partition_lane_credits(self, credits: JaxLaneCredits) -> dict[str, JaxLaneCredits]:
+        lanes_by_worker = {worker_id: [] for worker_id in self._worker_ids}
+        for lane_id in credits.lane_ids:
+            worker_id = self._worker_ids[self._next_credit_worker % len(self._worker_ids)]
+            lanes_by_worker[worker_id].append(int(lane_id))
+            self._next_credit_worker += 1
+        return {worker_id: JaxLaneCredits(lane_ids=tuple(lanes)) for worker_id, lanes in lanes_by_worker.items()}
+
+
+class JaxMultiGpuProcessVASplitRuntime:
+    """One AE process with N VLM processes pinned to separate CUDA-visible devices."""
+
+    def __init__(
+        self,
+        *,
+        model_factory: Callable[[], object],
+        config: JaxMultiGpuVASplitConfig,
+        result_timeout_s: float = 120.0,
+        vlm_env_updates: dict[str, str | None] | None = None,
+        ae_env_updates: dict[str, str | None] | None = None,
+        compile_config: JaxCompileConfig | None = None,
+        warmup_timeout_s: float | None = None,
+    ):
+        self._config = config
+        self._result_timeout_s = result_timeout_s
+        self._pending_results: dict[str, JaxActionResult] = {}
+        self._pending_errors: dict[str | None, JaxWorkerError] = {}
+        self._request_to_worker: dict[str, str] = {}
+        self._shutdown_seen = False
+        self._closed = False
+        self._condition = threading.Condition()
+        self._compile_timing = {"jax_warmup_batches": 0.0}
+        self._router = LeastBacklogVlmRouter(config.vlm_worker_ids)
+        initial_per_worker = max(1, int(config.max_prefix_slots or 1) // max(1, config.num_vlm_workers))
+        for worker_id in config.vlm_worker_ids:
+            self._router.update(worker_id, JaxVlmRouteState(available_credits=initial_per_worker))
+
+        ctx = mp.get_context(config.start_method)
+        self._request_queues = {worker_id: ctx.Queue() for worker_id in config.vlm_worker_ids}
+        self._release_queues = {worker_id: ctx.Queue() for worker_id in config.vlm_worker_ids}
+        self._prefix_queue = ctx.Queue()
+        self._result_queue = ctx.Queue()
+        self._warmup_queue = ctx.Queue()
+        release_fanout = JaxMultiGpuReleaseFanout(self._release_queues)
+
+        self._ae_process = ctx.Process(
+            target=run_ae_worker_entry,
+            args=(
+                model_factory,
+                self._prefix_queue,
+                self._result_queue,
+                release_fanout,
+                config.max_ae_batch_size,
+                config.max_prefix_slots,
+                compile_config,
+                None,
+                self._warmup_queue,
+            ),
+            kwargs={"device": config.ae_device, "env_updates": ae_env_updates},
+            daemon=True,
+        )
+        self._vlm_processes = {}
+        for worker_id, device in zip(config.vlm_worker_ids, config.vlm_devices, strict=True):
+            self._vlm_processes[worker_id] = ctx.Process(
+                target=run_vlm_worker_entry,
+                args=(
+                    model_factory,
+                    self._request_queues[worker_id],
+                    self._prefix_queue,
+                    self._release_queues[worker_id],
+                    config.max_vlm_batch_size,
+                    config.max_vlm_wait_ms,
+                    config.max_prefix_slots,
+                    compile_config,
+                    None,
+                    self._warmup_queue,
+                    worker_id,
+                ),
+                kwargs={"device": device, "env_updates": vlm_env_updates},
+                daemon=True,
+            )
+
+        timeout = warmup_timeout_s if warmup_timeout_s is not None else result_timeout_s
+        self._ae_process.start()
+        ae_compile = _collect_compile_warmup(
+            self._warmup_queue,
+            expected_roles=("ae",),
+            timeout_s=timeout,
+            vlm_process=None,
+            ae_process=self._ae_process,
+        )
+        for process in self._vlm_processes.values():
+            process.start()
+        vlm_compile = _collect_compile_warmup_count(
+            self._warmup_queue,
+            expected_role="vlm",
+            expected_count=len(self._vlm_processes),
+            timeout_s=timeout,
+            processes=(*self._vlm_processes.values(), self._ae_process),
+        )
+        self._compile_timing = {
+            "jax_warmup_batches": float(ae_compile["jax_warmup_batches"] + vlm_compile["jax_warmup_batches"])
+        }
+        self._result_thread = threading.Thread(target=self._collect_results, daemon=True)
+        self._result_thread.start()
+
+    def infer(self, observation: dict, sample_kwargs: dict) -> JaxActionResult:
+        if self._closed:
+            raise RuntimeError("JAX multi-GPU VA split runtime is shut down")
+        request_id = str(uuid.uuid4())
+        worker_id = self._choose_worker(count=1)
+        self._request_to_worker[request_id] = worker_id
+        self._request_queues[worker_id].put(
+            JaxRequestEnvelope(
+                request_id=request_id,
+                observation=observation,
+                sample_kwargs=dict(sample_kwargs),
+                enqueue_ns=time.monotonic_ns(),
+            )
+        )
+        return self._wait_for_result(request_id)
+
+    def infer_batch(self, observation: dict, sample_kwargs: dict) -> JaxActionResult:
+        if self._closed:
+            raise RuntimeError("JAX multi-GPU VA split runtime is shut down")
+        batch_size = int(observation["state"].shape[0])
+        batch_id = str(uuid.uuid4())
+        request_ids = tuple(f"{batch_id}:{row}" for row in range(batch_size))
+        worker_id = self._choose_worker(count=batch_size)
+        for request_id in request_ids:
+            self._request_to_worker[request_id] = worker_id
+        self._request_queues[worker_id].put(
+            JaxBatchRequestEnvelope(
+                batch_id=batch_id,
+                request_ids=request_ids,
+                observation=observation,
+                sample_kwargs=dict(sample_kwargs),
+                enqueue_ns=time.monotonic_ns(),
+            )
+        )
+        results_by_id = {request_id: self._wait_for_result(request_id) for request_id in request_ids}
+        return _combine_ordered_results(batch_id, request_ids, results_by_id)
+
+    def _choose_worker(self, *, count: int) -> str:
+        decision = self._router.choose_worker()
+        self._router.mark_enqueued(decision.worker_id, count=count)
+        self._router.mark_dispatched(decision.worker_id, count=count)
+        return decision.worker_id
+
+    def _wait_for_result(self, request_id: str) -> JaxActionResult:
+        deadline = time.monotonic() + self._result_timeout_s
+        with self._condition:
+            while True:
+                if request_id in self._pending_results:
+                    return self._pending_results.pop(request_id)
+                if request_id in self._pending_errors:
+                    raise _worker_error_to_runtime_error(self._pending_errors.pop(request_id))
+                if None in self._pending_errors:
+                    raise _worker_error_to_runtime_error(self._pending_errors[None])
+                if self._shutdown_seen:
+                    raise RuntimeError("JAX multi-GPU VA split worker shut down before producing a result")
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(f"Timed out waiting for JAX multi-GPU VA split result {request_id}")
+                self._condition.wait(timeout=remaining)
+
+    def _collect_results(self) -> None:
+        while True:
+            try:
+                message, get_start_ns, get_end_ns = timed_queue_get(self._result_queue)
+            except (EOFError, OSError):
+                return
+            with self._condition:
+                if isinstance(message, JaxActionResult):
+                    worker_id = self._request_to_worker.pop(message.request_id, None)
+                    if worker_id is not None:
+                        self._router.mark_released(worker_id)
+                    self._pending_results[message.request_id] = _mark_collected_result(
+                        message,
+                        get_start_ns=get_start_ns,
+                        get_end_ns=get_end_ns,
+                    )
+                elif isinstance(message, JaxWorkerError):
+                    self._pending_errors[message.request_id] = message
+                elif isinstance(message, JaxShutdown):
+                    self._shutdown_seen = True
+                self._condition.notify_all()
+            if isinstance(message, JaxShutdown):
+                return
+
+    def shutdown(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        for request_queue in self._request_queues.values():
+            with contextlib.suppress(Exception):
+                request_queue.put(JaxShutdown())
+        for process in (*self._vlm_processes.values(), self._ae_process):
+            process.join(timeout=5)
+            if process.is_alive():
+                process.terminate()
+        self._result_thread.join(timeout=5)
+
+    def reset(self) -> None:
+        pass
+
+    @property
+    def compile_timing(self) -> dict[str, float]:
+        return dict(self._compile_timing)
 
 
 class JaxProcessVASplitRuntime:
@@ -472,6 +721,40 @@ def _collect_compile_warmup(
             raise RuntimeError(f"Unexpected warmup queue message: {type(message)}")
         seen[message.role] = float(message.jax_warmup_batches)
     return {"jax_warmup_batches": float(sum(seen[role] for role in expected_roles))}
+
+
+def _collect_compile_warmup_count(
+    warmup_queue,
+    *,
+    expected_role: str,
+    expected_count: int,
+    timeout_s: float,
+    processes: tuple[Any, ...],
+) -> dict[str, float]:
+    if expected_count <= 0:
+        return {"jax_warmup_batches": 0.0}
+    deadline = time.monotonic() + max(timeout_s, 1.0)
+    seen = 0
+    total = 0.0
+    while seen < expected_count:
+        if any(process is not None and not process.is_alive() for process in processes) and seen == 0:
+            raise RuntimeError(f"Process exited before reporting {expected_role} compile warmup")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(
+                f"Timed out waiting for {expected_count} {expected_role} compile warmup reports; got {seen}"
+            )
+        try:
+            message = warmup_queue.get(timeout=min(remaining, 1.0))
+        except queue.Empty:
+            continue
+        if not isinstance(message, JaxCompileWarmupDone):
+            raise RuntimeError(f"Unexpected warmup queue message: {type(message)}")
+        if message.role != expected_role:
+            raise RuntimeError(f"Unexpected warmup role {message.role!r}; expected {expected_role!r}")
+        total += float(message.jax_warmup_batches)
+        seen += 1
+    return {"jax_warmup_batches": total}
 
 
 def _combine_ordered_results(

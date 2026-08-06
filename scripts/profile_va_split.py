@@ -7,16 +7,26 @@ import contextlib
 import dataclasses
 import json
 import math
+import multiprocessing as mp
 import os
 import pathlib
 import threading
 import time
 from typing import Any, Literal
+import uuid
 
 import numpy as np
 import tyro
 
-Mode = Literal["monolithic", "split-no-mps", "split-mps", "jax-monolithic", "jax-split-ipc"]
+Mode = Literal[
+    "monolithic",
+    "split-no-mps",
+    "split-mps",
+    "jax-monolithic",
+    "jax-split-ipc",
+    "jax-multigpu-split-ipc",
+    "jax-multigpu-baseline",
+]
 CompileMode = Literal["default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"]
 TraceStatus = Literal["ok", "error", "timeout"]
 DEFAULT_PROFILE_CHECKPOINT_CONFIG = "pi05_libero"
@@ -116,6 +126,9 @@ class Args:
     max_ae_batch_size: int = 8
     max_vlm_batch_size: int = 8
     max_vlm_wait_ms: float = 2.0
+    vlm_devices: str = ""
+    ae_device: str = ""
+    baseline_devices: str = ""
     ae_sm_percent: int = 20
     vlm_sm_percent: int = 0
     require_mps_env: bool = True
@@ -1015,7 +1028,7 @@ def warmup_jax_e2e_pipeline_until_steady(
         ms = _one_e2e()
         print(f"[profile]   e2e warmup #{e2e_count}: {ms:.1f}ms", flush=True)
 
-    if args.mode in ("jax-split-ipc", "jax-monolithic") and callable(getattr(policy, "infer_batch", None)):
+    if args.mode in ("jax-split-ipc", "jax-monolithic", "jax-multigpu-split-ipc", "jax-multigpu-baseline") and callable(getattr(policy, "infer_batch", None)):
         batch_sizes: list[int] = []
         if args.mode == "jax-monolithic":
             # Baseline FCFS can emit any size in [1, batch_size]; warm all of them so timed
@@ -1121,7 +1134,7 @@ def _warmup_before_timed_workload(
         return
     if args.warmup_requests <= 0:
         return
-    if args.mode in ("split-mps", "split-no-mps", "jax-split-ipc", "jax-monolithic"):
+    if args.mode in ("split-mps", "split-no-mps", "jax-split-ipc", "jax-monolithic", "jax-multigpu-split-ipc", "jax-multigpu-baseline"):
         stats = warmup_jax_e2e_pipeline_until_steady(policy, requests, args=args, executor=executor)
         policy._profile_e2e_warmup_stats = stats  # noqa: SLF001 — profile-only annotation
         return
@@ -1144,6 +1157,245 @@ def _warmup_before_timed_workload(
         num_requests=args.warmup_requests,
         executor=executor,
     )
+
+
+
+def _parse_profile_device_list(value: str) -> tuple[str, ...]:
+    devices = tuple(part.strip() for part in value.split(",") if part.strip())
+    if not devices:
+        raise ValueError("baseline_devices must contain at least one device")
+    if len(set(devices)) != len(devices):
+        raise ValueError("baseline_devices must be unique")
+    return devices
+
+
+class JaxMultiGpuBaselineProfilePolicy:
+    """Profile-only router for full sequential JAX policy replicas on separate GPUs."""
+
+    supports_concurrent_infer = True
+
+    def __init__(
+        self,
+        *,
+        policy_config: str,
+        policy_dir: str,
+        devices: tuple[str, ...],
+        sample_kwargs: dict[str, Any],
+        enable_component_timing: bool,
+        result_timeout_s: float,
+    ):
+        self._result_timeout_s = result_timeout_s
+        self._condition = threading.Condition()
+        self._closed = False
+        self._shutdown_seen = False
+        self._pending_results: dict[str, dict[str, Any]] = {}
+        self._pending_errors: dict[str | None, Any] = {}
+        self._request_to_worker: dict[str, str] = {}
+        self._request_counts: dict[str, int] = {}
+        self._inflight_by_worker = {f"baseline-{idx}": 0 for idx, _device in enumerate(devices)}
+
+        ctx = mp.get_context("spawn")
+        self._request_queues = {worker_id: ctx.Queue() for worker_id in self._inflight_by_worker}
+        self._result_queue = ctx.Queue()
+        self._processes = {}
+        for idx, device in enumerate(devices):
+            worker_id = f"baseline-{idx}"
+            self._processes[worker_id] = ctx.Process(
+                target=_run_jax_baseline_replica_process,
+                args=(
+                    policy_config,
+                    policy_dir,
+                    sample_kwargs,
+                    self._request_queues[worker_id],
+                    self._result_queue,
+                    device,
+                ),
+                kwargs={"enable_component_timing": enable_component_timing},
+                daemon=True,
+            )
+        for process in self._processes.values():
+            process.start()
+        self._result_thread = threading.Thread(target=self._collect_results, daemon=True)
+        self._result_thread.start()
+
+    def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:
+        request_id = str(uuid.uuid4())
+        worker_id = self._choose_worker(count=1)
+        self._request_to_worker[request_id] = worker_id
+        self._request_counts[request_id] = 1
+        sample_kwargs = {"noise": np.asarray(noise).copy()} if noise is not None else {}
+        self._request_queues[worker_id].put(
+            _make_jax_request_envelope(request_id=request_id, observation=obs, sample_kwargs=sample_kwargs)
+        )
+        return self._wait_for_result(request_id)
+
+    def infer_batch(self, obs_batch: dict, *, noise: np.ndarray | None = None) -> dict:
+        batch_size = int(np.asarray(obs_batch["observation/state"]).shape[0])
+        batch_id = str(uuid.uuid4())
+        request_ids = tuple(f"{batch_id}:{row}" for row in range(batch_size))
+        worker_id = self._choose_worker(count=batch_size)
+        self._request_to_worker[batch_id] = worker_id
+        self._request_counts[batch_id] = batch_size
+        sample_kwargs = {"noise": np.asarray(noise).copy()} if noise is not None else {}
+        self._request_queues[worker_id].put(
+            _make_jax_batch_request_envelope(
+                batch_id=batch_id,
+                request_ids=request_ids,
+                observation=obs_batch,
+                sample_kwargs=sample_kwargs,
+            )
+        )
+        return self._wait_for_result(batch_id)
+
+    def _choose_worker(self, *, count: int) -> str:
+        with self._condition:
+            worker_id = min(self._inflight_by_worker, key=lambda item: (self._inflight_by_worker[item], item))
+            self._inflight_by_worker[worker_id] += count
+            return worker_id
+
+    def _wait_for_result(self, request_id: str) -> dict:
+        deadline = time.monotonic() + self._result_timeout_s
+        with self._condition:
+            while True:
+                if request_id in self._pending_results:
+                    return self._pending_results.pop(request_id)
+                if request_id in self._pending_errors:
+                    raise RuntimeError(self._pending_errors.pop(request_id).error)
+                if None in self._pending_errors:
+                    raise RuntimeError(self._pending_errors[None].error)
+                if self._shutdown_seen:
+                    raise RuntimeError("JAX multi-GPU baseline worker shut down before producing a result")
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(f"Timed out waiting for JAX multi-GPU baseline result {request_id}")
+                self._condition.wait(timeout=remaining)
+
+    def _collect_results(self) -> None:
+        from openpi.serving.va_split_jax.types import JaxActionResult
+        from openpi.serving.va_split_jax.types import JaxShutdown
+        from openpi.serving.va_split_jax.types import JaxWorkerError
+
+        while True:
+            try:
+                message = self._result_queue.get()
+            except (EOFError, OSError):
+                return
+            with self._condition:
+                if isinstance(message, JaxActionResult):
+                    worker_id = self._request_to_worker.pop(message.request_id, None)
+                    count = self._request_counts.pop(message.request_id, 1)
+                    if worker_id is not None:
+                        self._inflight_by_worker[worker_id] = max(0, self._inflight_by_worker[worker_id] - count)
+                    self._pending_results[message.request_id] = message.actions
+                elif isinstance(message, JaxWorkerError):
+                    self._pending_errors[message.request_id] = message
+                elif isinstance(message, JaxShutdown):
+                    self._shutdown_seen = True
+                self._condition.notify_all()
+            if isinstance(message, JaxShutdown):
+                return
+
+    def shutdown(self) -> None:
+        from openpi.serving.va_split_jax.types import JaxShutdown
+
+        if self._closed:
+            return
+        self._closed = True
+        for request_queue in self._request_queues.values():
+            with contextlib.suppress(Exception):
+                request_queue.put(JaxShutdown())
+        for process in self._processes.values():
+            process.join(timeout=5)
+            if process.is_alive():
+                process.terminate()
+        self._result_thread.join(timeout=5)
+
+    def reset(self) -> None:
+        pass
+
+
+# Keep these constructors local so profile.py does not import JAX serving types before
+# child CUDA_VISIBLE_DEVICES is set in replica workers.
+def _make_jax_request_envelope(*, request_id: str, observation: dict, sample_kwargs: dict) -> Any:
+    from openpi.serving.va_split_jax.types import JaxRequestEnvelope
+
+    return JaxRequestEnvelope(
+        request_id=request_id,
+        observation=observation,
+        sample_kwargs=sample_kwargs,
+        enqueue_ns=time.monotonic_ns(),
+    )
+
+
+def _make_jax_batch_request_envelope(
+    *,
+    batch_id: str,
+    request_ids: tuple[str, ...],
+    observation: dict,
+    sample_kwargs: dict,
+) -> Any:
+    from openpi.serving.va_split_jax.types import JaxBatchRequestEnvelope
+
+    return JaxBatchRequestEnvelope(
+        batch_id=batch_id,
+        request_ids=request_ids,
+        observation=observation,
+        sample_kwargs=sample_kwargs,
+        enqueue_ns=time.monotonic_ns(),
+    )
+
+
+def _run_jax_baseline_replica_process(
+    policy_config: str,
+    policy_dir: str,
+    sample_kwargs: dict[str, Any],
+    request_queue,
+    result_queue,
+    device: str,
+    *,
+    enable_component_timing: bool,
+) -> None:
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(device)
+    os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+
+    from openpi.policies import policy_config as _policy_config
+    from openpi.serving.va_split_jax.types import JaxActionResult
+    from openpi.serving.va_split_jax.types import JaxBatchRequestEnvelope
+    from openpi.serving.va_split_jax.types import JaxRequestEnvelope
+    from openpi.serving.va_split_jax.types import JaxShutdown
+    from openpi.serving.va_split_jax.types import JaxWorkerError
+    from openpi.training import config as _config
+
+    policy = _policy_config.create_trained_policy(
+        _config.get_config(policy_config),
+        policy_dir,
+        sample_kwargs=sample_kwargs,
+        enable_component_timing=enable_component_timing,
+    )
+    while True:
+        message = request_queue.get()
+        if isinstance(message, JaxShutdown):
+            result_queue.put(message)
+            return
+        try:
+            if isinstance(message, JaxRequestEnvelope):
+                noise = message.sample_kwargs.get("noise")
+                output = policy.infer(message.observation, noise=noise) if noise is not None else policy.infer(message.observation)
+                result_queue.put(JaxActionResult(request_id=message.request_id, actions=output))
+                continue
+            if isinstance(message, JaxBatchRequestEnvelope):
+                noise = message.sample_kwargs.get("noise")
+                output = (
+                    policy.infer_batch(message.observation, noise=noise)
+                    if noise is not None
+                    else policy.infer_batch(message.observation)
+                )
+                result_queue.put(JaxActionResult(request_id=message.batch_id, actions=output))
+                continue
+            result_queue.put(JaxWorkerError(request_id=None, error=f"Unexpected baseline message: {type(message)}"))
+        except Exception as exc:  # pragma: no cover - model failures depend on environment.
+            request_id = getattr(message, "request_id", getattr(message, "batch_id", None))
+            result_queue.put(JaxWorkerError(request_id=request_id, error=repr(exc)))
 
 
 def _with_pytorch_compile_mode(train_config, compile_mode: CompileMode | None):
@@ -1194,6 +1446,30 @@ def create_policy_for_mode(args: Args, mode: Mode):
             jax_compile=args.jax_compile,
             jax_compile_warmup=args.jax_compile_warmup,
             jax_compile_warmup_max_batch_size=args.jax_compile_warmup_max_batch_size,
+        )
+    if mode == "jax-multigpu-split-ipc":
+        return _jax_va_split_policy.create_trained_jax_multigpu_va_split_policy(
+            train_config,
+            args.policy.dir,
+            sample_kwargs=sample_kwargs,
+            vlm_devices=args.vlm_devices,
+            ae_device=args.ae_device,
+            max_ae_batch_size=args.max_ae_batch_size,
+            max_vlm_batch_size=args.max_vlm_batch_size,
+            max_vlm_wait_ms=args.max_vlm_wait_ms,
+            result_timeout_s=args.timeout_s,
+            jax_compile=args.jax_compile,
+            jax_compile_warmup=args.jax_compile_warmup,
+            jax_compile_warmup_max_batch_size=args.jax_compile_warmup_max_batch_size,
+        )
+    if mode == "jax-multigpu-baseline":
+        return JaxMultiGpuBaselineProfilePolicy(
+            policy_config=args.policy.config,
+            policy_dir=args.policy.dir,
+            devices=_parse_profile_device_list(args.baseline_devices),
+            sample_kwargs=sample_kwargs,
+            enable_component_timing=args.enable_component_timing,
+            result_timeout_s=args.timeout_s,
         )
     ae_sm_percent = args.ae_sm_percent if mode == "split-mps" else 0
     vlm_sm_percent = args.vlm_sm_percent if mode == "split-mps" else 0

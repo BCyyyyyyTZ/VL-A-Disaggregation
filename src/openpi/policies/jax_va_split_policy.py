@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 import functools
-import os
 import pathlib
 import time
 from typing import Any
@@ -17,6 +16,8 @@ from openpi.models import model as _model
 from openpi.policies import batch_inference as _batch
 from openpi.policies import policy as _policy
 from openpi.serving.va_split_jax.compile import JaxCompileConfig
+from openpi.serving.va_split_jax.multigpu_config import JaxMultiGpuVASplitConfig
+from openpi.serving.va_split_jax.runtime import JaxMultiGpuProcessVASplitRuntime
 from openpi.serving.va_split_jax.runtime import JaxProcessVASplitRuntime
 from openpi.serving.va_split_jax.types import JaxActionResult
 from openpi.shared import download
@@ -295,3 +296,88 @@ def create_trained_jax_va_split_policy(
         sample_kwargs=sample_kwargs,
         metadata=train_config.policy_metadata,
     )
+
+def create_trained_jax_multigpu_va_split_policy(
+    train_config: _config.TrainConfig,
+    checkpoint_dir: pathlib.Path | str = "/mnt/tianze/models/pi05_libero",
+    *,
+    repack_transforms: _transforms.Group | None = None,
+    sample_kwargs: dict[str, Any] | None = None,
+    default_prompt: str | None = None,
+    norm_stats: dict[str, _transforms.NormStats] | None = None,
+    vlm_devices: str | Sequence[str],
+    ae_device: str,
+    max_ae_batch_size: int = 64,
+    max_vlm_batch_size: int = 8,
+    max_vlm_wait_ms: float = 1.0,
+    result_timeout_s: float = 120.0,
+    jax_compile: bool = True,
+    jax_compile_warmup: bool = True,
+    jax_compile_warmup_max_batch_size: int | None = None,
+) -> JaxVASplitPolicy:
+    repack_transforms = repack_transforms or _transforms.Group()
+    checkpoint_dir = pathlib.Path(download.maybe_download(str(checkpoint_dir)))
+    params_dir = checkpoint_dir / "params"
+    if not params_dir.exists():
+        if (checkpoint_dir / "model.safetensors").exists():
+            raise ValueError(
+                "JAX multi-GPU VA split policy requires a JAX checkpoint containing params/. "
+                "The provided checkpoint appears to be PyTorch-only (model.safetensors)."
+            )
+        raise ValueError(f"JAX checkpoint params directory not found: {params_dir}")
+
+    data_config = train_config.data.create(train_config.assets_dirs, train_config.model)
+    if norm_stats is None:
+        if data_config.asset_id is None:
+            raise ValueError("Asset id is required to load norm stats.")
+        norm_stats = _checkpoints.load_checkpoint_norm_stats(checkpoint_dir, data_config.asset_id)
+
+    config = JaxMultiGpuVASplitConfig(
+        vlm_devices=vlm_devices,
+        ae_device=ae_device,
+        max_vlm_batch_size=max_vlm_batch_size,
+        max_vlm_wait_ms=max_vlm_wait_ms,
+        max_ae_batch_size=max_ae_batch_size,
+    )
+    warmup_max_batch_size = (
+        jax_compile_warmup_max_batch_size
+        if jax_compile_warmup_max_batch_size is not None
+        else int(config.max_prefix_slots or max_vlm_batch_size * 3)
+    )
+    runtime = JaxMultiGpuProcessVASplitRuntime(
+        model_factory=functools.partial(_load_jax_model, train_config, checkpoint_dir),
+        config=config,
+        result_timeout_s=result_timeout_s,
+        vlm_env_updates=_mps_env_updates(0),
+        ae_env_updates=_mps_env_updates(0),
+        compile_config=JaxCompileConfig(
+            enabled=jax_compile,
+            warmup_enabled=jax_compile_warmup,
+            warmup_max_batch_size=warmup_max_batch_size,
+            num_steps=int((sample_kwargs or {}).get("num_steps", 10)),
+        ),
+    )
+    return JaxVASplitPolicy(
+        runtime=runtime,
+        transforms=[
+            *repack_transforms.inputs,
+            _transforms.InjectDefaultPrompt(default_prompt),
+            *data_config.data_transforms.inputs,
+            _transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
+            *data_config.model_transforms.inputs,
+        ],
+        output_transforms=[
+            *data_config.model_transforms.outputs,
+            _transforms.Unnormalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
+            *data_config.data_transforms.outputs,
+            *repack_transforms.outputs,
+        ],
+        sample_kwargs=sample_kwargs,
+        metadata={
+            **train_config.policy_metadata,
+            "va_split_runtime": "jax-multigpu-split-ipc",
+            "vlm_devices": tuple(config.vlm_devices),
+            "ae_device": config.ae_device,
+        },
+    )
+

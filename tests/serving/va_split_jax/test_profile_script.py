@@ -230,6 +230,143 @@ fi
     assert "--no-jax-compile-warmup" in args
 
 
+def test_profile_args_accept_multigpu_modes_and_devices():
+    from scripts import profile_va_split
+
+    args = profile_va_split.Args(
+        mode="jax-multigpu-split-ipc",
+        vlm_devices="0,1",
+        ae_device="2",
+        baseline_devices="0,1,2",
+    )
+
+    assert args.mode == "jax-multigpu-split-ipc"
+    assert args.vlm_devices == "0,1"
+    assert args.ae_device == "2"
+    assert args.baseline_devices == "0,1,2"
+
+
+def test_run_profile_va_split_multigpu_split_invocation(tmp_path):
+    repo_root = pathlib.Path(__file__).resolve().parents[3]
+    script_path = repo_root / "scripts/run_profile_va_split_multigpu.sh"
+    python_arg_log = tmp_path / "python_args.txt"
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _write_executable(
+        bin_dir / "python",
+        """#!/usr/bin/env bash
+set -euo pipefail
+: "${PYTHON_ARG_LOG:?}"
+printf '%s\n' "$@" >"${PYTHON_ARG_LOG}"
+""",
+    )
+
+    env = os.environ.copy()
+    env.update(
+        {
+            "PATH": f"{bin_dir}:{env['PATH']}",
+            "PYTHON_BIN": "python",
+            "PYTHON_ARG_LOG": str(python_arg_log),
+            "PROFILE_TARGET": "split",
+            "BACKEND": "jax",
+            "VLM_DEVICES": "0,1",
+            "AE_DEVICE": "2",
+            "REQUEST_RATE_HZ_VALUES": "8,16",
+            "JAX_COMPILE": "0",
+            "JAX_COMPILE_WARMUP": "false",
+            "LOG_ROOT": str(tmp_path / "logs"),
+            "RUN_TS": "split",
+        }
+    )
+
+    result = subprocess.run(
+        ["bash", str(script_path)],
+        cwd=repo_root,
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    args = python_arg_log.read_text(encoding="utf-8").splitlines()
+    assert _flag_value(args, "--mode") == "jax-multigpu-split-ipc"
+    assert _flag_value(args, "--vlm-devices") == "0,1"
+    assert _flag_value(args, "--ae-device") == "2"
+    assert _flag_value(args, "--request-rate-hz-values") == "8,16"
+    assert "--no-jax-compile" in args
+    assert "--no-jax-compile-warmup" in args
+
+
+def test_run_profile_va_split_multigpu_baseline_invocation(tmp_path):
+    repo_root = pathlib.Path(__file__).resolve().parents[3]
+    script_path = repo_root / "scripts/run_profile_va_split_multigpu.sh"
+    python_arg_log = tmp_path / "python_args.txt"
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _write_executable(
+        bin_dir / "python",
+        """#!/usr/bin/env bash
+set -euo pipefail
+: "${PYTHON_ARG_LOG:?}"
+printf '%s\n' "$@" >"${PYTHON_ARG_LOG}"
+""",
+    )
+
+    env = os.environ.copy()
+    env.update(
+        {
+            "PATH": f"{bin_dir}:{env['PATH']}",
+            "PYTHON_BIN": "python",
+            "PYTHON_ARG_LOG": str(python_arg_log),
+            "PROFILE_TARGET": "baseline",
+            "BACKEND": "jax",
+            "BASELINE_DEVICES": "0,1,2",
+            "REQUEST_RATE_HZ_VALUES": "8,16",
+            "LOG_ROOT": str(tmp_path / "logs"),
+            "RUN_TS": "baseline",
+        }
+    )
+
+    result = subprocess.run(
+        ["bash", str(script_path)],
+        cwd=repo_root,
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    args = python_arg_log.read_text(encoding="utf-8").splitlines()
+    assert _flag_value(args, "--mode") == "jax-multigpu-baseline"
+    assert _flag_value(args, "--baseline-devices") == "0,1,2"
+    assert _flag_value(args, "--request-rate-hz-values") == "8,16"
+
+
+def test_run_profile_va_split_multigpu_rejects_pytorch_backend(tmp_path):
+    repo_root = pathlib.Path(__file__).resolve().parents[3]
+    script_path = repo_root / "scripts/run_profile_va_split_multigpu.sh"
+
+    env = os.environ.copy()
+    env.update({"BACKEND": "pytorch", "LOG_ROOT": str(tmp_path / "logs")})
+
+    result = subprocess.run(
+        ["bash", str(script_path)],
+        cwd=repo_root,
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "PyTorch multi-GPU split profile is not implemented" in result.stderr
+
+
 def _flag_value(args: list[str], flag: str) -> str:
     index = args.index(flag)
     return args[index + 1]
