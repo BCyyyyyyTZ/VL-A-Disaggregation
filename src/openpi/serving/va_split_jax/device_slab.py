@@ -251,8 +251,8 @@ class CudaIpcDeviceSlabBackend(DeviceSlabBackend):
         key = int(device_ordinal)
         stream = self._write_streams.get(key)
         if stream is None:
-            _select_numba_device(key)
-            stream = cuda.stream()
+            context = _select_numba_device(key)
+            stream = context.create_stream()
             self._write_streams[key] = stream
         return stream
 

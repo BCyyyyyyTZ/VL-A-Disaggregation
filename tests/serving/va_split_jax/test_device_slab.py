@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import multiprocessing as mp
-import queue
 import threading
 import time
 from unittest import mock
@@ -162,11 +161,10 @@ def test_cuda_copy_lane_uses_stream_sync_not_device_or_slab_sync():
             stream_sync = mock.Mock()
             fake_stream = mock.Mock()
             fake_stream.synchronize = stream_sync
-            with mock.patch.object(backend, "_write_stream", return_value=fake_stream):
-                with mock.patch(
-                    "openpi.serving.va_split_jax.device_slab._copy_lane_with_kernel"
-                ) as copy_kernel:
-                    backend.copy_lane_from_array(slab, 2, value)
+            with mock.patch.object(backend, "_write_stream", return_value=fake_stream), mock.patch(
+                "openpi.serving.va_split_jax.device_slab._copy_lane_with_kernel"
+            ) as copy_kernel:
+                backend.copy_lane_from_array(slab, 2, value)
 
             copy_kernel.assert_called_once()
             assert copy_kernel.call_args.kwargs.get("stream") is fake_stream
@@ -174,6 +172,26 @@ def test_cuda_copy_lane_uses_stream_sync_not_device_or_slab_sync():
             device_sync.assert_not_called()
     finally:
         slab.close()
+
+
+def test_cuda_write_stream_uses_selected_device_context():
+    backend = CudaIpcDeviceSlabBackend()
+    fake_stream = mock.Mock()
+    fake_context = mock.Mock()
+    fake_context.create_stream.return_value = fake_stream
+
+    with mock.patch(
+        "openpi.serving.va_split_jax.device_slab._select_numba_device",
+        return_value=fake_context,
+    ) as select_device, mock.patch(
+        "openpi.serving.va_split_jax.device_slab.cuda.stream",
+        side_effect=AssertionError("cuda.stream() should not be used"),
+    ):
+        stream = backend._write_stream(2)  # noqa: SLF001
+
+    select_device.assert_called_once_with(2)
+    fake_context.create_stream.assert_called_once_with()
+    assert stream is fake_stream
 
 
 def test_cuda_deferred_lane_writes_sync_once_and_preserve_content():
@@ -251,7 +269,7 @@ def test_free_lane_write_concurrent_with_active_prefix_read():
                     np.testing.assert_allclose(np.asarray(batch[0]), expected0)
                     np.testing.assert_allclose(np.asarray(batch[1]), expected1)
                     time.sleep(0.001)
-            except BaseException as exc:  # noqa: BLE001 - surface in main thread
+            except BaseException as exc:  # surface in main thread
                 errors.append(exc)
 
         reader_thread = threading.Thread(target=reader, daemon=True)
