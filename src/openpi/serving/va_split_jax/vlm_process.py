@@ -16,6 +16,7 @@ import numpy as np
 from openpi.models import model as _model
 from openpi.models.jax_split_types import JaxPrefixFeature
 from openpi.models.jax_split_types import JaxPrefixSlotHandle
+from openpi.serving.va_split_jax import timeline_log
 from openpi.serving.va_split_jax.device_slab import DeviceSlab
 from openpi.serving.va_split_jax.device_slab import DeviceSlabBackend
 from openpi.serving.va_split_jax.device_slab import DeviceSlabHandle
@@ -23,7 +24,7 @@ from openpi.serving.va_split_jax.device_slab import make_default_device_slab_bac
 from openpi.serving.va_split_jax.prefix_cache_pool import JaxVlmPrefixCacheLanePool
 from openpi.serving.va_split_jax.prefix_cache_pool import write_feature_batch_to_slab_tree
 from openpi.serving.va_split_jax.prefix_cache_pool import write_feature_to_slab_tree
-from openpi.serving.va_split_jax import timeline_log
+from openpi.serving.va_split_jax.prefix_transfer import PrefixTransferTicket
 from openpi.serving.va_split_jax.timing import timed_queue_get
 from openpi.serving.va_split_jax.types import JaxBatchRequestEnvelope
 from openpi.serving.va_split_jax.types import JaxLaneCredits
@@ -33,7 +34,6 @@ from openpi.serving.va_split_jax.types import JaxReleaseFeature
 from openpi.serving.va_split_jax.types import JaxRequestEnvelope
 from openpi.serving.va_split_jax.types import JaxShutdown
 from openpi.serving.va_split_jax.types import JaxWorkerError
-
 
 _BACKLOG_DRAIN_PER_ROW_MS = 2.0
 _BACKLOG_DRAIN_MAX_MS = 25.0
@@ -49,6 +49,7 @@ class JaxVLMWorker:
         max_live_features: int,
         backend: DeviceSlabBackend | None = None,
         shared_pool: JaxVlmPrefixCacheLanePool | None = None,
+        source_worker_id: str | None = None,
     ):
         if max_live_features <= 0:
             raise ValueError("max_live_features must be positive")
@@ -56,6 +57,7 @@ class JaxVLMWorker:
         self._max_live_features = max_live_features
         self._backend = backend or make_default_device_slab_backend()
         self._shared_pool = shared_pool
+        self._source_worker_id = source_worker_id
         self._writable_slab_tree: dict[str, Any] | None = None
         self._lane_credits: list[int] = []
         self._outstanding: set[str] = set()
@@ -196,9 +198,7 @@ class JaxVLMWorker:
             return
         if self._writable_slab_tree is None:
             raise RuntimeError("VLM has not attached AE-owned prefix slabs")
-        self._writable_slab_tree = write_feature_to_slab_tree(
-            self._backend, self._writable_slab_tree, lane_id, feature
-        )
+        self._writable_slab_tree = write_feature_to_slab_tree(self._backend, self._writable_slab_tree, lane_id, feature)
 
     def _write_feature_to_lanes(self, lane_ids: tuple[int, ...], feature: JaxPrefixFeature) -> bool:
         if len(lane_ids) > 1 and _is_contiguous_lane_span(lane_ids):
@@ -285,6 +285,8 @@ class JaxVLMWorker:
                     ),
                     num_steps=num_steps,
                     sample_kwargs=row_kwargs,
+                    source_worker_id=self._source_worker_id,
+                    prefix_ready_ticket=PrefixTransferTicket(kind="synchronous"),
                     timing={
                         "vlm_prefix_forward_ms": elapsed_ms,
                         "vlm_effective_batch": float(batch_size),
@@ -323,6 +325,7 @@ class JaxVLMProcess:
         max_live_features: int = 8,
         backend: DeviceSlabBackend | None = None,
         shared_pool: JaxVlmPrefixCacheLanePool | None = None,
+        source_worker_id: str | None = None,
     ):
         if max_batch_size <= 0:
             raise ValueError("max_batch_size must be positive")
@@ -333,6 +336,7 @@ class JaxVLMProcess:
             max_live_features=max_live_features,
             backend=backend,
             shared_pool=shared_pool,
+            source_worker_id=source_worker_id,
         )
         self._request_queue = request_queue
         self._prefix_queue = prefix_queue
@@ -409,7 +413,9 @@ class JaxVLMProcess:
                         )
                 continue
             if not isinstance(message, JaxRequestEnvelope):
-                self._prefix_queue.put(JaxWorkerError(request_id=None, error=f"Unexpected VLM message: {type(message)}"))
+                self._prefix_queue.put(
+                    JaxWorkerError(request_id=None, error=f"Unexpected VLM message: {type(message)}")
+                )
                 continue
             if not self._defer_until_live_feature_capacity(message, 1):
                 continue

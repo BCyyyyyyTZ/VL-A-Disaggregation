@@ -37,6 +37,8 @@ class JaxPrefixReady:
     num_steps: int
     sample_kwargs: dict[str, Any]
     timing: dict[str, float] | None = None
+    source_worker_id: str | None = None
+    prefix_ready_ticket: Any | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,6 +60,7 @@ class JaxReleaseFeature:
 
     request_id: str
     slot_id: int
+    source_worker_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

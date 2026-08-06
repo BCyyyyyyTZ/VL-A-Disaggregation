@@ -15,12 +15,13 @@ import numpy as np
 from openpi.models.jax_split_types import JaxDenoiseState
 from openpi.models.jax_split_types import JaxPrefixFeature
 from openpi.models.jax_split_types import JaxPrefixSlabHandleTree
+from openpi.serving.va_split_jax import timeline_log
 from openpi.serving.va_split_jax.compile import JaxCompileConfig
 from openpi.serving.va_split_jax.compile import warmup_ae_denoise_on_mapped_slabs
 from openpi.serving.va_split_jax.device_slab import DeviceSlabBackend
 from openpi.serving.va_split_jax.device_slab import make_default_device_slab_backend
 from openpi.serving.va_split_jax.prefix_cache_pool import JaxVlmPrefixCacheLanePool
-from openpi.serving.va_split_jax import timeline_log
+from openpi.serving.va_split_jax.prefix_transfer import wait_for_prefix_ticket
 from openpi.serving.va_split_jax.timing import queue_wait_and_transfer_ms
 from openpi.serving.va_split_jax.timing import timed_queue_get
 from openpi.serving.va_split_jax.types import JaxActionBatchRow
@@ -36,6 +37,7 @@ from openpi.serving.va_split_jax.types import JaxWorkerError
 @dataclass
 class JaxAERequestState:
     request_id: str
+    source_worker_id: str | None
     active_lane_id: int
     x_t: jax.Array
     step_idx: int
@@ -209,8 +211,7 @@ class JaxAEWorker:
         self._ipc_warmup_done = True
         warm_ms = (time.monotonic_ns() - warm_start_ns) / 1_000_000
         print(
-            f"[jax-ae] owned-pool denoise warmup done: batches={self._ipc_warmup_batches} "
-            f"wall_ms={warm_ms:.1f}",
+            f"[jax-ae] owned-pool denoise warmup done: batches={self._ipc_warmup_batches} wall_ms={warm_ms:.1f}",
             flush=True,
         )
 
@@ -271,6 +272,7 @@ class JaxAEWorker:
         if noise is not None:
             noise = jnp.asarray(noise)
         timing = dict(ready.timing or {})
+        timing["prefix_ready_wait_ms"] = wait_for_prefix_ticket(ready.prefix_ready_ticket)
         prefix_enqueue_ns = timing.pop("_prefix_enqueue_ns", None)
         prefix_get_start_ns = timing.pop("_prefix_get_start_ns", None)
         prefix_get_end_ns = timing.pop("_prefix_get_end_ns", None)
@@ -307,8 +309,7 @@ class JaxAEWorker:
         timing["ae_init_denoise_ms"] = (time.monotonic_ns() - init_denoise_start_ns) / 1_000_000
         if int(x_t.shape[0]) != int(ready.slot_handle.batch_rows):
             raise RuntimeError(
-                f"AE denoise state batch size {x_t.shape[0]} does not match prefix rows "
-                f"{ready.slot_handle.batch_rows}"
+                f"AE denoise state batch size {x_t.shape[0]} does not match prefix rows {ready.slot_handle.batch_rows}"
             )
         dt = jnp.full((ready.slot_handle.batch_rows,), -1.0 / float(ready.num_steps), dtype=jnp.float32)
         lane_id = self._active_count
@@ -326,6 +327,7 @@ class JaxAEWorker:
         timing["prefix_pool_write_ms"] = (time.monotonic_ns() - admit_start_ns) / 1_000_000
         state = JaxAERequestState(
             request_id=ready.request_id,
+            source_worker_id=ready.source_worker_id,
             active_lane_id=lane_id,
             x_t=x_t,
             step_idx=0,
@@ -452,7 +454,13 @@ class JaxAEWorker:
             for request in sorted(completed, key=lambda item: item.active_lane_id, reverse=True):
                 freed_by_request[request.request_id] = self._remove_active_lane(request.active_lane_id)
         for request in completed:
-            releases.append(JaxReleaseFeature(request_id=request.request_id, slot_id=freed_by_request[request.request_id]))
+            releases.append(
+                JaxReleaseFeature(
+                    request_id=request.request_id,
+                    slot_id=freed_by_request[request.request_id],
+                    source_worker_id=request.source_worker_id,
+                )
+            )
         return results, releases
 
     def clear_active(self) -> list[JaxReleaseFeature]:
@@ -787,7 +795,11 @@ class JaxAEProcess:
                     JaxWorkerError(request_id=message.request_id, error=str(exc), traceback=traceback.format_exc())
                 )
                 self._release_queue.put(
-                    JaxReleaseFeature(request_id=message.request_id, slot_id=message.slot_handle.slot_id)
+                    JaxReleaseFeature(
+                        request_id=message.request_id,
+                        slot_id=message.slot_handle.slot_id,
+                        source_worker_id=message.source_worker_id,
+                    )
                 )
             if block:
                 block = False

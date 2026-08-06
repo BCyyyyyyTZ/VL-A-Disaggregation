@@ -13,7 +13,6 @@ import uuid
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 
 from openpi.serving.va_split_jax.ae_process import JaxAEProcess
 from openpi.serving.va_split_jax.ae_process import JaxAEWorker
@@ -34,6 +33,7 @@ from openpi.serving.va_split_jax.types import JaxActionBatchRow
 from openpi.serving.va_split_jax.types import JaxActionResult
 from openpi.serving.va_split_jax.types import JaxBatchRequestEnvelope
 from openpi.serving.va_split_jax.types import JaxCompileWarmupDone
+from openpi.serving.va_split_jax.types import JaxReleaseFeature
 from openpi.serving.va_split_jax.types import JaxRequestEnvelope
 from openpi.serving.va_split_jax.types import JaxShutdown
 from openpi.serving.va_split_jax.types import JaxWorkerError
@@ -176,6 +176,7 @@ def _run_jax_vlm_process(
     compile_config=None,
     env_updates=None,
     warmup_queue=None,
+    source_worker_id=None,
 ) -> None:
     _apply_env_updates(env_updates)
     model = model_factory()
@@ -201,6 +202,7 @@ def _run_jax_vlm_process(
         max_batch_size=max_vlm_batch_size,
         max_wait_ms=max_vlm_wait_ms,
         max_live_features=max_prefix_slots,
+        source_worker_id=source_worker_id,
         backend=backend,
     )
     # AE-first handshake: wait for slab export + credits on release_queue.
@@ -432,6 +434,10 @@ class JaxProcessVASplitRuntime:
     @property
     def compile_timing(self) -> dict[str, float]:
         return dict(self._compile_timing)
+
+
+def _release_queue_key(release: JaxReleaseFeature) -> str | None:
+    return release.source_worker_id
 
 
 def _worker_error_to_runtime_error(error: JaxWorkerError) -> RuntimeError:
