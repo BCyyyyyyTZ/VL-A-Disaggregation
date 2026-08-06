@@ -206,6 +206,7 @@ class CudaIpcDeviceSlabBackend(DeviceSlabBackend):
             raise RuntimeError(f"expected {self.transport!r} slab, got {slab.handle.transport!r}")
         value.block_until_ready()
         device_ordinal = int(slab.handle.device_ordinal)
+        _select_numba_device(device_ordinal)
         stream = self._write_stream(device_ordinal)
         dst = _device_array_view_from_cuda_array_interface(
             _cuda_array_interface_for_array(slab.array), owner=slab, device_ordinal=device_ordinal
@@ -232,6 +233,7 @@ class CudaIpcDeviceSlabBackend(DeviceSlabBackend):
             raise RuntimeError(f"expected {self.transport!r} slab, got {slab.handle.transport!r}")
         value.block_until_ready()
         device_ordinal = int(slab.handle.device_ordinal)
+        _select_numba_device(device_ordinal)
         stream = self._write_stream(device_ordinal)
         dst = _device_array_view_from_cuda_array_interface(
             _cuda_array_interface_for_array(slab.array), owner=slab, device_ordinal=device_ordinal
@@ -367,10 +369,8 @@ def _device_array_view_from_cuda_array_interface(
 ) -> devicearray.DeviceNDArray:
     """Create a Numba device array view in the selected process-visible context."""
     version = int(desc.get("version", 0))
-    if version >= 1:
-        mask = desc.get("mask")
-        if mask is not None:
-            raise NotImplementedError("Masked arrays are not supported")
+    if version >= 1 and desc.get("mask") is not None:
+        raise NotImplementedError("Masked arrays are not supported")
 
     shape = desc["shape"]
     strides = desc.get("strides")
