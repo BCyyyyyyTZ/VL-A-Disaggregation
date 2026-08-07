@@ -1,5 +1,6 @@
 from flax import nnx
 import jax
+import jax.numpy as jnp
 import pytest
 
 from openpi.models import model as _model
@@ -92,3 +93,36 @@ def test_model_restore():
 
     actions = model.sample_actions(key, obs, num_steps=10)
     assert actions.shape == (batch_size, model.action_horizon, model.action_dim)
+
+
+def test_filter_checkpoint_params_item_keeps_only_target_subtree():
+    checkpoint_params = {
+        "PaliGemma": {
+            "llm": {
+                "attn": {"value": jnp.ones((1,), dtype=jnp.float32)},
+            },
+            "img": {
+                "proj": {"value": jnp.ones((2,), dtype=jnp.float32)},
+            },
+        },
+        "action_in_proj": {
+            "kernel": {"value": jnp.ones((3,), dtype=jnp.float32)},
+        },
+    }
+    target = {
+        "PaliGemma": {
+            "llm": {
+                "attn": jnp.zeros((1,), dtype=jnp.float32),
+            }
+        },
+        "action_in_proj": {
+            "kernel": jnp.zeros((3,), dtype=jnp.float32),
+        },
+    }
+
+    filtered = _model._filter_checkpoint_params_item(checkpoint_params, target)  # noqa: SLF001
+
+    assert set(filtered) == {"PaliGemma", "action_in_proj"}
+    assert set(filtered["PaliGemma"]) == {"llm"}
+    assert filtered["PaliGemma"]["llm"]["attn"]["value"].shape == (1,)
+    assert filtered["action_in_proj"]["kernel"]["value"].shape == (3,)

@@ -166,18 +166,30 @@ class CudaIpcDeviceSlabBackend(DeviceSlabBackend):
     def open_slab(self, handle: DeviceSlabHandle) -> DeviceSlab:
         if handle.transport != self.transport:
             raise RuntimeError(f"unsupported slab transport {handle.transport!r}")
-        _select_numba_device(handle.device_ordinal)
+        device_ordinal = _normalize_numba_device_ordinal(handle.device_ordinal)
+        context = _select_numba_device(device_ordinal)
         stack = contextlib.ExitStack()
         try:
-            ipc_array = stack.enter_context(
-                cuda.open_ipc_array(
-                    tuple(handle.handle_bytes),
-                    handle.spec.slab_shape,
-                    _storage_dtype_for_spec(handle.spec),
-                    strides=handle.strides,
-                    offset=handle.offset,
-                )
+            driver_handle = (
+                driver.binding.CUipcMemHandle() if driver.USE_NV_BINDING else driver.drvapi.cu_ipc_mem_handle()
             )
+            if driver.USE_NV_BINDING:
+                driver_handle.reserved = tuple(handle.handle_bytes)
+            else:
+                driver_handle = driver.drvapi.cu_ipc_mem_handle(*tuple(handle.handle_bytes))
+            ipchandle = driver.IpcHandle(
+                None,
+                driver_handle,
+                int(np.prod(handle.spec.slab_shape) * np.dtype(_storage_dtype_for_spec(handle.spec)).itemsize),
+                offset=handle.offset,
+            )
+            ipc_array = ipchandle.open_array(
+                context,
+                shape=handle.spec.slab_shape,
+                dtype=_storage_dtype_for_spec(handle.spec),
+                strides=handle.strides,
+            )
+            stack.callback(ipchandle.close)
             array = jnp.asarray(ipc_array)
             array.block_until_ready()
             if array.unsafe_buffer_pointer() != ipc_array.device_ctypes_pointer.value:
@@ -286,9 +298,9 @@ class LocalDeviceSlabBackend(DeviceSlabBackend):
         raise RuntimeError("LocalDeviceSlabBackend cannot open slabs across processes")
 
 
-def make_default_device_slab_backend() -> DeviceSlabBackend:
+def make_default_device_slab_backend(*, device_ordinal: int | None = None) -> DeviceSlabBackend:
     if _has_cuda_device():
-        return CudaIpcDeviceSlabBackend()
+        return CudaIpcDeviceSlabBackend(device_ordinal=device_ordinal)
     return LocalDeviceSlabBackend()
 
 

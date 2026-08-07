@@ -6,20 +6,28 @@ import pathlib
 import time
 from typing import Any
 
+from flax import nnx
 import jax
 import jax.numpy as jnp
 import numpy as np
+import orbax.checkpoint as ocp
 from typing_extensions import override
 
 from openpi import transforms as _transforms
+from openpi.models import gemma as _gemma
 from openpi.models import model as _model
+from openpi.models.jax_split_types import JaxPrefixFeature
 from openpi.policies import batch_inference as _batch
 from openpi.policies import policy as _policy
 from openpi.serving.va_split_jax.compile import JaxCompileConfig
+from openpi.serving.va_split_jax.compile import make_model_observation_factory
+from openpi.serving.va_split_jax.compile import make_prefix_feature_template
+from openpi.serving.va_split_jax.compile import prune_split_model_for_role
 from openpi.serving.va_split_jax.multigpu_config import JaxMultiGpuVASplitConfig
 from openpi.serving.va_split_jax.runtime import JaxMultiGpuProcessVASplitRuntime
 from openpi.serving.va_split_jax.runtime import JaxProcessVASplitRuntime
 from openpi.serving.va_split_jax.types import JaxActionResult
+from openpi.shared import array_typing as at
 from openpi.shared import download
 from openpi.training import checkpoints as _checkpoints
 from openpi.training import config as _config
@@ -201,7 +209,13 @@ def _normalize_uint8_images_for_vlm_ipc(inputs: dict[str, Any]) -> dict[str, Any
     return staged
 
 
-def _load_jax_model(train_config: _config.TrainConfig, checkpoint_dir: pathlib.Path | str):
+def _load_jax_model(
+    train_config: _config.TrainConfig,
+    checkpoint_dir: pathlib.Path | str,
+    *,
+    role: str | None = None,
+    device_index: int | None = None,
+):
     checkpoint_dir = pathlib.Path(checkpoint_dir)
     params_dir = checkpoint_dir / "params"
     if not params_dir.exists():
@@ -211,7 +225,73 @@ def _load_jax_model(train_config: _config.TrainConfig, checkpoint_dir: pathlib.P
                 "found only PyTorch model.safetensors. Download or provide a JAX checkpoint."
             )
         raise ValueError(f"JAX checkpoint params directory not found: {params_dir}")
-    return train_config.model.load(_model.restore_params(params_dir, dtype=jnp.bfloat16))
+
+    sharding = _single_device_sharding(device_index) if device_index is not None else None
+    if role is None:
+        return train_config.model.load(_model.restore_params(params_dir, dtype=jnp.bfloat16, sharding=sharding))
+
+    model, expected_params = _role_pruned_model_and_expected_params(train_config.model, role=role)
+    params = _model.restore_params(params_dir, dtype=jnp.bfloat16, sharding=sharding, target=expected_params)
+    params = ocp.transform_utils.intersect_trees(expected_params, params)
+    at.check_pytree_equality(expected=expected_params, got=params, check_shapes=True, check_dtypes=False)
+    graphdef, state = nnx.split(model)
+    state.replace_by_pure_dict(params)
+    loaded = nnx.merge(graphdef, state)
+    if role == "ae":
+        loaded._va_split_prefix_feature_template = _make_prefix_feature_template_for_model_config(train_config.model)  # noqa: SLF001
+    return loaded
+
+
+def _single_device_sharding(device_index: int) -> jax.sharding.SingleDeviceSharding:
+    devices = jax.devices()
+    if device_index < 0 or device_index >= len(devices):
+        raise ValueError(f"JAX device_index={device_index} is out of range for visible devices: {devices}")
+    return jax.sharding.SingleDeviceSharding(devices[device_index])
+
+
+def _role_pruned_model_and_expected_params(
+    model_config: _model.BaseModelConfig,
+    *,
+    role: str,
+) -> tuple[_model.BaseModel, at.Params]:
+    model = nnx.eval_shape(model_config.create, jax.random.key(0))
+    model = prune_split_model_for_role(model, role=role)
+    _, state = nnx.split(model)
+    return model, state.to_pure_dict()
+
+
+def _make_prefix_feature_template_for_model_config(model_config: _model.BaseModelConfig):
+    if hasattr(model_config, "paligemma_variant"):
+        paligemma_config = _gemma.get_config(model_config.paligemma_variant)
+        observation_spec, _ = model_config.inputs_spec(batch_size=1)
+        siglip_patch_size = 14
+        image_tokens = 0
+        for image_spec in observation_spec.images.values():
+            height, width = image_spec.shape[1:3]
+            if height % siglip_patch_size or width % siglip_patch_size:
+                raise ValueError(f"Image shape {image_spec.shape} is not divisible by SigLIP patch size 14")
+            image_tokens += (height // siglip_patch_size) * (width // siglip_patch_size)
+        text_tokens = 0
+        if observation_spec.tokenized_prompt is not None:
+            text_tokens = int(observation_spec.tokenized_prompt.shape[1])
+        prefix_tokens = int(image_tokens + text_tokens)
+        dtype = jnp.dtype(getattr(model_config, "dtype", jnp.bfloat16))
+        kv_shape = (
+            int(paligemma_config.depth),
+            1,
+            prefix_tokens,
+            int(paligemma_config.num_kv_heads),
+            int(paligemma_config.head_dim),
+        )
+        return JaxPrefixFeature(
+            past_key_values=(jnp.zeros(kv_shape, dtype=dtype), jnp.zeros(kv_shape, dtype=dtype)),
+            prefix_pad_masks=jnp.ones((1, prefix_tokens), dtype=jnp.bool_),
+            state=jnp.zeros((1, int(model_config.action_dim)), dtype=jnp.float32),
+        )
+
+    model = nnx.eval_shape(model_config.create, jax.random.key(0))
+    observation_factory = make_model_observation_factory(model)
+    return make_prefix_feature_template(model, observation_factory)
 
 
 def _mps_env_updates(sm_percent: int) -> dict[str, str | None]:
@@ -265,6 +345,8 @@ def create_trained_jax_va_split_policy(
     )
     runtime = JaxProcessVASplitRuntime(
         model_factory=functools.partial(_load_jax_model, train_config, checkpoint_dir),
+        vlm_model_factory=functools.partial(_load_jax_model, train_config, checkpoint_dir, role="vlm", device_index=0),
+        ae_model_factory=functools.partial(_load_jax_model, train_config, checkpoint_dir, role="ae", device_index=0),
         max_ae_batch_size=max_ae_batch_size,
         max_vlm_batch_size=max_vlm_batch_size,
         max_vlm_wait_ms=max_vlm_wait_ms,
@@ -346,6 +428,8 @@ def create_trained_jax_multigpu_va_split_policy(
     )
     runtime = JaxMultiGpuProcessVASplitRuntime(
         model_factory=functools.partial(_load_jax_model, train_config, checkpoint_dir),
+        vlm_model_factory=functools.partial(_load_jax_model, train_config, checkpoint_dir, role="vlm", device_index=1),
+        ae_model_factory=functools.partial(_load_jax_model, train_config, checkpoint_dir, role="ae", device_index=0),
         config=config,
         result_timeout_s=result_timeout_s,
         vlm_env_updates=_mps_env_updates(0),
@@ -380,4 +464,3 @@ def create_trained_jax_multigpu_va_split_policy(
             "ae_device": config.ae_device,
         },
     )
-

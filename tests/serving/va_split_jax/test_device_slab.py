@@ -240,6 +240,38 @@ def test_cuda_copy_lane_uses_context_aware_array_views():
     fake_stream.synchronize.assert_called_once_with()
 
 
+def test_cuda_open_slab_normalizes_physical_device_ordinal(monkeypatch):
+    backend = CudaIpcDeviceSlabBackend()
+    spec = DeviceSlabSpec(name="x", shape=(1, 2, 3), dtype="float32", max_lanes=4)
+    handle = device_slab.DeviceSlabHandle(
+        spec=spec,
+        transport=backend.transport,
+        device_ordinal=2,
+        handle_bytes=b"handle",
+    )
+    fake_context = SimpleNamespace()
+    fake_array = SimpleNamespace(
+        unsafe_buffer_pointer=lambda: 123,
+        block_until_ready=lambda: None,
+        device_ctypes_pointer=SimpleNamespace(value=123),
+    )
+    fake_ipc_handle = SimpleNamespace(
+        open_array=mock.Mock(return_value=fake_array),
+        close=mock.Mock(),
+    )
+    with monkeypatch.context() as m:
+        m.setenv("CUDA_VISIBLE_DEVICES", "0,2")
+        m.setattr(device_slab, "_select_numba_device", mock.Mock(return_value=fake_context))
+        m.setattr(device_slab.driver, "USE_NV_BINDING", False)
+        m.setattr(device_slab.driver.drvapi, "cu_ipc_mem_handle", lambda *args: tuple(args))
+        m.setattr(device_slab.driver, "IpcHandle", lambda *args, **kwargs: fake_ipc_handle)
+        m.setattr(device_slab.jnp, "asarray", lambda array: array)
+        opened = backend.open_slab(handle)
+
+    assert opened.handle is handle
+    fake_ipc_handle.open_array.assert_called_once()
+
+
 def test_numba_device_ordinal_normalizes_physical_cuda_visible_device(monkeypatch):
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "2")
     monkeypatch.setattr(device_slab.cuda, "gpus", [object()])

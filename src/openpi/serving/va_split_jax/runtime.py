@@ -201,7 +201,7 @@ def _run_jax_vlm_process(
                 config=compile_config,
             )
             vlm_warmup_batches = float(stats["jax_warmup_batches"])
-    backend = make_default_device_slab_backend()
+    backend = make_default_device_slab_backend(device_ordinal=1 if len(jax.devices()) > 1 else 0)
     process = JaxVLMProcess(
         model=model,
         request_queue=request_queue,
@@ -246,7 +246,9 @@ def _run_jax_ae_process(
     model = model_factory()
     observation_factory = make_model_observation_factory(model)
     noise_factory = make_model_noise_factory(model) if compile_config is not None else None
-    template = make_prefix_feature_template(model, observation_factory)
+    template = getattr(model, "_va_split_prefix_feature_template", None)
+    if template is None:
+        template = make_prefix_feature_template(model, observation_factory)
     model = prune_split_model_for_role(model, role="ae")
     if compile_config is not None:
         model = maybe_jit_ae_model(model, compile_config)
@@ -342,7 +344,9 @@ class JaxMultiGpuProcessVASplitRuntime:
     def __init__(
         self,
         *,
-        model_factory: Callable[[], object],
+        model_factory: Callable[[], object] | None = None,
+        vlm_model_factory: Callable[[], object] | None = None,
+        ae_model_factory: Callable[[], object] | None = None,
         config: JaxMultiGpuVASplitConfig,
         result_timeout_s: float = 120.0,
         vlm_env_updates: dict[str, str | None] | None = None,
@@ -360,6 +364,9 @@ class JaxMultiGpuProcessVASplitRuntime:
         self._condition = threading.Condition()
         self._compile_timing = {"jax_warmup_batches": 0.0}
         self._router = LeastBacklogVlmRouter(config.vlm_worker_ids)
+        self._model_factory = model_factory or vlm_model_factory or ae_model_factory
+        self._vlm_model_factory = vlm_model_factory or self._model_factory
+        self._ae_model_factory = ae_model_factory or self._model_factory
         initial_per_worker = max(1, int(config.max_prefix_slots or 1) // max(1, config.num_vlm_workers))
         for worker_id in config.vlm_worker_ids:
             self._router.update(worker_id, JaxVlmRouteState(available_credits=initial_per_worker))
@@ -372,13 +379,13 @@ class JaxMultiGpuProcessVASplitRuntime:
         self._warmup_queue = ctx.Queue()
         release_fanout = JaxMultiGpuReleaseFanout(
             self._release_queues,
-            slab_device_ordinals=dict.fromkeys(config.vlm_worker_ids, 1),
+            slab_device_ordinals=dict.fromkeys(config.vlm_worker_ids, 0),
         )
 
         self._ae_process = ctx.Process(
             target=run_ae_worker_entry,
             args=(
-                model_factory,
+                self._ae_model_factory,
                 self._prefix_queue,
                 self._result_queue,
                 release_fanout,
@@ -396,7 +403,7 @@ class JaxMultiGpuProcessVASplitRuntime:
             self._vlm_processes[worker_id] = ctx.Process(
                 target=run_vlm_worker_entry,
                 args=(
-                    model_factory,
+                    self._vlm_model_factory,
                     self._request_queues[worker_id],
                     self._prefix_queue,
                     self._release_queues[worker_id],
@@ -408,8 +415,8 @@ class JaxMultiGpuProcessVASplitRuntime:
                     self._warmup_queue,
                     worker_id,
                 ),
-                # VLM sees its compute GPU first and the AE slab GPU second.
-                kwargs={"device": f"{device},{config.ae_device}", "env_updates": vlm_env_updates},
+                # VLM sees the AE slab GPU first and its compute GPU second.
+                kwargs={"device": f"{config.ae_device},{device}", "env_updates": vlm_env_updates},
                 daemon=True,
             )
 
@@ -546,7 +553,9 @@ class JaxProcessVASplitRuntime:
     def __init__(
         self,
         *,
-        model_factory: Callable[[], object],
+        model_factory: Callable[[], object] | None = None,
+        vlm_model_factory: Callable[[], object] | None = None,
+        ae_model_factory: Callable[[], object] | None = None,
         max_ae_batch_size: int = 8,
         max_vlm_batch_size: int = 8,
         max_vlm_wait_ms: float = 2.0,
@@ -567,6 +576,9 @@ class JaxProcessVASplitRuntime:
         self._closed = False
         self._condition = threading.Condition()
         self._compile_timing = {"jax_warmup_batches": 0.0}
+        self._model_factory = model_factory or vlm_model_factory or ae_model_factory
+        self._vlm_model_factory = vlm_model_factory or self._model_factory
+        self._ae_model_factory = ae_model_factory or self._model_factory
 
         ctx = mp.get_context(start_method)
         self._request_queue = ctx.Queue()
@@ -578,7 +590,7 @@ class JaxProcessVASplitRuntime:
         self._ae_process = ctx.Process(
             target=_run_jax_ae_process,
             args=(
-                model_factory,
+                self._ae_model_factory,
                 self._prefix_queue,
                 self._result_queue,
                 self._release_queue,
@@ -593,7 +605,7 @@ class JaxProcessVASplitRuntime:
         self._vlm_process = ctx.Process(
             target=_run_jax_vlm_process,
             args=(
-                model_factory,
+                self._vlm_model_factory,
                 self._request_queue,
                 self._prefix_queue,
                 self._release_queue,

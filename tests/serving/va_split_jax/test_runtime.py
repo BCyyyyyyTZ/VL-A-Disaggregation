@@ -13,8 +13,11 @@ import pytest
 
 from openpi.models.jax_split_types import JaxDenoiseState
 from openpi.models.jax_split_types import JaxPrefixFeature
+from openpi.serving.va_split_jax import runtime as runtime_module
 from openpi.serving.va_split_jax.launcher import build_jax_mps_process_envs
+from openpi.serving.va_split_jax.multigpu_config import JaxMultiGpuVASplitConfig
 from openpi.serving.va_split_jax.runtime import JaxLocalVASplitRuntime
+from openpi.serving.va_split_jax.runtime import JaxMultiGpuProcessVASplitRuntime
 from openpi.serving.va_split_jax.runtime import JaxProcessVASplitRuntime
 from openpi.serving.va_split_jax.types import JaxActionResult
 from openpi.serving.va_split_jax.types import JaxShutdown
@@ -165,3 +168,66 @@ def test_jax_process_runtime_infer_after_shutdown_raises():
     runtime._closed = True
     with pytest.raises(RuntimeError, match="shut down"):
         runtime.infer(_observation(), {})
+
+
+class _FakeContext:
+    def __init__(self):
+        self.processes = []
+
+    def Queue(self):  # noqa: N802
+        return _FakeQueue()
+
+    def Process(self, *, target, args, kwargs=None, daemon=None):  # noqa: N802
+        process = SimpleNamespace(
+            target=target,
+            args=args,
+            kwargs=kwargs or {},
+            daemon=daemon,
+            started=False,
+            start=lambda: None,
+            join=lambda timeout=None: None,
+            is_alive=lambda: False,
+            terminate=lambda: None,
+        )
+        self.processes.append(process)
+        return process
+
+
+class _FakeQueue:
+    def __init__(self):
+        self.messages = []
+
+    def put(self, message):
+        self.messages.append(message)
+
+    def get(self, timeout=None):
+        del timeout
+        raise EOFError
+
+
+def test_jax_multigpu_runtime_routes_role_specific_model_factories(monkeypatch):
+    fake_context = _FakeContext()
+    vlm_factory = object()
+    ae_factory = object()
+
+    monkeypatch.setattr(runtime_module.mp, "get_context", lambda _start_method: fake_context)
+    monkeypatch.setattr(
+        runtime_module,
+        "_collect_compile_warmup",
+        lambda *args, **kwargs: {"jax_warmup_batches": 0.0},
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "_collect_compile_warmup_count",
+        lambda *args, **kwargs: {"jax_warmup_batches": 0.0},
+    )
+
+    runtime = JaxMultiGpuProcessVASplitRuntime(
+        vlm_model_factory=vlm_factory,
+        ae_model_factory=ae_factory,
+        config=JaxMultiGpuVASplitConfig(vlm_devices=("0",), ae_device="1"),
+    )
+
+    assert fake_context.processes[0].args[0] is ae_factory
+    assert fake_context.processes[1].args[0] is vlm_factory
+    runtime.shutdown()

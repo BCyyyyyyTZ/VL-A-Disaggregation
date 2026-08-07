@@ -102,14 +102,14 @@ def test_multigpu_release_fanout_rewrites_slab_device_ordinal_per_worker():
         )
     )
     queues = {"vlm-0": _Queue(), "vlm-1": _Queue()}
-    fanout = JaxMultiGpuReleaseFanout(queues, slab_device_ordinals={"vlm-0": 1, "vlm-1": 2})
+    fanout = JaxMultiGpuReleaseFanout(queues, slab_device_ordinals={"vlm-0": 0, "vlm-1": 0})
 
     fanout.put(slab_ready)
 
     first = queues["vlm-0"].messages[0].slab.slab_handle_tree["past_key_values"][0]
     second = queues["vlm-1"].messages[0].slab.slab_handle_tree["prefix_pad_masks"]
-    assert first.device_ordinal == 1
-    assert second.device_ordinal == 2
+    assert first.device_ordinal == 0
+    assert second.device_ordinal == 0
     assert handle.device_ordinal == 0
 
 

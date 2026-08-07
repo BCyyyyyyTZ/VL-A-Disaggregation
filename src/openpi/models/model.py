@@ -289,6 +289,7 @@ def restore_params(
     restore_type: type[np.ndarray] | type[jax.Array] = jax.Array,
     dtype: jnp.dtype | None = None,
     sharding: jax.sharding.Sharding | None = None,
+    target: at.Params | None = None,
 ) -> at.Params:
     """Restores unstructured params PyTree from a checkpoint.
 
@@ -300,6 +301,7 @@ def restore_params(
         restore_type: The type to restore the params as. Can be set to `np.ndarray` to load the params as a numpy array.
         dtype: The dtype to restore all params as. If not provided, will use the original dtype from the checkpoint.
         sharding: The sharding to use for the params. If not provided, the params will be replicated across all devices.
+        target: Optional parameter PyTree limiting restore to matching checkpoint leaves.
 
     Returns:
         The restored params.
@@ -312,7 +314,10 @@ def restore_params(
 
     with ocp.PyTreeCheckpointer() as ckptr:
         metadata = ckptr.metadata(params_path)
-        item = {"params": metadata["params"]}
+        checkpoint_params = metadata["params"]
+        if target is not None:
+            checkpoint_params = _filter_checkpoint_params_item(checkpoint_params, target)
+        item = {"params": checkpoint_params}
 
         params = ckptr.restore(
             params_path,
@@ -321,6 +326,7 @@ def restore_params(
                 restore_args=jax.tree.map(
                     lambda _: ocp.ArrayRestoreArgs(sharding=sharding, restore_type=restore_type, dtype=dtype), item
                 ),
+                transforms={} if target is not None else None,
             ),
         )["params"]
 
@@ -330,3 +336,23 @@ def restore_params(
     if all(kp[-1] == "value" for kp in flat_params):
         flat_params = {kp[:-1]: v for kp, v in flat_params.items()}
     return traverse_util.unflatten_dict(flat_params)
+
+
+def _filter_checkpoint_params_item(checkpoint_params: at.Params, target: at.Params) -> at.Params:
+    flat_checkpoint = traverse_util.flatten_dict(checkpoint_params)
+    flat_target = traverse_util.flatten_dict(target)
+    checkpoint_keys = set(flat_checkpoint)
+    target_keys = set(flat_target)
+    value_suffixed_target_keys = {(*key, "value") for key in target_keys}
+
+    if value_suffixed_target_keys.issubset(checkpoint_keys):
+        restore_keys = value_suffixed_target_keys
+    elif target_keys.issubset(checkpoint_keys):
+        restore_keys = target_keys
+    else:
+        missing = sorted(target_keys - checkpoint_keys)
+        missing_value_suffixed = sorted(value_suffixed_target_keys - checkpoint_keys)
+        sample_missing = missing[:3] or missing_value_suffixed[:3]
+        raise ValueError(f"Checkpoint is missing target params; examples: {sample_missing}")
+
+    return traverse_util.unflatten_dict({key: flat_checkpoint[key] for key in restore_keys})
