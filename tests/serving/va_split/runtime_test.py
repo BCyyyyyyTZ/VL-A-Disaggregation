@@ -148,6 +148,77 @@ def test_process_runtime_collect_results_records_ae_result_transfer_latency():
     assert "_ae_result_enqueue_ns" not in timing
 
 
+def test_process_runtime_waits_for_both_workers_before_result_thread(monkeypatch):
+    events: list[str] = []
+    processes: dict[str, object] = {}
+
+    class FakeQueue:
+        def put(self, value):
+            events.append(f"queue-put:{type(value).__name__}")
+
+        def get(self):
+            raise AssertionError("ready queue should be intercepted by the test helper")
+
+    class FakeProcess:
+        def __init__(self, *, target, args, daemon):
+            del args
+            self.role = "vlm" if target is runtime_module._run_vlm_process else "ae"
+            self.daemon = daemon
+            self.started = False
+            processes[self.role] = self
+
+        def start(self):
+            self.started = True
+            events.append(f"start:{self.role}")
+
+        def join(self, timeout=None):
+            del timeout
+
+        def is_alive(self):
+            return self.started
+
+    class FakeContext:
+        def Queue(self):
+            return FakeQueue()
+
+        def Process(self, *, target, args, daemon):
+            return FakeProcess(target=target, args=args, daemon=daemon)
+
+    class FakeThread:
+        def __init__(self, *, target, daemon):
+            del target
+            self.daemon = daemon
+
+        def start(self):
+            events.append("thread:start")
+
+        def join(self, timeout=None):
+            del timeout
+
+    def collect_ready(_queue, *, expected_roles, timeout_s, vlm_process, ae_process):
+        del timeout_s
+        events.append("ready:" + ",".join(expected_roles))
+        assert expected_roles == ("vlm", "ae")
+        assert vlm_process is processes["vlm"]
+        assert ae_process is processes["ae"]
+        assert processes["vlm"].started
+        assert processes["ae"].started
+
+    monkeypatch.setattr(runtime_module.torch.multiprocessing, "get_context", lambda _start_method: FakeContext())
+    monkeypatch.setattr(runtime_module.threading, "Thread", FakeThread)
+    monkeypatch.setattr(runtime_module, "_collect_worker_ready", collect_ready, raising=False)
+
+    runtime = ProcessVASplitRuntime(
+        model_factory=object(),
+        device="cpu",
+        start_method="spawn",
+    )
+
+    assert events.index("ready:vlm,ae") > max(events.index("start:vlm"), events.index("start:ae"))
+    assert events[-1] == "thread:start"
+    assert runtime._vlm_process is processes["vlm"]
+    assert runtime._ae_process is processes["ae"]
+
 def test_process_runtime_passes_role_specific_model_factories(monkeypatch):
     process_args = []
 
@@ -197,6 +268,7 @@ def test_process_runtime_passes_role_specific_model_factories(monkeypatch):
     ae_factory = object()
     monkeypatch.setattr(runtime_module.torch.multiprocessing, "get_context", lambda _start_method: FakeContext())
     monkeypatch.setattr(runtime_module.threading, "Thread", FakeThread)
+    monkeypatch.setattr(runtime_module, "_collect_worker_ready", lambda *args, **kwargs: None, raising=False)
 
     runtime = ProcessVASplitRuntime(
         model_factory=base_factory,

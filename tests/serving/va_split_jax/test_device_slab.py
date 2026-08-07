@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import multiprocessing as mp
-import queue
 import threading
 import time
 from unittest import mock
@@ -13,9 +12,24 @@ import pytest
 from openpi.models.jax_split_types import JaxPrefixFeature
 from openpi.serving.va_split_jax.device_slab import CudaIpcDeviceSlabBackend
 from openpi.serving.va_split_jax.device_slab import DeviceSlabSpec
+from openpi.serving.va_split_jax.device_slab import LocalDeviceSlabBackend
 from openpi.serving.va_split_jax.device_slab import has_cuda_device
 from openpi.serving.va_split_jax.device_slab import make_default_device_slab_backend
 from openpi.serving.va_split_jax.prefix_cache_pool import write_feature_to_slab_tree
+
+
+def test_local_device_slab_backend_does_not_require_numba_cuda(monkeypatch):
+    def fail_cuda_mapping(array):
+        del array
+        raise AssertionError("LocalDeviceSlabBackend should not map a JAX array to a CUDA ordinal")
+
+    monkeypatch.setattr("openpi.serving.va_split_jax.device_slab._array_device_ordinal", fail_cuda_mapping)
+
+    backend = LocalDeviceSlabBackend()
+    slab = backend.create_slab(DeviceSlabSpec(name="cpu", shape=(1, 2), dtype="float32", max_lanes=2))
+
+    assert slab.handle.transport == backend.transport
+    assert slab.handle.device_ordinal == 0
 
 
 def test_device_slab_put_lane_and_view_batch():

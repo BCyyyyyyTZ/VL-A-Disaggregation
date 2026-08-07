@@ -218,7 +218,6 @@ class JaxAEWorker:
         if self._compile_config is None or self._noise_factory is None:
             return
         cap = min(
-            self._max_batch_size,
             self._max_prefix_slots,
             self._compile_config.warmup_max_batch_size,
         )

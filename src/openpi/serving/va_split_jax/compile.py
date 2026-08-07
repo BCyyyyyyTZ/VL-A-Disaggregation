@@ -11,7 +11,6 @@ import jax.numpy as jnp
 from openpi.models.jax_split_types import JaxDenoiseState
 from openpi.models.jax_split_types import JaxPrefixFeature
 from openpi.serving.va_split_jax.device_slab import DeviceSlabBackend
-from openpi.serving.va_split_jax.device_slab import make_default_device_slab_backend
 from openpi.serving.va_split_jax.prefix_cache_pool import JaxVlmPrefixCacheLanePool
 from openpi.shared import nnx_utils
 
@@ -316,8 +315,10 @@ def warmup_ae_denoise_model(
     del backend  # retained for call-site compatibility
     if not config.warmup_enabled:
         return {"jax_warmup_batches": 0.0}
+    if max_ae_batch_size <= 0 or max_prefix_slots <= 0:
+        raise ValueError("max_ae_batch_size and max_prefix_slots must be positive")
     batches = planned_warmup_batches(
-        max_batch_size=min(max_ae_batch_size, max_prefix_slots),
+        max_batch_size=max_prefix_slots,
         warmup_max_batch_size=config.warmup_max_batch_size,
     )
     if not config.enabled:
@@ -358,8 +359,10 @@ def warmup_ae_denoise_on_mapped_slabs(
     """
     if not config.warmup_enabled:
         return {"jax_warmup_batches": 0.0}
+    if max_ae_batch_size <= 0 or max_prefix_slots <= 0:
+        raise ValueError("max_ae_batch_size and max_prefix_slots must be positive")
     batches = planned_warmup_batches(
-        max_batch_size=min(max_ae_batch_size, max_prefix_slots),
+        max_batch_size=max_prefix_slots,
         warmup_max_batch_size=config.warmup_max_batch_size,
     )
     if not config.enabled:

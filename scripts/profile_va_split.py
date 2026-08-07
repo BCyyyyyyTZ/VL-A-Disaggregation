@@ -947,6 +947,30 @@ def profile_warmup_max_batch_size(args: Args) -> int:
     return max(1, int(args.max_vlm_batch_size) * 3)
 
 
+def split_prefix_slot_capacity(args: Args) -> int:
+    """Return the VA-split prefix-slot capacity used by synthetic warmup."""
+    return max(1, int(args.max_vlm_batch_size) * 3)
+
+
+def split_e2e_prefix_batch_sizes(args: Args) -> tuple[int, ...]:
+    """Return the VLM prefix batch shapes that synthetic e2e warmup should cover."""
+    if args.mode in ("monolithic", "jax-monolithic"):
+        cap = max(1, int(args.batch_size))
+        return tuple(range(1, cap + 1))
+    cap = max(1, int(args.max_vlm_batch_size))
+    return tuple(range(1, cap + 1))
+
+
+def split_e2e_concurrent_burst_inflight(args: Args) -> int:
+    """Return the synthetic concurrent inflight used to shake out split scheduling paths."""
+    burst = max(0, int(args.warmup_concurrent_inflight))
+    if burst <= 0:
+        return 0
+    if args.mode in ("split-mps", "split-no-mps", "jax-split-ipc"):
+        burst = max(burst, split_prefix_slot_capacity(args))
+    return min(burst, max(0, int(args.max_inflight)))
+
+
 def _median_ms(values: Sequence[float]) -> float:
     if not values:
         return 0.0
@@ -1015,20 +1039,12 @@ def warmup_jax_e2e_pipeline_until_steady(
         ms = _one_e2e()
         print(f"[profile]   e2e warmup #{e2e_count}: {ms:.1f}ms", flush=True)
 
-    if args.mode in ("jax-split-ipc", "jax-monolithic") and callable(getattr(policy, "infer_batch", None)):
-        batch_sizes: list[int] = []
-        if args.mode == "jax-monolithic":
-            # Baseline FCFS can emit any size in [1, batch_size]; warm all of them so timed
-            # measurement does not pay first-hit XLA compile behind the single-worker queue.
-            cap = max(1, int(args.batch_size))
-            batch_sizes = list(range(1, cap + 1))
-        else:
-            cap = max(1, min(int(args.max_vlm_batch_size), 8))
-            for batch_size in (1, 2, 4, 8):
-                if batch_size <= cap and batch_size not in batch_sizes:
-                    batch_sizes.append(batch_size)
-            if cap not in batch_sizes:
-                batch_sizes.append(cap)
+    supports_concurrent_infer = bool(getattr(policy, "supports_concurrent_infer", False))
+    should_warm_batch_shapes = args.mode == "jax-monolithic" or (
+        args.mode in ("split-mps", "split-no-mps", "jax-split-ipc") and supports_concurrent_infer
+    )
+    if should_warm_batch_shapes and callable(getattr(policy, "infer_batch", None)):
+        batch_sizes = list(split_e2e_prefix_batch_sizes(args))
         print(f"[profile]   batch-shape e2e warmup: B={batch_sizes}", flush=True)
         for batch_size in batch_sizes:
             batch_request = make_fixed_size_batch_request(requests, batch_size=batch_size)
@@ -1038,8 +1054,8 @@ def warmup_jax_e2e_pipeline_until_steady(
             e2e_count += 1
             print(f"[profile]   e2e batch warmup B={batch_size}: {ms:.1f}ms", flush=True)
 
-    burst = max(0, min(int(args.warmup_concurrent_inflight), int(args.max_inflight)))
-    if burst > 1 and bool(getattr(policy, "supports_concurrent_infer", False)):
+    burst = split_e2e_concurrent_burst_inflight(args)
+    if burst > 1 and supports_concurrent_infer:
         print(f"[profile]   concurrent burst warmup: inflight={burst}", flush=True)
         t0 = time.perf_counter()
         futures = [executor.submit(_call_policy_infer, policy, request) for _ in range(burst)]

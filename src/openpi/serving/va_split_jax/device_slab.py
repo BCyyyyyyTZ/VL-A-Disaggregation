@@ -12,6 +12,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from numba import cuda
+from numba.cuda.cudadrv import devicearray
+from numba.cuda.cudadrv import devices
 from numba.cuda.cudadrv import driver
 from numba.cuda.cudadrv import drvapi
 
@@ -204,10 +206,10 @@ class CudaIpcDeviceSlabBackend(DeviceSlabBackend):
             raise RuntimeError(f"expected {self.transport!r} slab, got {slab.handle.transport!r}")
         value.block_until_ready()
         device_ordinal = int(slab.handle.device_ordinal)
-        _select_numba_device(device_ordinal)
+        context = _select_numba_device(device_ordinal)
         stream = self._write_stream(device_ordinal)
-        dst = cuda.from_cuda_array_interface(_cuda_array_interface_for_array(slab.array), owner=slab)
-        src = cuda.from_cuda_array_interface(_cuda_array_interface_for_array(value), owner=value)
+        dst = _numba_device_array_from_jax_array(slab.array, context=context, owner=slab)
+        src = _numba_device_array_from_jax_array(value, context=context, owner=value)
         _copy_lane_with_kernel(dst, src, lane_id, slab.spec, stream=stream)
         if sync:
             stream.synchronize()
@@ -227,10 +229,10 @@ class CudaIpcDeviceSlabBackend(DeviceSlabBackend):
             raise RuntimeError(f"expected {self.transport!r} slab, got {slab.handle.transport!r}")
         value.block_until_ready()
         device_ordinal = int(slab.handle.device_ordinal)
-        _select_numba_device(device_ordinal)
+        context = _select_numba_device(device_ordinal)
         stream = self._write_stream(device_ordinal)
-        dst = cuda.from_cuda_array_interface(_cuda_array_interface_for_array(slab.array), owner=slab)
-        src = cuda.from_cuda_array_interface(_cuda_array_interface_for_array(value), owner=value)
+        dst = _numba_device_array_from_jax_array(slab.array, context=context, owner=slab)
+        src = _numba_device_array_from_jax_array(value, context=context, owner=value)
         _copy_batch_with_kernel(dst, src, lane_start, slab.spec, stream=stream)
         if sync:
             stream.synchronize()
@@ -251,8 +253,8 @@ class CudaIpcDeviceSlabBackend(DeviceSlabBackend):
         key = int(device_ordinal)
         stream = self._write_streams.get(key)
         if stream is None:
-            _select_numba_device(key)
-            stream = cuda.stream()
+            context = _select_numba_device(key)
+            stream = context.create_stream()
             self._write_streams[key] = stream
         return stream
 
@@ -266,7 +268,8 @@ class LocalDeviceSlabBackend(DeviceSlabBackend):
         handle = DeviceSlabHandle(
             spec=spec,
             transport=self.transport,
-            device_ordinal=_array_device_ordinal(array),
+            # Local slabs never cross a CUDA-IPC boundary, so no Numba CUDA ordinal is needed.
+            device_ordinal=0,
             handle_bytes=b"",
             strides=_c_contiguous_strides(spec.slab_shape, np.dtype(spec.dtype)),
         )
@@ -354,7 +357,11 @@ def _array_device_ordinal(array: jax.Array) -> int:
 
 def _select_numba_device(device_ordinal: int):
     """Select a Numba CUDA context using process-visible device ordinal."""
-    return cuda.current_context(int(device_ordinal))
+    context = cuda.current_context(int(device_ordinal))
+    # Numba require_context APIs may otherwise re-read a foreign active context
+    # installed by XLA/JAX and get an invalid device ordinal in this environment.
+    devices._runtime._set_attached_context(context)
+    return context
 
 
 def _numba_device_ordinal_for_jax_device(device: jax.Device) -> int:
@@ -438,6 +445,20 @@ def _cuda_array_interface_for_array(array: jax.Array) -> dict[str, Any]:
         "data": (array.unsafe_buffer_pointer(), False),
         "version": 3,
     }
+
+
+def _numba_device_array_from_jax_array(array: jax.Array, *, context: Any, owner: Any) -> devicearray.DeviceNDArray:
+    desc = _cuda_array_interface_for_array(array)
+    dtype = np.dtype(desc["typestr"])
+    shape = tuple(desc["shape"])
+    strides = desc.get("strides") or _c_contiguous_strides(shape, dtype)
+    memory = driver.MemoryPointer(
+        context,
+        drvapi.cu_device_ptr(int(desc["data"][0])),
+        driver.memory_size_from_info(shape, strides, dtype.itemsize),
+        owner=owner,
+    )
+    return devicearray.DeviceNDArray(shape=shape, strides=strides, dtype=dtype, gpu_data=memory)
 
 
 def _cuda_array_interface_for_lane(array: jax.Array, spec: DeviceSlabSpec, lane_id: int) -> dict[str, Any]:

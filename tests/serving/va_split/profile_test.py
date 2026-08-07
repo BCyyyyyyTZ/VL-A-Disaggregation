@@ -517,6 +517,19 @@ def test_pytorch_compile_warmup_batch_plan_enumerates_all_shapes():
     ) == 8
 
 
+def test_split_profile_warmup_helpers_cover_vlm_prefix_and_prefix_capacity():
+    args = profile_va_split.Args(
+        mode="split-mps",
+        max_vlm_batch_size=8,
+        max_inflight=64,
+        warmup_concurrent_inflight=4,
+    )
+
+    assert profile_va_split.split_prefix_slot_capacity(args) == 24
+    assert profile_va_split.split_e2e_prefix_batch_sizes(args) == tuple(range(1, 9))
+    assert profile_va_split.split_e2e_concurrent_burst_inflight(args) == 24
+
+
 def test_make_fixed_size_batch_request_tiles_when_needed():
     requests = _fake_requests(3)
     batch = profile_va_split.make_fixed_size_batch_request(requests, batch_size=8)
@@ -576,11 +589,11 @@ def test_run_profile_compile_warmup_uses_batch_shapes_for_ours(monkeypatch):
         )
     )
 
-    expected_warmup = list(range(1, 25))
+    expected_warmup = [*range(1, 25), *range(1, 9)]
     assert policy.observed_batch_sizes[: len(expected_warmup)] == expected_warmup
     assert policy.infer_batch_calls == len(expected_warmup)
     assert policy.infer_calls == 10
-    assert result.summary["e2e_warmup_requests"] == 2.0
+    assert result.summary["e2e_warmup_requests"] == 10.0
     assert [trace.request_id for trace in result.traces] == [f"req-{idx:06d}" for idx in range(8)]
 
 
@@ -609,9 +622,9 @@ def test_run_profile_rate_sweep_warms_once_and_reuses_policy(monkeypatch):
 
     assert create_calls == ["split-mps"]
     assert [run.summary["target_request_rate_hz"] for run in result.results] == [8.0, 16.0, 32.0]
-    assert policy.observed_batch_sizes == list(range(1, 25))
+    assert policy.observed_batch_sizes == [*range(1, 25), *range(1, 9)]
     assert policy.infer_calls == 14
-    assert [run.summary["e2e_warmup_requests"] for run in result.results] == [2.0, 2.0, 2.0]
+    assert [run.summary["e2e_warmup_requests"] for run in result.results] == [10.0, 10.0, 10.0]
 
 
 def test_run_profile_uses_baseline_fcfs_batching_only_for_monolithic(monkeypatch):

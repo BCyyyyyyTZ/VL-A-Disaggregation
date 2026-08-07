@@ -213,7 +213,7 @@ def test_warmup_ae_denoise_model_uses_vector_step_dt_and_direct_prefix():
         model=model,
         observation_factory=Observation,
         noise_factory=lambda batch: jnp.zeros((batch, 2, 1), dtype=jnp.float32),
-        max_ae_batch_size=8,
+        max_ae_batch_size=2,
         max_prefix_slots=4,
         config=JaxCompileConfig(enabled=True, warmup_enabled=True, warmup_max_batch_size=8, num_steps=2),
     )
@@ -245,7 +245,7 @@ def test_warmup_ae_denoise_on_mapped_slabs_uses_make_prefix_batch():
     stats = warmup_ae_denoise_on_mapped_slabs(
         model=model,
         noise_factory=lambda batch: jnp.zeros((batch, 2, 1), dtype=jnp.float32),
-        max_ae_batch_size=8,
+        max_ae_batch_size=2,
         max_prefix_slots=4,
         config=JaxCompileConfig(enabled=True, warmup_enabled=True, warmup_max_batch_size=8, num_steps=2),
         make_prefix_batch=make_prefix_batch,

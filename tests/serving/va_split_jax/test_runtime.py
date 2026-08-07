@@ -13,6 +13,7 @@ import pytest
 
 from openpi.models.jax_split_types import JaxDenoiseState
 from openpi.models.jax_split_types import JaxPrefixFeature
+from openpi.serving.va_split_jax import runtime as runtime_module
 from openpi.serving.va_split_jax.launcher import build_jax_mps_process_envs
 from openpi.serving.va_split_jax.runtime import JaxLocalVASplitRuntime
 from openpi.serving.va_split_jax.runtime import JaxProcessVASplitRuntime
@@ -165,3 +166,83 @@ def test_jax_process_runtime_infer_after_shutdown_raises():
     runtime._closed = True
     with pytest.raises(RuntimeError, match="shut down"):
         runtime.infer(_observation(), {})
+
+
+def test_jax_process_runtime_starts_both_workers_before_compile_warmup(monkeypatch):
+    events: list[str] = []
+    processes: dict[str, object] = {}
+
+    class FakeQueue:
+        def put(self, value):
+            events.append(f"queue-put:{type(value).__name__}")
+
+    class FakeProcess:
+        def __init__(self, *, target, args, daemon):
+            del args
+            self.role = "ae" if target is runtime_module._run_jax_ae_process else "vlm"
+            self.daemon = daemon
+            self.started = False
+            processes[self.role] = self
+
+        def start(self):
+            self.started = True
+            events.append(f"start:{self.role}")
+
+        def join(self, timeout=None):
+            del timeout
+
+        def is_alive(self):
+            return self.started
+
+    class FakeContext:
+        def Queue(self):
+            return FakeQueue()
+
+        def Process(self, *, target, args, daemon):
+            return FakeProcess(target=target, args=args, daemon=daemon)
+
+    class FakeThread:
+        def __init__(self, *, target, daemon):
+            del target
+            self.daemon = daemon
+
+        def start(self):
+            events.append("thread:start")
+
+        def join(self, timeout=None):
+            del timeout
+
+    def collect_startup(_queue, *, expected_roles, timeout_s, vlm_process, ae_process):
+        del timeout_s
+        events.append("startup:" + ",".join(expected_roles))
+        assert vlm_process is processes["vlm"]
+        assert ae_process is processes["ae"]
+        assert processes["vlm"].started
+        assert processes["ae"].started
+
+    def collect_warmup(_queue, *, expected_roles, timeout_s, vlm_process, ae_process):
+        del timeout_s
+        events.append("warmup:" + ",".join(expected_roles))
+        assert "startup:ae,vlm" in events
+        assert expected_roles in (("ae",), ("vlm",))
+        assert vlm_process is processes["vlm"]
+        assert ae_process is processes["ae"]
+        assert processes["vlm"].started
+        assert processes["ae"].started
+        return {"jax_warmup_batches": float(len(expected_roles))}
+
+    monkeypatch.setattr(runtime_module.mp, "get_context", lambda _start_method: FakeContext())
+    monkeypatch.setattr(runtime_module.threading, "Thread", FakeThread)
+    monkeypatch.setattr(runtime_module, "_collect_worker_ready", collect_startup, raising=False)
+    monkeypatch.setattr(runtime_module, "_collect_compile_warmup", collect_warmup)
+
+    runtime = JaxProcessVASplitRuntime(
+        model_factory=lambda: object(),
+        start_method="spawn",
+        result_timeout_s=1.0,
+        warmup_timeout_s=1.0,
+    )
+
+    assert runtime.compile_timing == {"jax_warmup_batches": 2.0}
+    assert events.index("startup:ae,vlm") < events.index("warmup:ae")
+    assert events.index("startup:ae,vlm") < events.index("warmup:vlm")

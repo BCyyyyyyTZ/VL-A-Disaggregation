@@ -4,6 +4,7 @@ from collections.abc import Callable
 import contextlib
 from dataclasses import replace
 import os
+import queue
 import threading
 import time
 import uuid
@@ -12,13 +13,13 @@ import torch
 
 from openpi.serving.va_split.ae_process import AEProcess
 from openpi.serving.va_split.ae_process import AEWorker
+from openpi.serving.va_split.timing import queue_wait_and_transfer_ms
+from openpi.serving.va_split.timing import timed_queue_get
 from openpi.serving.va_split.types import ActionResult
 from openpi.serving.va_split.types import BatchRequestEnvelope
 from openpi.serving.va_split.types import RequestEnvelope
 from openpi.serving.va_split.types import Shutdown
 from openpi.serving.va_split.types import WorkerError
-from openpi.serving.va_split.timing import queue_wait_and_transfer_ms
-from openpi.serving.va_split.timing import timed_queue_get
 from openpi.serving.va_split.vlm_process import VLMProcess
 from openpi.serving.va_split.vlm_process import VLMWorker
 
@@ -123,10 +124,11 @@ def _run_vlm_process(
     max_live_features,
     env_updates=None,
     enable_component_timing=True,
+    ready_queue=None,
 ) -> None:
     _apply_env_updates(env_updates)
     model = _prepare_model(model_factory, device)
-    VLMProcess(
+    process = VLMProcess(
         model=model,
         device=device,
         request_queue=request_queue,
@@ -136,7 +138,10 @@ def _run_vlm_process(
         max_wait_ms=max_vlm_wait_ms,
         max_live_features=max_live_features,
         enable_component_timing=enable_component_timing,
-    ).run()
+    )
+    if ready_queue is not None:
+        ready_queue.put("vlm")
+    process.run()
 
 
 def _run_ae_process(
@@ -149,10 +154,11 @@ def _run_ae_process(
     max_prefix_slots,
     env_updates=None,
     enable_component_timing=True,
+    ready_queue=None,
 ) -> None:
     _apply_env_updates(env_updates)
     model = _prepare_model(model_factory, device)
-    AEProcess(
+    process = AEProcess(
         model=model,
         device=device,
         prefix_queue=prefix_queue,
@@ -161,7 +167,10 @@ def _run_ae_process(
         max_batch_size=max_ae_batch_size,
         max_prefix_slots=max_prefix_slots,
         enable_component_timing=enable_component_timing,
-    ).run()
+    )
+    if ready_queue is not None:
+        ready_queue.put("ae")
+    process.run()
 
 
 class ProcessVASplitRuntime:
@@ -206,6 +215,7 @@ class ProcessVASplitRuntime:
         self._prefix_queue = ctx.Queue()
         self._result_queue = ctx.Queue()
         self._release_queue = ctx.Queue()
+        self._ready_queue = ctx.Queue()
         self._vlm_process = ctx.Process(
             target=_run_vlm_process,
             args=(
@@ -219,6 +229,7 @@ class ProcessVASplitRuntime:
                 max_prefix_slots,
                 vlm_env_updates,
                 enable_component_timing,
+                self._ready_queue,
             ),
             daemon=True,
         )
@@ -234,11 +245,19 @@ class ProcessVASplitRuntime:
                 max_prefix_slots,
                 ae_env_updates,
                 enable_component_timing,
+                self._ready_queue,
             ),
             daemon=True,
         )
         self._vlm_process.start()
         self._ae_process.start()
+        _collect_worker_ready(
+            self._ready_queue,
+            expected_roles=("vlm", "ae"),
+            timeout_s=result_timeout_s,
+            vlm_process=self._vlm_process,
+            ae_process=self._ae_process,
+        )
         self._result_thread = threading.Thread(target=self._collect_results, daemon=True)
         self._result_thread.start()
 
@@ -326,6 +345,34 @@ class ProcessVASplitRuntime:
 
     def reset(self) -> None:
         pass
+
+
+def _collect_worker_ready(
+    ready_queue,
+    *,
+    expected_roles: tuple[str, ...],
+    timeout_s: float,
+    vlm_process,
+    ae_process,
+) -> None:
+    deadline = time.monotonic() + max(timeout_s, 1.0)
+    seen: set[str] = set()
+    while len(seen) < len(expected_roles):
+        if vlm_process is not None and not vlm_process.is_alive() and "vlm" not in seen:
+            raise RuntimeError("VLM process exited before reporting ready")
+        if ae_process is not None and not ae_process.is_alive() and "ae" not in seen:
+            raise RuntimeError("AE process exited before reporting ready")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            missing = sorted(set(expected_roles) - seen)
+            raise TimeoutError(f"Timed out waiting for worker ready from: {missing}")
+        try:
+            role = ready_queue.get(timeout=min(remaining, 1.0))
+        except queue.Empty:
+            continue
+        if role not in expected_roles:
+            raise RuntimeError(f"Unexpected worker ready message: {role!r}")
+        seen.add(role)
 
 
 def _worker_error_to_runtime_error(error: WorkerError) -> RuntimeError:

@@ -13,7 +13,6 @@ import uuid
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 
 from openpi.serving.va_split_jax.ae_process import JaxAEProcess
 from openpi.serving.va_split_jax.ae_process import JaxAEWorker
@@ -176,6 +175,8 @@ def _run_jax_vlm_process(
     compile_config=None,
     env_updates=None,
     warmup_queue=None,
+    ready_queue=None,
+    warmup_start_queue=None,
 ) -> None:
     _apply_env_updates(env_updates)
     model = model_factory()
@@ -184,14 +185,6 @@ def _run_jax_vlm_process(
     vlm_warmup_batches = 0.0
     if compile_config is not None:
         model = maybe_jit_vlm_model(model, compile_config)
-        if warmup_queue is not None:
-            stats = warmup_vlm_prefix_model(
-                model=model,
-                observation_factory=observation_factory,
-                max_vlm_batch_size=max_vlm_batch_size,
-                config=compile_config,
-            )
-            vlm_warmup_batches = float(stats["jax_warmup_batches"])
     backend = make_default_device_slab_backend()
     process = JaxVLMProcess(
         model=model,
@@ -203,6 +196,18 @@ def _run_jax_vlm_process(
         max_live_features=max_prefix_slots,
         backend=backend,
     )
+    if ready_queue is not None:
+        ready_queue.put("vlm")
+    if warmup_start_queue is not None:
+        warmup_start_queue.get()
+    if compile_config is not None and warmup_queue is not None:
+        stats = warmup_vlm_prefix_model(
+            model=model,
+            observation_factory=observation_factory,
+            max_vlm_batch_size=max_vlm_batch_size,
+            config=compile_config,
+        )
+        vlm_warmup_batches = float(stats["jax_warmup_batches"])
     # AE-first handshake: wait for slab export + credits on release_queue.
     process.wait_for_ae_export()
     if compile_config is not None and warmup_queue is not None and process.worker._writable_slab_tree is not None:
@@ -231,6 +236,8 @@ def _run_jax_ae_process(
     compile_config=None,
     env_updates=None,
     warmup_queue=None,
+    ready_queue=None,
+    warmup_start_queue=None,
 ) -> None:
     _apply_env_updates(env_updates)
     model = model_factory()
@@ -250,6 +257,10 @@ def _run_jax_ae_process(
         compile_config=compile_config,
         noise_factory=noise_factory,
     )
+    if ready_queue is not None:
+        ready_queue.put("ae")
+    if warmup_start_queue is not None:
+        warmup_start_queue.get()
     ipc_batches = process.bootstrap_owned_pool(template)
     if warmup_queue is not None:
         warmup_queue.put(JaxCompileWarmupDone(role="ae", jax_warmup_batches=float(ipc_batches)))
@@ -288,7 +299,9 @@ class JaxProcessVASplitRuntime:
         self._result_queue = ctx.Queue()
         self._release_queue = ctx.Queue()
         self._warmup_queue = ctx.Queue()
-        # Start AE first so slab export is available when VLM waits.
+        self._ready_queue = ctx.Queue()
+        self._ae_warmup_start_queue = ctx.Queue()
+        self._vlm_warmup_start_queue = ctx.Queue()
         self._ae_process = ctx.Process(
             target=_run_jax_ae_process,
             args=(
@@ -301,6 +314,8 @@ class JaxProcessVASplitRuntime:
                 compile_config,
                 ae_env_updates,
                 self._warmup_queue,
+                self._ready_queue,
+                self._ae_warmup_start_queue,
             ),
             daemon=True,
         )
@@ -317,18 +332,29 @@ class JaxProcessVASplitRuntime:
                 compile_config,
                 vlm_env_updates,
                 self._warmup_queue,
+                self._ready_queue,
+                self._vlm_warmup_start_queue,
             ),
             daemon=True,
         )
         self._ae_process.start()
+        self._vlm_process.start()
+        _collect_worker_ready(
+            self._ready_queue,
+            expected_roles=("ae", "vlm"),
+            timeout_s=warmup_timeout_s if warmup_timeout_s is not None else result_timeout_s,
+            vlm_process=self._vlm_process,
+            ae_process=self._ae_process,
+        )
+        self._ae_warmup_start_queue.put("go")
         ae_compile_timing = _collect_compile_warmup(
             self._warmup_queue,
             expected_roles=("ae",),
             timeout_s=warmup_timeout_s if warmup_timeout_s is not None else result_timeout_s,
-            vlm_process=None,
+            vlm_process=self._vlm_process,
             ae_process=self._ae_process,
         )
-        self._vlm_process.start()
+        self._vlm_warmup_start_queue.put("go")
         vlm_compile_timing = _collect_compile_warmup(
             self._warmup_queue,
             expected_roles=("vlm",),
@@ -432,6 +458,34 @@ class JaxProcessVASplitRuntime:
     @property
     def compile_timing(self) -> dict[str, float]:
         return dict(self._compile_timing)
+
+
+def _collect_worker_ready(
+    ready_queue,
+    *,
+    expected_roles: tuple[str, ...],
+    timeout_s: float,
+    vlm_process,
+    ae_process,
+) -> None:
+    deadline = time.monotonic() + max(timeout_s, 1.0)
+    seen: set[str] = set()
+    while len(seen) < len(expected_roles):
+        if vlm_process is not None and not vlm_process.is_alive() and "vlm" not in seen:
+            raise RuntimeError("VLM process exited before reporting ready")
+        if ae_process is not None and not ae_process.is_alive() and "ae" not in seen:
+            raise RuntimeError("AE process exited before reporting ready")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            missing = sorted(set(expected_roles) - seen)
+            raise TimeoutError(f"Timed out waiting for JAX worker ready from: {missing}")
+        try:
+            role = ready_queue.get(timeout=min(remaining, 1.0))
+        except queue.Empty:
+            continue
+        if role not in expected_roles:
+            raise RuntimeError(f"Unexpected JAX worker ready message: {role!r}")
+        seen.add(role)
 
 
 def _worker_error_to_runtime_error(error: JaxWorkerError) -> RuntimeError:
