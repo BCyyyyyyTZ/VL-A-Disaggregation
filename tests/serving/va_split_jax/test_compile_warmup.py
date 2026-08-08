@@ -37,7 +37,7 @@ def test_compile_config_defaults_to_enabled():
     config = JaxCompileConfig()
     assert config.enabled is True
     assert config.warmup_enabled is True
-    assert config.warmup_max_batch_size == 24
+    assert config.warmup_max_batch_size == 20
     assert config.num_steps == 10
 
 

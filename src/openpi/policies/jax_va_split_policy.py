@@ -16,6 +16,7 @@ from openpi import transforms as _transforms
 from openpi.models import model as _model
 from openpi.policies import batch_inference as _batch
 from openpi.policies import policy as _policy
+from openpi.serving.va_split_jax.compile import DEFAULT_WARMUP_MAX_BATCH_SIZE
 from openpi.serving.va_split_jax.compile import JaxCompileConfig
 from openpi.serving.va_split_jax.runtime import JaxProcessVASplitRuntime
 from openpi.serving.va_split_jax.types import JaxActionResult
@@ -260,7 +261,7 @@ def create_trained_jax_va_split_policy(
     warmup_max_batch_size = (
         jax_compile_warmup_max_batch_size
         if jax_compile_warmup_max_batch_size is not None
-        else max_vlm_batch_size * 3
+        else min(max_vlm_batch_size * 3, DEFAULT_WARMUP_MAX_BATCH_SIZE)
     )
     runtime = JaxProcessVASplitRuntime(
         model_factory=functools.partial(_load_jax_model, train_config, checkpoint_dir),

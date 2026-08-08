@@ -16,6 +16,8 @@ from typing import Any, Literal
 import numpy as np
 import tyro
 
+from openpi.serving.va_split_jax.compile import DEFAULT_WARMUP_MAX_BATCH_SIZE
+
 Mode = Literal["monolithic", "split-no-mps", "split-mps", "jax-monolithic", "jax-split-ipc"]
 CompileMode = Literal["default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"]
 TraceStatus = Literal["ok", "error", "timeout"]
@@ -107,7 +109,7 @@ class Args:
     warmup_concurrent_inflight: int = 4
     jax_compile: bool = True
     jax_compile_warmup: bool = True
-    # None => VA-split resolves to max_vlm_batch_size * 3 (prefix capacity).
+    # None => VA-split resolves to min(max_vlm_batch_size * 3, 20).
     jax_compile_warmup_max_batch_size: int | None = None
     slo_ms: float = 200.0
     pytorch_device: str | None = None
@@ -940,11 +942,11 @@ def warmup_pytorch_compile_shapes(
 
 
 def profile_warmup_max_batch_size(args: Args) -> int:
-    """Return the largest batch size covered by PyTorch compile warmup."""
+    """Return the largest batch size covered by compile warmup."""
     if args.mode in ("monolithic", "jax-monolithic"):
         return min(COMPILE_WARMUP_MAX_BATCH_SIZE, max(1, int(args.batch_size)))
-    # Keep in sync with openpi.serving.va_split.runtime.ProcessVASplitRuntime default slots.
-    return max(1, int(args.max_vlm_batch_size) * 3)
+    # Cap split warmup at 20 while still clamping to the runtime prefix capacity.
+    return min(DEFAULT_WARMUP_MAX_BATCH_SIZE, max(1, int(args.max_vlm_batch_size) * 3))
 
 
 def split_prefix_slot_capacity(args: Args) -> int:
@@ -1197,6 +1199,11 @@ def create_policy_for_mode(args: Args, mode: Mode):
             enable_component_timing=args.enable_component_timing,
         )
     if mode == "jax-split-ipc":
+        jax_compile_warmup_max_batch_size = (
+            args.jax_compile_warmup_max_batch_size
+            if args.jax_compile_warmup_max_batch_size is not None
+            else profile_warmup_max_batch_size(args)
+        )
         return _jax_va_split_policy.create_trained_jax_va_split_policy(
             train_config,
             args.policy.dir,
@@ -1209,7 +1216,7 @@ def create_policy_for_mode(args: Args, mode: Mode):
             result_timeout_s=args.timeout_s,
             jax_compile=args.jax_compile,
             jax_compile_warmup=args.jax_compile_warmup,
-            jax_compile_warmup_max_batch_size=args.jax_compile_warmup_max_batch_size,
+            jax_compile_warmup_max_batch_size=jax_compile_warmup_max_batch_size,
         )
     ae_sm_percent = args.ae_sm_percent if mode == "split-mps" else 0
     vlm_sm_percent = args.vlm_sm_percent if mode == "split-mps" else 0

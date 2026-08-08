@@ -22,7 +22,7 @@ def test_run_profile_va_split_jax_defaults_and_invocation(tmp_path):
     assert 'LOG_ROOT="${LOG_ROOT:-${REPO_ROOT}/logs/tests}"' in script
     assert 'JAX_COMPILE="${JAX_COMPILE:-1}"' in script
     assert 'JAX_COMPILE_WARMUP="${JAX_COMPILE_WARMUP:-1}"' in script
-    assert 'JAX_COMPILE_WARMUP_MAX_BATCH_SIZE="${JAX_COMPILE_WARMUP_MAX_BATCH_SIZE:-$((MAX_VLM_BATCH_SIZE * 3))}"' in script
+    assert 'JAX_COMPILE_WARMUP_MAX_BATCH_SIZE="${JAX_COMPILE_WARMUP_MAX_BATCH_SIZE:-20}"' in script
     assert 'REQUEST_RATE_HZ_LIST="${REQUEST_RATE_HZ_LIST:-}"' in script
     assert "export XLA_PYTHON_CLIENT_PREALLOCATE=false" in script
 
@@ -96,7 +96,7 @@ fi
     assert _flag_value(args, "--policy.dir") == "/mnt/tianze/models/pi05_libero"
     assert _flag_value(args, "--ae-sm-percent") == "20"
     assert _flag_value(args, "--vlm-sm-percent") == "0"
-    assert _flag_value(args, "--jax-compile-warmup-max-batch-size") == "24"
+    assert _flag_value(args, "--jax-compile-warmup-max-batch-size") == "20"
     assert _flag_value(args, "--gpu-device-index") == "0"
     assert "--no-jax-compile" not in args
     assert "--no-jax-compile-warmup" not in args

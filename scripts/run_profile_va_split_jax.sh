@@ -32,8 +32,8 @@ WARMUP_STEADY_WINDOW="${WARMUP_STEADY_WINDOW:-4}"
 WARMUP_STEADY_MAX_REQUESTS="${WARMUP_STEADY_MAX_REQUESTS:-48}"
 JAX_COMPILE="${JAX_COMPILE:-1}"
 JAX_COMPILE_WARMUP="${JAX_COMPILE_WARMUP:-1}"
-# Default warmup ceiling follows VA-split prefix capacity: max_vlm_batch_size * 3.
-JAX_COMPILE_WARMUP_MAX_BATCH_SIZE="${JAX_COMPILE_WARMUP_MAX_BATCH_SIZE:-$((MAX_VLM_BATCH_SIZE * 3))}"
+# Default warmup ceiling is capped at 20 to reduce compile-time peak memory.
+JAX_COMPILE_WARMUP_MAX_BATCH_SIZE="${JAX_COMPILE_WARMUP_MAX_BATCH_SIZE:-20}"
 JSON_OUTPUT="${JSON_OUTPUT:-${RUN_LOG_DIR}/profile.json}"
 PYTHON_BIN="${PYTHON_BIN:-${REPO_ROOT}/.venv/bin/python}"
 

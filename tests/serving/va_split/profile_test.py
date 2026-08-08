@@ -508,10 +508,10 @@ def test_pytorch_compile_warmup_batch_plan_enumerates_all_shapes():
     assert profile_va_split.pytorch_compile_warmup_batch_plan(24) == tuple(
         (batch_size, 1) for batch_size in range(1, 25)
     )
-    # VA-split default: max_vlm_batch_size=8 -> prefix capacity 24.
+    # VA-split keeps runtime prefix capacity at 24 but caps compile warmup at 20 by default.
     assert profile_va_split.profile_warmup_max_batch_size(
         profile_va_split.Args(mode="split-mps", max_vlm_batch_size=8, max_ae_batch_size=999)
-    ) == 24
+    ) == 20
     assert profile_va_split.profile_warmup_max_batch_size(
         profile_va_split.Args(mode="monolithic", batch_size=8)
     ) == 8
@@ -589,7 +589,7 @@ def test_run_profile_compile_warmup_uses_batch_shapes_for_ours(monkeypatch):
         )
     )
 
-    expected_warmup = [*range(1, 25), *range(1, 9)]
+    expected_warmup = [*range(1, 21), *range(1, 9)]
     assert policy.observed_batch_sizes[: len(expected_warmup)] == expected_warmup
     assert policy.infer_batch_calls == len(expected_warmup)
     assert policy.infer_calls == 10
@@ -622,7 +622,7 @@ def test_run_profile_rate_sweep_warms_once_and_reuses_policy(monkeypatch):
 
     assert create_calls == ["split-mps"]
     assert [run.summary["target_request_rate_hz"] for run in result.results] == [8.0, 16.0, 32.0]
-    assert policy.observed_batch_sizes == [*range(1, 25), *range(1, 9)]
+    assert policy.observed_batch_sizes == [*range(1, 21), *range(1, 9)]
     assert policy.infer_calls == 14
     assert [run.summary["e2e_warmup_requests"] for run in result.results] == [10.0, 10.0, 10.0]
 
@@ -779,6 +779,42 @@ def test_create_policy_for_mode_uses_profile_timeout_for_split_runtime(monkeypat
     assert captured_kwargs["max_vlm_batch_size"] == 6
     assert captured_kwargs["max_vlm_wait_ms"] == 1.25
     assert captured_kwargs["enable_component_timing"] is True
+
+
+def test_create_policy_for_mode_forwards_split_compile_warmup_cap_to_jax(monkeypatch):
+    @dataclasses.dataclass(frozen=True)
+    class FakeModelConfig:
+        pytorch_compile_mode: str | None = "max-autotune"
+
+    @dataclasses.dataclass(frozen=True)
+    class FakeTrainConfig:
+        model: FakeModelConfig = dataclasses.field(default_factory=FakeModelConfig)
+
+    captured_kwargs = {}
+
+    def create_jax_split_policy(received_train_config, *args, **kwargs):
+        del received_train_config, args
+        captured_kwargs.update(kwargs)
+        return "jax-split-policy"
+
+    from openpi.policies import jax_va_split_policy
+
+    monkeypatch.setattr(training_config, "get_config", lambda config_name: FakeTrainConfig())
+    monkeypatch.setattr(jax_va_split_policy, "create_trained_jax_va_split_policy", create_jax_split_policy)
+
+    policy = profile_va_split.create_policy_for_mode(
+        profile_va_split.Args(
+            mode="jax-split-ipc",
+            policy=profile_va_split.Checkpoint(config="dummy", dir="/tmp/checkpoint"),
+            max_vlm_batch_size=8,
+            require_mps_env=False,
+        ),
+        "jax-split-ipc",
+    )
+
+    assert policy == "jax-split-policy"
+    assert captured_kwargs["jax_compile_warmup_max_batch_size"] == 20
+
 
 
 def test_create_policy_for_mode_forwards_component_timing_to_split_runtime(monkeypatch):

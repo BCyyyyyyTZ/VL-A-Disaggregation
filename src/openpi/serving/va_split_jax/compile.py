@@ -15,13 +15,16 @@ from openpi.serving.va_split_jax.prefix_cache_pool import JaxVlmPrefixCacheLaneP
 from openpi.shared import nnx_utils
 
 
+DEFAULT_WARMUP_MAX_BATCH_SIZE = 20
+
+
 @dataclass(frozen=True, slots=True)
 class JaxCompileConfig:
     enabled: bool = True
     warmup_enabled: bool = True
     # Cover every batch size in [1, warmup_max_batch_size] (clamped by runtime capacity).
-    # Callers typically set this to max_vlm_batch_size * 3 (prefix capacity).
-    warmup_max_batch_size: int = 24
+    # Split warmup defaults cap at 20 to keep peak memory lower than prefix capacity.
+    warmup_max_batch_size: int = DEFAULT_WARMUP_MAX_BATCH_SIZE
     num_steps: int = 10
 
 
