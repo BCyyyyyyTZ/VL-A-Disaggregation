@@ -274,6 +274,7 @@ printf '%s\n' "$@" >"${PYTHON_ARG_LOG}"
             "REQUEST_RATE_HZ_VALUES": "8,16",
             "JAX_COMPILE": "0",
             "JAX_COMPILE_WARMUP": "false",
+            "CROSS_CARD_TRANSFER_STRATEGY": "host-staged",
             "LOG_ROOT": str(tmp_path / "logs"),
             "RUN_TS": "split",
         }
@@ -294,6 +295,7 @@ printf '%s\n' "$@" >"${PYTHON_ARG_LOG}"
     assert _flag_value(args, "--mode") == "jax-multigpu-split-ipc"
     assert _flag_value(args, "--vlm-devices") == "0,1"
     assert _flag_value(args, "--ae-device") == "2"
+    assert _flag_value(args, "--cross-card-transfer-strategy") == "host-staged"
     assert _flag_value(args, "--request-rate-hz-values") == "8,16"
     assert "--no-jax-compile" in args
     assert "--no-jax-compile-warmup" in args

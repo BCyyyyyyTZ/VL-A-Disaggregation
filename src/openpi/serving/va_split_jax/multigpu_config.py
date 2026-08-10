@@ -2,12 +2,26 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import Literal
+from typing import TypeAlias
+from typing import cast
+
+CrossCardTransferStrategy: TypeAlias = Literal["device-direct", "host-staged"]
+_VALID_CROSS_CARD_TRANSFER_STRATEGIES = frozenset({"device-direct", "host-staged"})
 
 
 def parse_device_list(value: str | Sequence[str]) -> tuple[str, ...]:
     if isinstance(value, str):
         return tuple(part.strip() for part in value.split(",") if part.strip())
     return tuple(str(part).strip() for part in value if str(part).strip())
+
+
+def normalize_cross_card_transfer_strategy(value: str) -> CrossCardTransferStrategy:
+    strategy = str(value).strip()
+    if strategy not in _VALID_CROSS_CARD_TRANSFER_STRATEGIES:
+        valid = ", ".join(sorted(_VALID_CROSS_CARD_TRANSFER_STRATEGIES))
+        raise ValueError(f"cross_card_transfer_strategy must be one of: {valid}; got {value!r}")
+    return cast(CrossCardTransferStrategy, strategy)
 
 
 @dataclass(frozen=True, slots=True)
@@ -19,12 +33,15 @@ class JaxMultiGpuVASplitConfig:
     max_ae_batch_size: int = 64
     max_prefix_slots: int | None = None
     start_method: str = "spawn"
+    cross_card_transfer_strategy: CrossCardTransferStrategy = "device-direct"
 
     def __post_init__(self) -> None:
         vlm_devices = parse_device_list(self.vlm_devices)
         ae_device = str(self.ae_device).strip()
+        transfer_strategy = normalize_cross_card_transfer_strategy(self.cross_card_transfer_strategy)
         object.__setattr__(self, "vlm_devices", vlm_devices)
         object.__setattr__(self, "ae_device", ae_device)
+        object.__setattr__(self, "cross_card_transfer_strategy", transfer_strategy)
         if not vlm_devices:
             raise ValueError("vlm_devices must contain at least one device")
         if not ae_device:

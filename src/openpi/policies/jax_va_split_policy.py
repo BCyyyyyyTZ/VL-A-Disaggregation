@@ -396,6 +396,7 @@ def create_trained_jax_multigpu_va_split_policy(
     jax_compile: bool = True,
     jax_compile_warmup: bool = True,
     jax_compile_warmup_max_batch_size: int | None = None,
+    cross_card_transfer_strategy: str = "device-direct",
 ) -> JaxVASplitPolicy:
     repack_transforms = repack_transforms or _transforms.Group()
     checkpoint_dir = pathlib.Path(download.maybe_download(str(checkpoint_dir)))
@@ -420,6 +421,7 @@ def create_trained_jax_multigpu_va_split_policy(
         max_vlm_batch_size=max_vlm_batch_size,
         max_vlm_wait_ms=max_vlm_wait_ms,
         max_ae_batch_size=max_ae_batch_size,
+        cross_card_transfer_strategy=cross_card_transfer_strategy,
     )
     warmup_max_batch_size = (
         jax_compile_warmup_max_batch_size
@@ -462,5 +464,6 @@ def create_trained_jax_multigpu_va_split_policy(
             "va_split_runtime": "jax-multigpu-split-ipc",
             "vlm_devices": tuple(config.vlm_devices),
             "ae_device": config.ae_device,
+            "cross_card_transfer_strategy": config.cross_card_transfer_strategy,
         },
     )

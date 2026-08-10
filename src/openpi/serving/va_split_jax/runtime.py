@@ -185,6 +185,7 @@ def _run_jax_vlm_process(
     env_updates=None,
     warmup_queue=None,
     source_worker_id=None,
+    cross_card_transfer_strategy="device-direct",
 ) -> None:
     _apply_env_updates(env_updates)
     model = model_factory()
@@ -201,7 +202,10 @@ def _run_jax_vlm_process(
                 config=compile_config,
             )
             vlm_warmup_batches = float(stats["jax_warmup_batches"])
-    backend = make_default_device_slab_backend(device_ordinal=1 if len(jax.devices()) > 1 else 0)
+    backend = make_default_device_slab_backend(
+        device_ordinal=1 if len(jax.devices()) > 1 else 0,
+        cross_card_transfer_strategy=cross_card_transfer_strategy,
+    )
     process = JaxVLMProcess(
         model=model,
         request_queue=request_queue,
@@ -414,6 +418,7 @@ class JaxMultiGpuProcessVASplitRuntime:
                     None,
                     self._warmup_queue,
                     worker_id,
+                    config.cross_card_transfer_strategy,
                 ),
                 # VLM sees the AE slab GPU first and its compute GPU second.
                 kwargs={"device": f"{config.ae_device},{device}", "env_updates": vlm_env_updates},

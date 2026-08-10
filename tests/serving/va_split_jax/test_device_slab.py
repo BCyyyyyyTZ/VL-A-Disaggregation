@@ -376,3 +376,39 @@ def test_free_lane_write_concurrent_with_active_prefix_read():
         np.testing.assert_allclose(np.asarray(batch[5]), np.full((4, 8), -1.0, dtype=np.float32))
     finally:
         slab.close()
+
+
+def test_cuda_host_staged_strategy_moves_cross_device_source_to_slab_device(monkeypatch):
+    backend = CudaIpcDeviceSlabBackend(cross_card_transfer_strategy="host-staged")
+    spec = DeviceSlabSpec(name="x", shape=(1, 2, 3), dtype="float32", max_lanes=4)
+    slab = SimpleNamespace(handle=SimpleNamespace(device_ordinal=0), spec=spec)
+    staged = SimpleNamespace(block_until_ready=mock.Mock())
+    captured: dict[str, object] = {}
+
+    class FakeValue:
+        shape = (1, 2, 3)
+        dtype = np.dtype("float32")
+
+        def devices(self):
+            return {SimpleNamespace(platform="gpu", id=1)}
+
+        def __array__(self, dtype=None):
+            array = np.ones(self.shape, dtype=np.float32)
+            return array.astype(dtype) if dtype is not None else array
+
+    def fake_device_put(value, device):
+        captured["value"] = value
+        captured["device"] = device
+        return staged
+
+    monkeypatch.setattr(device_slab, "_normalize_numba_device_ordinal", lambda ordinal: int(ordinal))
+    monkeypatch.setattr(device_slab, "_numba_device_ordinal_for_jax_device", lambda device: int(device.id))
+    monkeypatch.setattr(device_slab.jax, "devices", lambda kind=None: ("gpu0", "gpu1"))
+    monkeypatch.setattr(device_slab.jax, "device_put", fake_device_put)
+
+    result = backend._prepare_copy_source(slab, FakeValue())  # noqa: SLF001
+
+    assert result is staged
+    assert captured["device"] == "gpu0"
+    np.testing.assert_allclose(captured["value"], np.ones((1, 2, 3), dtype=np.float32))
+    staged.block_until_ready.assert_called_once_with()

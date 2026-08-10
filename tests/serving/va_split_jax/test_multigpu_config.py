@@ -23,3 +23,22 @@ def test_multigpu_config_rejects_overlapping_devices():
 
 def test_parse_device_list_trims_csv():
     assert parse_device_list("GPU-a, 1,,GPU-c") == ("GPU-a", "1", "GPU-c")
+
+
+def test_multigpu_config_accepts_host_staged_cross_card_transfer_strategy():
+    cfg = JaxMultiGpuVASplitConfig(
+        vlm_devices=("0", "1"),
+        ae_device="2",
+        cross_card_transfer_strategy="host-staged",
+    )
+
+    assert cfg.cross_card_transfer_strategy == "host-staged"
+
+
+def test_multigpu_config_rejects_unknown_cross_card_transfer_strategy():
+    with pytest.raises(ValueError, match="cross_card_transfer_strategy"):
+        JaxMultiGpuVASplitConfig(
+            vlm_devices=("0",),
+            ae_device="1",
+            cross_card_transfer_strategy="unknown",
+        )

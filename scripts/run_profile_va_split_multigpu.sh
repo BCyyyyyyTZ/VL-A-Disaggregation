@@ -22,6 +22,7 @@ TIMEOUT_S="${TIMEOUT_S:-60}"
 MAX_AE_BATCH_SIZE="${MAX_AE_BATCH_SIZE:-999}"
 MAX_VLM_BATCH_SIZE="${MAX_VLM_BATCH_SIZE:-8}"
 MAX_VLM_WAIT_MS="${MAX_VLM_WAIT_MS:-1.0}"
+CROSS_CARD_TRANSFER_STRATEGY="${CROSS_CARD_TRANSFER_STRATEGY:-host-staged}"
 VLM_DEVICES="${VLM_DEVICES:-0,1}"
 AE_DEVICE="${AE_DEVICE:-2}"
 BASELINE_DEVICES="${BASELINE_DEVICES:-0,1,2}"
@@ -83,7 +84,11 @@ cmd=(
 )
 
 if [[ "${MODE}" == "jax-multigpu-split-ipc" ]]; then
-  cmd+=(--vlm-devices "${VLM_DEVICES}" --ae-device "${AE_DEVICE}")
+  cmd+=(
+    --vlm-devices "${VLM_DEVICES}"
+    --ae-device "${AE_DEVICE}"
+    --cross-card-transfer-strategy "${CROSS_CARD_TRANSFER_STRATEGY}"
+  )
 else
   cmd+=(--baseline-devices "${BASELINE_DEVICES}" --batch-size "${MAX_VLM_BATCH_SIZE}")
 fi
@@ -110,6 +115,7 @@ echo "  logs:   ${RUN_LOG_DIR}"
 echo "  json:   ${JSON_OUTPUT}"
 if [[ "${MODE}" == "jax-multigpu-split-ipc" ]]; then
   echo "  split:  vlm_devices=${VLM_DEVICES} ae_device=${AE_DEVICE}"
+  echo "  transfer: cross_card=${CROSS_CARD_TRANSFER_STRATEGY}"
 else
   echo "  baseline replicas: devices=${BASELINE_DEVICES}"
 fi

@@ -129,6 +129,7 @@ class Args:
     vlm_devices: str = ""
     ae_device: str = ""
     baseline_devices: str = ""
+    cross_card_transfer_strategy: str = "device-direct"
     ae_sm_percent: int = 20
     vlm_sm_percent: int = 0
     require_mps_env: bool = True
@@ -1461,6 +1462,7 @@ def create_policy_for_mode(args: Args, mode: Mode):
             jax_compile=args.jax_compile,
             jax_compile_warmup=args.jax_compile_warmup,
             jax_compile_warmup_max_batch_size=args.jax_compile_warmup_max_batch_size,
+            cross_card_transfer_strategy=args.cross_card_transfer_strategy,
         )
     if mode == "jax-multigpu-baseline":
         return JaxMultiGpuBaselineProfilePolicy(

@@ -17,6 +17,8 @@ from numba.cuda.cudadrv import driver
 from numba.cuda.cudadrv import drvapi
 import numpy as np
 
+from openpi.serving.va_split_jax.multigpu_config import normalize_cross_card_transfer_strategy
+
 
 @dataclass(frozen=True, slots=True)
 class DeviceSlabSpec:
@@ -144,8 +146,14 @@ class DeviceSlabBackend:
 class CudaIpcDeviceSlabBackend(DeviceSlabBackend):
     transport = "cuda-ipc-numba"
 
-    def __init__(self, *, device_ordinal: int | None = None):
+    def __init__(
+        self,
+        *,
+        device_ordinal: int | None = None,
+        cross_card_transfer_strategy: str = "device-direct",
+    ):
         self._device_ordinal = device_ordinal
+        self._cross_card_transfer_strategy = normalize_cross_card_transfer_strategy(cross_card_transfer_strategy)
         self._write_streams: dict[int, Any] = {}
 
     def create_slab(self, spec: DeviceSlabSpec) -> DeviceSlab:
@@ -216,8 +224,8 @@ class CudaIpcDeviceSlabBackend(DeviceSlabBackend):
         _validate_lane_update(slab, lane_id, value)
         if slab.handle.transport != self.transport:
             raise RuntimeError(f"expected {self.transport!r} slab, got {slab.handle.transport!r}")
-        value.block_until_ready()
         device_ordinal = _normalize_numba_device_ordinal(slab.handle.device_ordinal)
+        value = self._prepare_copy_source(slab, value)
         _select_numba_device(device_ordinal)
         stream = self._write_stream(device_ordinal)
         dst = _device_array_view_from_cuda_array_interface(
@@ -243,8 +251,8 @@ class CudaIpcDeviceSlabBackend(DeviceSlabBackend):
         _validate_batch_update(slab, lane_start, value)
         if slab.handle.transport != self.transport:
             raise RuntimeError(f"expected {self.transport!r} slab, got {slab.handle.transport!r}")
-        value.block_until_ready()
         device_ordinal = _normalize_numba_device_ordinal(slab.handle.device_ordinal)
+        value = self._prepare_copy_source(slab, value)
         _select_numba_device(device_ordinal)
         stream = self._write_stream(device_ordinal)
         dst = _device_array_view_from_cuda_array_interface(
@@ -278,6 +286,20 @@ class CudaIpcDeviceSlabBackend(DeviceSlabBackend):
             self._write_streams[key] = stream
         return stream
 
+    def _prepare_copy_source(self, slab: DeviceSlab, value: jax.Array) -> jax.Array:
+        target_ordinal = _normalize_numba_device_ordinal(slab.handle.device_ordinal)
+        if self._cross_card_transfer_strategy == "device-direct":
+            value.block_until_ready()
+            return value
+        source_ordinal = _array_device_ordinal_or_none(value)
+        if source_ordinal == target_ordinal:
+            value.block_until_ready()
+            return value
+        host_value = np.asarray(value)
+        staged = jax.device_put(host_value, _jax_gpu_device_for_numba_ordinal(target_ordinal))
+        staged.block_until_ready()
+        return staged
+
 
 class LocalDeviceSlabBackend(DeviceSlabBackend):
     transport = "local-device"
@@ -298,9 +320,16 @@ class LocalDeviceSlabBackend(DeviceSlabBackend):
         raise RuntimeError("LocalDeviceSlabBackend cannot open slabs across processes")
 
 
-def make_default_device_slab_backend(*, device_ordinal: int | None = None) -> DeviceSlabBackend:
+def make_default_device_slab_backend(
+    *,
+    device_ordinal: int | None = None,
+    cross_card_transfer_strategy: str = "device-direct",
+) -> DeviceSlabBackend:
     if _has_cuda_device():
-        return CudaIpcDeviceSlabBackend(device_ordinal=device_ordinal)
+        return CudaIpcDeviceSlabBackend(
+            device_ordinal=device_ordinal,
+            cross_card_transfer_strategy=cross_card_transfer_strategy,
+        )
     return LocalDeviceSlabBackend()
 
 
@@ -369,6 +398,22 @@ def _is_gpu_array(array: jax.Array) -> bool:
 def _array_device_ordinal(array: jax.Array) -> int:
     device = next(iter(array.devices()))
     return _numba_device_ordinal_for_jax_device(device)
+
+
+def _array_device_ordinal_or_none(array: Any) -> int | None:
+    try:
+        return _array_device_ordinal(array)
+    except Exception:
+        return None
+
+
+def _jax_gpu_device_for_numba_ordinal(device_ordinal: int) -> jax.Device:
+    devices = jax.devices("gpu")
+    if 0 <= device_ordinal < len(devices):
+        return devices[device_ordinal]
+    if len(devices) == 1:
+        return devices[0]
+    raise RuntimeError(f"Cannot map Numba CUDA ordinal {device_ordinal} to visible JAX GPU devices: {devices}")
 
 
 def _select_numba_device(device_ordinal: int):

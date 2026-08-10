@@ -225,9 +225,14 @@ def test_jax_multigpu_runtime_routes_role_specific_model_factories(monkeypatch):
     runtime = JaxMultiGpuProcessVASplitRuntime(
         vlm_model_factory=vlm_factory,
         ae_model_factory=ae_factory,
-        config=JaxMultiGpuVASplitConfig(vlm_devices=("0",), ae_device="1"),
+        config=JaxMultiGpuVASplitConfig(
+            vlm_devices=("0",),
+            ae_device="1",
+            cross_card_transfer_strategy="host-staged",
+        ),
     )
 
     assert fake_context.processes[0].args[0] is ae_factory
     assert fake_context.processes[1].args[0] is vlm_factory
+    assert fake_context.processes[1].args[-1] == "host-staged"
     runtime.shutdown()
