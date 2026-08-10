@@ -26,6 +26,12 @@ class JaxCompileConfig:
     num_steps: int = 10
 
 
+@dataclass(frozen=True, slots=True)
+class ModelWithPrefixTemplate:
+    model: Any
+    prefix_template: JaxPrefixFeature
+
+
 def maybe_jit_split_model(model: Any, config: JaxCompileConfig) -> Any:
     if not config.enabled:
         return model

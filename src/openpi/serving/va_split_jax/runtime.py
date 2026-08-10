@@ -17,6 +17,7 @@ import jax.numpy as jnp
 from openpi.serving.va_split_jax.ae_process import JaxAEProcess
 from openpi.serving.va_split_jax.ae_process import JaxAEWorker
 from openpi.serving.va_split_jax.compile import JaxCompileConfig
+from openpi.serving.va_split_jax.compile import ModelWithPrefixTemplate
 from openpi.serving.va_split_jax.compile import make_model_noise_factory
 from openpi.serving.va_split_jax.compile import make_model_observation_factory
 from openpi.serving.va_split_jax.compile import make_prefix_feature_template
@@ -247,10 +248,10 @@ def _run_jax_ae_process(
     warmup_queue=None,
 ) -> None:
     _apply_env_updates(env_updates)
-    model = model_factory()
+    model, template = _unwrap_model_with_prefix_template(model_factory())
     observation_factory = make_model_observation_factory(model)
     noise_factory = make_model_noise_factory(model) if compile_config is not None else None
-    template = getattr(model, "_va_split_prefix_feature_template", None)
+    template = template or getattr(model, "_va_split_prefix_feature_template", None)
     if template is None:
         template = make_prefix_feature_template(model, observation_factory)
     model = prune_split_model_for_role(model, role="ae")
@@ -271,6 +272,11 @@ def _run_jax_ae_process(
         warmup_queue.put(JaxCompileWarmupDone(role="ae", jax_warmup_batches=float(ipc_batches)))
     process.run()
 
+
+def _unwrap_model_with_prefix_template(value: Any) -> tuple[Any, Any | None]:
+    if isinstance(value, ModelWithPrefixTemplate):
+        return value.model, value.prefix_template
+    return value, None
 
 
 class JaxMultiGpuReleaseFanout:

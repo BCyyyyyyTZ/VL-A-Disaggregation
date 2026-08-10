@@ -244,6 +244,7 @@ def test_profile_args_accept_multigpu_modes_and_devices():
     assert args.vlm_devices == "0,1"
     assert args.ae_device == "2"
     assert args.baseline_devices == "0,1,2"
+    assert args.cross_card_transfer_strategy == "host-staged"
 
 
 def test_run_profile_va_split_multigpu_split_invocation(tmp_path):

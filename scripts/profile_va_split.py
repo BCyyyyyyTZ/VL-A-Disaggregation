@@ -129,7 +129,7 @@ class Args:
     vlm_devices: str = ""
     ae_device: str = ""
     baseline_devices: str = ""
-    cross_card_transfer_strategy: str = "device-direct"
+    cross_card_transfer_strategy: str = "host-staged"
     ae_sm_percent: int = 20
     vlm_sm_percent: int = 0
     require_mps_env: bool = True

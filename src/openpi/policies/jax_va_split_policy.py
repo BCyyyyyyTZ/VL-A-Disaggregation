@@ -20,6 +20,7 @@ from openpi.models.jax_split_types import JaxPrefixFeature
 from openpi.policies import batch_inference as _batch
 from openpi.policies import policy as _policy
 from openpi.serving.va_split_jax.compile import JaxCompileConfig
+from openpi.serving.va_split_jax.compile import ModelWithPrefixTemplate
 from openpi.serving.va_split_jax.compile import make_model_observation_factory
 from openpi.serving.va_split_jax.compile import make_prefix_feature_template
 from openpi.serving.va_split_jax.compile import prune_split_model_for_role
@@ -238,8 +239,32 @@ def _load_jax_model(
     state.replace_by_pure_dict(params)
     loaded = nnx.merge(graphdef, state)
     if role == "ae":
-        loaded._va_split_prefix_feature_template = _make_prefix_feature_template_for_model_config(train_config.model)  # noqa: SLF001
+        return _wrap_ae_model_with_prefix_template(
+            loaded,
+            _make_prefix_feature_template_for_model_config(train_config.model),
+        )
     return loaded
+
+
+def _wrap_ae_model_with_prefix_template(model: Any, template: JaxPrefixFeature) -> ModelWithPrefixTemplate:
+    return ModelWithPrefixTemplate(model=model, prefix_template=template)
+
+
+def _multigpu_policy_metadata(
+    policy_metadata: dict[str, Any] | None,
+    *,
+    va_split_runtime: str,
+    vlm_devices: tuple[str, ...],
+    ae_device: str,
+    cross_card_transfer_strategy: str,
+) -> dict[str, Any]:
+    return {
+        **(policy_metadata or {}),
+        "va_split_runtime": va_split_runtime,
+        "vlm_devices": vlm_devices,
+        "ae_device": ae_device,
+        "cross_card_transfer_strategy": cross_card_transfer_strategy,
+    }
 
 
 def _single_device_sharding(device_index: int) -> jax.sharding.SingleDeviceSharding:
@@ -459,11 +484,11 @@ def create_trained_jax_multigpu_va_split_policy(
             *repack_transforms.outputs,
         ],
         sample_kwargs=sample_kwargs,
-        metadata={
-            **train_config.policy_metadata,
-            "va_split_runtime": "jax-multigpu-split-ipc",
-            "vlm_devices": tuple(config.vlm_devices),
-            "ae_device": config.ae_device,
-            "cross_card_transfer_strategy": config.cross_card_transfer_strategy,
-        },
+        metadata=_multigpu_policy_metadata(
+            train_config.policy_metadata,
+            va_split_runtime="jax-multigpu-split-ipc",
+            vlm_devices=tuple(config.vlm_devices),
+            ae_device=config.ae_device,
+            cross_card_transfer_strategy=config.cross_card_transfer_strategy,
+        ),
     )

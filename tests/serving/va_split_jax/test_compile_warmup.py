@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+from flax import nnx
+import jax
 import jax.numpy as jnp
 import pytest
 
+from openpi.models.jax_split_types import JaxDenoiseState
 from openpi.models.jax_split_types import JaxPrefixFeature
 from openpi.serving.va_split_jax.compile import JaxCompileConfig
+from openpi.serving.va_split_jax.compile import ModelWithPrefixTemplate
 from openpi.serving.va_split_jax.compile import make_prefix_feature_template
 from openpi.serving.va_split_jax.compile import maybe_jit_ae_model
 from openpi.serving.va_split_jax.compile import maybe_jit_monolithic_model
@@ -20,6 +24,15 @@ from openpi.serving.va_split_jax.compile import warmup_vlm_prefix_lane_pool
 from openpi.serving.va_split_jax.compile import warmup_vlm_prefix_model
 from openpi.serving.va_split_jax.device_slab import make_default_device_slab_backend
 from openpi.serving.va_split_jax.prefix_cache_pool import JaxVlmPrefixCacheLanePool
+
+
+class _TinyAeModel(nnx.Module):
+    def __init__(self):
+        self.scale = nnx.Param(jnp.asarray(1.0, dtype=jnp.float32))
+
+    def denoise_one_batch(self, prefix_batch: JaxPrefixFeature, denoise_batch: JaxDenoiseState) -> jax.Array:
+        del prefix_batch
+        return denoise_batch.x_t + self.scale.value
 
 
 def test_planned_warmup_batches_covers_every_size_up_to_cap():
@@ -39,6 +52,22 @@ def test_compile_config_defaults_to_enabled():
     assert config.warmup_enabled is True
     assert config.warmup_max_batch_size == 24
     assert config.num_steps == 10
+
+
+def test_model_with_prefix_template_keeps_arrays_out_of_nnx_module_jit():
+    model = _TinyAeModel()
+    template = JaxPrefixFeature(
+        past_key_values=jnp.zeros((1, 1, 1), dtype=jnp.float32),
+        prefix_pad_masks=jnp.ones((1, 1), dtype=jnp.bool_),
+        state=jnp.zeros((1, 1), dtype=jnp.float32),
+    )
+
+    wrapped = ModelWithPrefixTemplate(model=model, prefix_template=template)
+
+    assert wrapped.model is model
+    assert wrapped.prefix_template is template
+    assert not hasattr(model, "_va_split_prefix_feature_template")
+    maybe_jit_ae_model(wrapped.model, JaxCompileConfig(enabled=True))
 
 
 def test_compile_helpers_use_module_jit(monkeypatch):
