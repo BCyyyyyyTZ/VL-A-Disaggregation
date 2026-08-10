@@ -21,10 +21,19 @@ def test_run_profile_va_split_jax_defaults_and_invocation(tmp_path):
     assert 'POLICY_DIR="${POLICY_DIR:-/mnt/tianze/models/pi05_libero}"' in script
     assert 'LOG_ROOT="${LOG_ROOT:-${REPO_ROOT}/logs/tests}"' in script
     assert 'JAX_COMPILE="${JAX_COMPILE:-1}"' in script
+    assert 'JAX_COMPILE_AE="${JAX_COMPILE_AE:-1}"' in script
+    assert 'JAX_COMPILE_VLM="${JAX_COMPILE_VLM:-1}"' in script
     assert 'JAX_COMPILE_WARMUP="${JAX_COMPILE_WARMUP:-1}"' in script
-    assert 'JAX_COMPILE_WARMUP_MAX_BATCH_SIZE="${JAX_COMPILE_WARMUP_MAX_BATCH_SIZE:-20}"' in script
+    assert 'DEFAULT_JAX_COMPILE_WARMUP_MAX_BATCH_SIZE="$((MAX_VLM_BATCH_SIZE * 2))"' in script
+    assert 'JAX_COMPILE_WARMUP_MAX_BATCH_SIZE="${JAX_COMPILE_WARMUP_MAX_BATCH_SIZE:-${DEFAULT_JAX_COMPILE_WARMUP_MAX_BATCH_SIZE}}"' in script
+    assert 'JAX_COMPILATION_CACHE_DIR="${JAX_COMPILATION_CACHE_DIR:-${RUN_LOG_DIR}/jax-compilation-cache}"' in script
+    assert 'JAX_ENABLE_COMPILATION_CACHE="${JAX_ENABLE_COMPILATION_CACHE:-true}"' in script
+    assert 'JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS="${JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS:-0}"' in script
     assert 'REQUEST_RATE_HZ_LIST="${REQUEST_RATE_HZ_LIST:-}"' in script
     assert "export XLA_PYTHON_CLIENT_PREALLOCATE=false" in script
+    assert "export JAX_COMPILATION_CACHE_DIR" in script
+    assert "export JAX_ENABLE_COMPILATION_CACHE" in script
+    assert "export JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS" in script
 
     python_arg_log = tmp_path / "python_args.txt"
     mps_arg_log = tmp_path / "mps_args.txt"
@@ -89,6 +98,7 @@ fi
     )
 
     assert result.returncode == 0, result.stderr
+    assert f"jax_cache: dir={tmp_path / 'logs' / 'jax-testrun' / 'jax-compilation-cache'}" in result.stdout
     args = python_arg_log.read_text(encoding="utf-8").splitlines()
     assert args[:2] == [str(repo_root / "scripts/profile_va_split.py"), "--policy.config"]
     assert _flag_value(args, "--policy.config") == "pi05_libero"
@@ -96,9 +106,11 @@ fi
     assert _flag_value(args, "--policy.dir") == "/mnt/tianze/models/pi05_libero"
     assert _flag_value(args, "--ae-sm-percent") == "20"
     assert _flag_value(args, "--vlm-sm-percent") == "0"
-    assert _flag_value(args, "--jax-compile-warmup-max-batch-size") == "20"
+    assert _flag_value(args, "--jax-compile-warmup-max-batch-size") == "16"
     assert _flag_value(args, "--gpu-device-index") == "0"
     assert "--no-jax-compile" not in args
+    assert "--no-jax-compile-ae" not in args
+    assert "--no-jax-compile-vlm" not in args
     assert "--no-jax-compile-warmup" not in args
     assert "-d" in mps_arg_log.read_text(encoding="utf-8").splitlines()
 
@@ -228,6 +240,60 @@ fi
     assert _flag_value(args, "--mode") == "jax-monolithic"
     assert "--no-jax-compile" in args
     assert "--no-jax-compile-warmup" in args
+
+
+def test_run_profile_va_split_jax_can_disable_vlm_compile(tmp_path):
+    repo_root = pathlib.Path(__file__).resolve().parents[3]
+    python_arg_log = tmp_path / "python_args.txt"
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _write_executable(
+        bin_dir / "python",
+        """#!/usr/bin/env bash
+set -euo pipefail
+: "${PYTHON_ARG_LOG:?}"
+printf '%s\n' "$@" >"${PYTHON_ARG_LOG}"
+""",
+    )
+    _write_executable(
+        bin_dir / "nvidia-smi",
+        """#!/usr/bin/env bash
+set -euo pipefail
+if [[ "$*" == *"--query-gpu=uuid"* ]]; then
+  printf 'GPU-test-uuid\n'
+elif [[ "$*" == *"--query-gpu=name"* ]]; then
+  printf 'Test GPU\n'
+else
+  printf '0, Test GPU\n'
+fi
+""",
+    )
+
+    env = os.environ.copy()
+    env.update(
+        {
+            "PATH": f"{bin_dir}:{env['PATH']}",
+            "PYTHON_BIN": "python",
+            "PYTHON_ARG_LOG": str(python_arg_log),
+            "MODE": "jax-monolithic",
+            "JAX_COMPILE_VLM": "0",
+            "LOG_ROOT": str(tmp_path / "logs"),
+        }
+    )
+
+    result = subprocess.run(
+        ["bash", "scripts/run_profile_va_split_jax.sh"],
+        cwd=repo_root,
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    args = python_arg_log.read_text(encoding="utf-8").splitlines()
+    assert "--no-jax-compile-vlm" in args
 
 
 def _flag_value(args: list[str], flag: str) -> str:

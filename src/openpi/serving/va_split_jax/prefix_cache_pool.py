@@ -28,6 +28,18 @@ class JaxVlmPrefixCacheLanePool:
     def active_count(self) -> int:
         return self._active_count
 
+    @property
+    def is_initialized(self) -> bool:
+        return self._past_slabs is not None and self._prefix_pad_masks is not None
+
+    def request_id_at_lane(self, lane_id: int) -> str | None:
+        self._validate_physical_lane_id(lane_id)
+        return self._lane_to_request[lane_id]
+
+    def is_lane_active(self, lane_id: int) -> bool:
+        self._validate_physical_lane_id(lane_id)
+        return self._lane_to_request[lane_id] is not None
+
     def initialize_from_feature(self, feature: JaxPrefixFeature) -> None:
         """Allocate slab storage from a template row without activating any lane."""
         _validate_single_row_feature(feature)
@@ -67,7 +79,7 @@ class JaxVlmPrefixCacheLanePool:
         if self._active_count >= self.max_lanes:
             raise RuntimeError(f"VLM prefix lane pool is full ({self.max_lanes} active requests)")
         _validate_single_row_feature(feature)
-        lane_id = self._active_count
+        lane_id = self._first_free_lane_id()
         self._ensure_initialized(feature)
         self._write_feature_into_lane(lane_id, feature)
         self._request_to_lane[request_id] = lane_id
@@ -76,10 +88,11 @@ class JaxVlmPrefixCacheLanePool:
         return lane_id
 
     def claim_written_lane(self, request_id: str, lane_id: int) -> tuple[int, int | None]:
-        """Activate a lane that already holds prefix data (VLM wrote it).
+        """Activate a physical lane that already holds prefix data from VLM.
 
-        Densifies into ``active_count`` when needed. Returns ``(dense_lane_id, vacated_lane_or_none)``.
-        ``vacated_lane`` is a free physical id after densify move (credit candidate).
+        Prefix slab lane ids are VLM credit ownership ids, so claiming never moves
+        slab rows. AE keeps its denoise state dense separately and gathers prefix
+        rows by request id when building a denoise batch.
         """
         if request_id in self._request_to_lane:
             raise ValueError(f"request_id {request_id!r} already exists in prefix lane pool")
@@ -91,34 +104,21 @@ class JaxVlmPrefixCacheLanePool:
         if self._past_slabs is None or self._prefix_pad_masks is None:
             raise RuntimeError("Cannot claim lanes before pool initialization")
 
-        vacated: int | None = None
-        dense_lane = self._active_count
-        if lane_id != dense_lane:
-            self._move_lane(lane_id, dense_lane)
-            vacated = lane_id
-            lane_id = dense_lane
         self._request_to_lane[request_id] = lane_id
         self._lane_to_request[lane_id] = request_id
         self._active_count += 1
-        return lane_id, vacated
+        return lane_id, None
 
     def release_lane(self, request_id: str) -> int | None:
-        """Release and compact. Returns the freed physical lane id (credit for VLM), if any."""
+        """Release a request and return its original physical lane id for VLM credit."""
         lane_id = self._request_to_lane.pop(request_id, None)
         if lane_id is None:
             return None
-        last_lane = self._active_count - 1
-        moved_request_id = self._lane_to_request[last_lane]
+        if self._lane_to_request[lane_id] != request_id:
+            raise RuntimeError(f"prefix lane ownership mismatch for {request_id!r} at lane {lane_id}")
         self._lane_to_request[lane_id] = None
-        if lane_id != last_lane:
-            if moved_request_id is None:
-                raise RuntimeError(f"Cannot compact empty VLM lane {last_lane}")
-            self._move_lane(last_lane, lane_id)
-            self._lane_to_request[lane_id] = moved_request_id
-            self._request_to_lane[moved_request_id] = lane_id
-        self._lane_to_request[last_lane] = None
         self._active_count -= 1
-        return last_lane
+        return lane_id
 
     def _write_feature_into_lane(self, lane_id: int, feature: JaxPrefixFeature) -> None:
         self._past_slabs = _copy_tree_lane(
@@ -140,16 +140,23 @@ class JaxVlmPrefixCacheLanePool:
         if lane_id < 0 or lane_id >= self.max_lanes:
             raise ValueError(f"lane_id {lane_id} outside pool capacity {self.max_lanes}")
 
+    def _first_free_lane_id(self) -> int:
+        for lane_id, request_id in enumerate(self._lane_to_request):
+            if request_id is None:
+                return lane_id
+        raise RuntimeError(f"prefix lane pool is full ({self.max_lanes} active requests)")
+
     def export_batch_view(self, request_ids: tuple[str, ...]) -> JaxPrefixFeature:
         if not request_ids:
             raise ValueError("request_ids must be non-empty")
         lane_ids = tuple(self._request_to_lane[request_id] for request_id in request_ids)
-        if lane_ids != tuple(range(len(request_ids))):
-            raise ValueError(
-                "The first implementation exports only the dense prefix of the VLM lane pool; "
-                "AE batch selection must use the request ids currently occupying lanes [0, batch_size)."
-            )
-        return self.view_prefix_batch(len(request_ids))
+        if self._past_slabs is None or self._prefix_pad_masks is None:
+            raise RuntimeError("Cannot view prefix batch before initialization")
+        return JaxPrefixFeature(
+            past_key_values=_view_tree_lanes(self._backend, self._past_slabs, lane_ids),
+            prefix_pad_masks=self._backend.slice_lanes(self._prefix_pad_masks, lane_ids),
+            state=self._backend.slice_lanes(self._state, lane_ids) if self._state is not None else None,
+        )
 
     def export_slab_handle_tree(self) -> dict[str, Any]:
         if self._past_slabs is None or self._prefix_pad_masks is None:
@@ -181,8 +188,7 @@ class JaxVlmPrefixCacheLanePool:
     def _move_lane(self, src_lane: int, dst_lane: int) -> None:
         if self._past_slabs is None or self._prefix_pad_masks is None:
             raise RuntimeError("Cannot move lanes before initialization")
-        # Physical read: may move a free-but-written lane during claim densify, so do not
-        # require src_lane < active_count.
+        # Physical read: lane ids are stable, so gather the requested physical row directly.
         span = max(src_lane, dst_lane) + 1
         past_view = _view_tree_batch(self._backend, self._past_slabs, span)
         row = _row_view_tree(past_view, src_lane, axis=1)
@@ -341,6 +347,18 @@ def _view_tree_batch(backend: DeviceSlabBackend, slabs: Any, batch_size: int) ->
     raise TypeError(f"Unsupported JAX slab tree node: {type(slabs)}")
 
 
+def _view_tree_lanes(backend: DeviceSlabBackend, slabs: Any, lane_ids: tuple[int, ...]) -> Any:
+    if isinstance(slabs, DeviceSlab):
+        return backend.slice_lanes(slabs, lane_ids)
+    if isinstance(slabs, tuple):
+        return tuple(_view_tree_lanes(backend, item, lane_ids) for item in slabs)
+    if isinstance(slabs, list):
+        return [_view_tree_lanes(backend, item, lane_ids) for item in slabs]
+    if isinstance(slabs, dict):
+        return {key: _view_tree_lanes(backend, item, lane_ids) for key, item in slabs.items()}
+    raise TypeError(f"Unsupported JAX slab tree node: {type(slabs)}")
+
+
 def _export_slab_handle_tree(
     past_slabs: Any,
     prefix_pad_masks: DeviceSlab | None,
@@ -400,7 +418,7 @@ def _validate_single_row_tree(value: Any) -> None:
         if value.ndim < 2 or value.shape[1] != 1:
             raise ValueError(f"prefix tree array must have batch size 1 on axis 1, got {value.shape}")
         return
-    if isinstance(value, (tuple, list)):
+    if isinstance(value, tuple | list):
         for item in value:
             _validate_single_row_tree(item)
         return
@@ -428,7 +446,7 @@ def _validate_batch_tree(value: Any, batch_size: int) -> None:
         if value.ndim < 2 or value.shape[1] != batch_size:
             raise ValueError(f"prefix tree array must have batch size {batch_size} on axis 1, got {value.shape}")
         return
-    if isinstance(value, (tuple, list)):
+    if isinstance(value, tuple | list):
         for item in value:
             _validate_batch_tree(item, batch_size)
         return

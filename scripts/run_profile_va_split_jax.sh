@@ -25,15 +25,25 @@ NUM_STEPS="${NUM_STEPS:-5}"
 TIMEOUT_S="${TIMEOUT_S:-60}"
 MAX_AE_BATCH_SIZE="${MAX_AE_BATCH_SIZE:-999}"
 MAX_VLM_BATCH_SIZE="${MAX_VLM_BATCH_SIZE:-8}"
-MAX_VLM_WAIT_MS="${MAX_VLM_WAIT_MS:-1.0}"
+MAX_VLM_WAIT_MS="${MAX_VLM_WAIT_MS:-0.0}"
 WARMUP_REQUESTS="${WARMUP_REQUESTS:-4}"
 WARMUP_UNTIL_STEADY="${WARMUP_UNTIL_STEADY:-1}"
 WARMUP_STEADY_WINDOW="${WARMUP_STEADY_WINDOW:-4}"
 WARMUP_STEADY_MAX_REQUESTS="${WARMUP_STEADY_MAX_REQUESTS:-48}"
+WARMUP_CONCURRENT_INFLIGHT="${WARMUP_CONCURRENT_INFLIGHT:-4}"
 JAX_COMPILE="${JAX_COMPILE:-1}"
+JAX_COMPILE_AE="${JAX_COMPILE_AE:-1}"
+JAX_COMPILE_VLM="${JAX_COMPILE_VLM:-1}"
 JAX_COMPILE_WARMUP="${JAX_COMPILE_WARMUP:-1}"
-# Default warmup ceiling is capped at 20 to reduce compile-time peak memory.
-JAX_COMPILE_WARMUP_MAX_BATCH_SIZE="${JAX_COMPILE_WARMUP_MAX_BATCH_SIZE:-20}"
+# Default split compile warmup covers up to 2x VLM capacity, capped at 20.
+DEFAULT_JAX_COMPILE_WARMUP_MAX_BATCH_SIZE="$((MAX_VLM_BATCH_SIZE * 2))"
+if (( DEFAULT_JAX_COMPILE_WARMUP_MAX_BATCH_SIZE > 20 )); then
+  DEFAULT_JAX_COMPILE_WARMUP_MAX_BATCH_SIZE=20
+fi
+JAX_COMPILE_WARMUP_MAX_BATCH_SIZE="${JAX_COMPILE_WARMUP_MAX_BATCH_SIZE:-${DEFAULT_JAX_COMPILE_WARMUP_MAX_BATCH_SIZE}}"
+JAX_COMPILATION_CACHE_DIR="${JAX_COMPILATION_CACHE_DIR:-${RUN_LOG_DIR}/jax-compilation-cache}"
+JAX_ENABLE_COMPILATION_CACHE="${JAX_ENABLE_COMPILATION_CACHE:-true}"
+JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS="${JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS:-0}"
 JSON_OUTPUT="${JSON_OUTPUT:-${RUN_LOG_DIR}/profile.json}"
 PYTHON_BIN="${PYTHON_BIN:-${REPO_ROOT}/.venv/bin/python}"
 
@@ -72,6 +82,9 @@ trap cleanup EXIT
 export CUDA_VISIBLE_DEVICES="${GPU_UUID}"
 export PYTHONPATH="${REPO_ROOT}/src:${REPO_ROOT}/packages/openpi-client/src${PYTHONPATH:+:${PYTHONPATH}}"
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
+export JAX_COMPILATION_CACHE_DIR
+export JAX_ENABLE_COMPILATION_CACHE
+export JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS
 
 mkdir -p "${RUN_LOG_DIR}"
 
@@ -117,6 +130,7 @@ cmd=(
   --warmup-requests "${WARMUP_REQUESTS}"
   --warmup-steady-window "${WARMUP_STEADY_WINDOW}"
   --warmup-steady-max-requests "${WARMUP_STEADY_MAX_REQUESTS}"
+  --warmup-concurrent-inflight "${WARMUP_CONCURRENT_INFLIGHT}"
   --ae-sm-percent "${AE_SM_PERCENT}"
   --vlm-sm-percent "${VLM_SM_PERCENT}"
   --jax-compile-warmup-max-batch-size "${JAX_COMPILE_WARMUP_MAX_BATCH_SIZE}"
@@ -130,6 +144,14 @@ fi
 
 if [[ "${JAX_COMPILE}" == "0" || "${JAX_COMPILE}" == "false" ]]; then
   cmd+=(--no-jax-compile)
+fi
+
+if [[ "${JAX_COMPILE_AE}" == "0" || "${JAX_COMPILE_AE}" == "false" ]]; then
+  cmd+=(--no-jax-compile-ae)
+fi
+
+if [[ "${JAX_COMPILE_VLM}" == "0" || "${JAX_COMPILE_VLM}" == "false" ]]; then
+  cmd+=(--no-jax-compile-vlm)
 fi
 
 if [[ "${JAX_COMPILE_WARMUP}" == "0" || "${JAX_COMPILE_WARMUP}" == "false" ]]; then
@@ -148,7 +170,8 @@ if [[ -n "${REQUEST_RATE_HZ_LIST}" ]]; then
   echo "  rates:  ${REQUEST_RATE_HZ_LIST} (single warmup before sweep)"
 fi
 echo "  cuda:   visible=${CUDA_VISIBLE_DEVICES}"
-echo "  compile: enabled=${JAX_COMPILE} warmup=${JAX_COMPILE_WARMUP} warmup_max_batch=${JAX_COMPILE_WARMUP_MAX_BATCH_SIZE}"
+echo "  compile: enabled=${JAX_COMPILE} ae=${JAX_COMPILE_AE} vlm=${JAX_COMPILE_VLM} warmup=${JAX_COMPILE_WARMUP} warmup_max_batch=${JAX_COMPILE_WARMUP_MAX_BATCH_SIZE}"
+echo "  jax_cache: dir=${JAX_COMPILATION_CACHE_DIR} enabled=${JAX_ENABLE_COMPILATION_CACHE} min_compile_s=${JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS}"
 echo "  e2e_warmup: min=${WARMUP_REQUESTS} until_steady=${WARMUP_UNTIL_STEADY} window=${WARMUP_STEADY_WINDOW} max=${WARMUP_STEADY_MAX_REQUESTS}"
 echo "  mps:    pipe=${MPS_PIPE_DIR} ae_sm=${AE_SM_PERCENT} vlm_sm=${VLM_SM_PERCENT}"
 "${cmd[@]}" "$@"

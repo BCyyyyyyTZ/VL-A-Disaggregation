@@ -2,14 +2,16 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 import functools
-import os
 import pathlib
 import time
 from typing import Any
 
+from flax import nnx
+from flax import traverse_util
 import jax
 import jax.numpy as jnp
 import numpy as np
+import orbax.checkpoint as ocp
 from typing_extensions import override
 
 from openpi import transforms as _transforms
@@ -18,8 +20,11 @@ from openpi.policies import batch_inference as _batch
 from openpi.policies import policy as _policy
 from openpi.serving.va_split_jax.compile import DEFAULT_WARMUP_MAX_BATCH_SIZE
 from openpi.serving.va_split_jax.compile import JaxCompileConfig
+from openpi.serving.va_split_jax.compile import make_pi0_prefix_feature_template
+from openpi.serving.va_split_jax.compile import prune_split_model_for_role
 from openpi.serving.va_split_jax.runtime import JaxProcessVASplitRuntime
 from openpi.serving.va_split_jax.types import JaxActionResult
+from openpi.shared import array_typing as at
 from openpi.shared import download
 from openpi.training import checkpoints as _checkpoints
 from openpi.training import config as _config
@@ -201,7 +206,7 @@ def _normalize_uint8_images_for_vlm_ipc(inputs: dict[str, Any]) -> dict[str, Any
     return staged
 
 
-def _load_jax_model(train_config: _config.TrainConfig, checkpoint_dir: pathlib.Path | str):
+def _load_jax_model(train_config: _config.TrainConfig, checkpoint_dir: pathlib.Path | str, *, role: str | None = None):
     checkpoint_dir = pathlib.Path(checkpoint_dir)
     params_dir = checkpoint_dir / "params"
     if not params_dir.exists():
@@ -211,7 +216,66 @@ def _load_jax_model(train_config: _config.TrainConfig, checkpoint_dir: pathlib.P
                 "found only PyTorch model.safetensors. Download or provide a JAX checkpoint."
             )
         raise ValueError(f"JAX checkpoint params directory not found: {params_dir}")
+    if role is not None:
+        return _load_role_pruned_jax_model(train_config, params_dir, role=role)
     return train_config.model.load(_model.restore_params(params_dir, dtype=jnp.bfloat16))
+
+
+def _load_role_pruned_jax_model(train_config: _config.TrainConfig, params_dir: pathlib.Path, *, role: str):
+    model = nnx.eval_shape(train_config.model.create, jax.random.key(0))
+    model = prune_split_model_for_role(model, role=role)
+    graphdef, state = nnx.split(model)
+    target_params = state.to_pure_dict()
+    params = _restore_params_for_target_state(params_dir, target_params, dtype=jnp.bfloat16)
+    at.check_pytree_equality(expected=target_params, got=params, check_shapes=True, check_dtypes=False)
+    state.replace_by_pure_dict(params)
+    return nnx.merge(graphdef, state)
+
+
+def _restore_params_for_target_state(
+    params_dir: pathlib.Path,
+    target_params: at.Params,
+    *,
+    dtype: jnp.dtype | None,
+) -> at.Params:
+    mesh = jax.sharding.Mesh(jax.devices(), ("x",))
+    sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
+    with ocp.PyTreeCheckpointer() as ckptr:
+        metadata = ckptr.metadata(params_dir)
+        metadata_params = metadata["params"]
+        item = {"params": _make_role_restore_item(metadata_params, target_params)}
+        restore_args = jax.tree.map(
+            lambda value: ocp.PLACEHOLDER
+            if value is ocp.PLACEHOLDER
+            else ocp.ArrayRestoreArgs(sharding=sharding, restore_type=jax.Array, dtype=dtype),
+            item,
+            is_leaf=lambda value: value is ocp.PLACEHOLDER,
+        )
+        params = ckptr.restore(
+            params_dir,
+            ocp.args.PyTreeRestore(item=item, restore_args=restore_args),
+        )["params"]
+
+    flat_params = traverse_util.flatten_dict(params)
+    if flat_params and all(key_path[-1] == "value" for key_path in flat_params):
+        flat_params = {key_path[:-1]: value for key_path, value in flat_params.items()}
+        params = traverse_util.unflatten_dict(flat_params)
+    return ocp.transform_utils.intersect_trees(target_params, params)
+
+
+def _make_role_restore_item(metadata_params: at.Params, target_params: at.Params) -> at.Params:
+    flat_metadata = traverse_util.flatten_dict(metadata_params)
+    target_key_paths = set(traverse_util.flatten_dict(target_params))
+    metadata_has_value_suffix = bool(flat_metadata) and all(key_path[-1] == "value" for key_path in flat_metadata)
+    item = {}
+    for key_path, value in flat_metadata.items():
+        normalized_key_path = key_path[:-1] if metadata_has_value_suffix and key_path[-1] == "value" else key_path
+        item[key_path] = value if normalized_key_path in target_key_paths else ocp.PLACEHOLDER
+    return traverse_util.unflatten_dict(item)
+
+
+def _make_jax_prefix_feature_template(train_config: _config.TrainConfig):
+    return make_pi0_prefix_feature_template(train_config.model)
 
 
 def _mps_env_updates(sm_percent: int) -> dict[str, str | None]:
@@ -238,6 +302,8 @@ def create_trained_jax_va_split_policy(
     vlm_sm_percent: int = 0,
     result_timeout_s: float = 120.0,
     jax_compile: bool = True,
+    jax_compile_ae: bool = True,
+    jax_compile_vlm: bool = True,
     jax_compile_warmup: bool = True,
     jax_compile_warmup_max_batch_size: int | None = None,
 ) -> JaxVASplitPolicy:
@@ -265,6 +331,9 @@ def create_trained_jax_va_split_policy(
     )
     runtime = JaxProcessVASplitRuntime(
         model_factory=functools.partial(_load_jax_model, train_config, checkpoint_dir),
+        vlm_model_factory=functools.partial(_load_jax_model, train_config, checkpoint_dir, role="vlm"),
+        ae_model_factory=functools.partial(_load_jax_model, train_config, checkpoint_dir, role="ae"),
+        prefix_template_factory=functools.partial(_make_jax_prefix_feature_template, train_config),
         max_ae_batch_size=max_ae_batch_size,
         max_vlm_batch_size=max_vlm_batch_size,
         max_vlm_wait_ms=max_vlm_wait_ms,
@@ -274,6 +343,8 @@ def create_trained_jax_va_split_policy(
         compile_config=JaxCompileConfig(
             enabled=jax_compile,
             warmup_enabled=jax_compile_warmup,
+            compile_ae=jax_compile_ae,
+            compile_vlm=jax_compile_vlm,
             warmup_max_batch_size=warmup_max_batch_size,
             num_steps=int((sample_kwargs or {}).get("num_steps", 10)),
         ),

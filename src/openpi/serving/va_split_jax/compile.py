@@ -14,14 +14,26 @@ from openpi.serving.va_split_jax.device_slab import DeviceSlabBackend
 from openpi.serving.va_split_jax.prefix_cache_pool import JaxVlmPrefixCacheLanePool
 from openpi.shared import nnx_utils
 
-
 DEFAULT_WARMUP_MAX_BATCH_SIZE = 20
+_VLM_UNUSED_PI0_ATTRS = (
+    "action_in_proj",
+    "action_out_proj",
+    "time_mlp_in",
+    "time_mlp_out",
+    "state_proj",
+    "action_time_mlp_in",
+    "action_time_mlp_out",
+)
+_PALIGEMMA_LLM_EXPERT_INDEX = 0
+_ACTION_LLM_EXPERT_INDEX = 1
 
 
 @dataclass(frozen=True, slots=True)
 class JaxCompileConfig:
     enabled: bool = True
     warmup_enabled: bool = True
+    compile_ae: bool = True
+    compile_vlm: bool = True
     # Cover every batch size in [1, warmup_max_batch_size] (clamped by runtime capacity).
     # Split warmup defaults cap at 20 to keep peak memory lower than prefix capacity.
     warmup_max_batch_size: int = DEFAULT_WARMUP_MAX_BATCH_SIZE
@@ -31,20 +43,22 @@ class JaxCompileConfig:
 def maybe_jit_split_model(model: Any, config: JaxCompileConfig) -> Any:
     if not config.enabled:
         return model
-    model.build_prefix_feature = nnx_utils.module_jit(model.build_prefix_feature)
-    model.denoise_one_batch = nnx_utils.module_jit(model.denoise_one_batch)
+    if config.compile_vlm:
+        model.build_prefix_feature = nnx_utils.module_jit(model.build_prefix_feature)
+    if config.compile_ae:
+        model.denoise_one_batch = nnx_utils.module_jit(model.denoise_one_batch)
     return model
 
 
 def maybe_jit_vlm_model(model: Any, config: JaxCompileConfig) -> Any:
-    if not config.enabled:
+    if not config.enabled or not config.compile_vlm:
         return model
     model.build_prefix_feature = nnx_utils.module_jit(model.build_prefix_feature)
     return model
 
 
 def maybe_jit_ae_model(model: Any, config: JaxCompileConfig) -> Any:
-    if not config.enabled:
+    if not config.enabled or not config.compile_ae:
         return model
     model.denoise_one_batch = nnx_utils.module_jit(model.denoise_one_batch)
     return model
@@ -58,28 +72,15 @@ def maybe_jit_monolithic_model(model: Any, config: JaxCompileConfig) -> Any:
 
 
 def prune_split_model_for_role(model: Any, *, role: str) -> Any:
-    """Drop role-unused top-level modules before freezing NNX state for jit.
-
-    The PaliGemma LLM is intentionally kept in both roles: VLM uses it to build
-    prefix KV, and AE uses it to consume that KV during suffix denoising.
-    """
+    """Drop role-unused JAX split modules before freezing NNX state for jit."""
     if role == "vlm":
-        _delete_attrs(
-            model,
-            (
-                "action_in_proj",
-                "action_out_proj",
-                "time_mlp_in",
-                "time_mlp_out",
-                "state_proj",
-                "action_time_mlp_in",
-                "action_time_mlp_out",
-            ),
-        )
+        _delete_attrs(model, _VLM_UNUSED_PI0_ATTRS)
+        _prune_fused_paligemma_llm(model, expert_index=_ACTION_LLM_EXPERT_INDEX)
     elif role == "ae":
         paligemma = getattr(model, "PaliGemma", None)
-        if paligemma is not None and hasattr(paligemma, "img"):
-            delattr(paligemma, "img")
+        if paligemma is not None:
+            _delete_child(paligemma, "img")
+        _prune_fused_paligemma_llm(model, expert_index=_PALIGEMMA_LLM_EXPERT_INDEX)
     else:
         raise ValueError(f"Unsupported split model role: {role!r}")
     gc.collect()
@@ -90,8 +91,55 @@ def prune_split_model_for_role(model: Any, *, role: str) -> Any:
 
 def _delete_attrs(value: Any, names: tuple[str, ...]) -> None:
     for name in names:
-        if hasattr(value, name):
-            delattr(value, name)
+        _delete_child(value, name)
+
+
+def _prune_fused_paligemma_llm(model: Any, *, expert_index: int) -> None:
+    paligemma = getattr(model, "PaliGemma", None)
+    llm = None if paligemma is None else _get_child(paligemma, "llm")
+    if llm is None:
+        return
+
+    if expert_index == _PALIGEMMA_LLM_EXPERT_INDEX:
+        _delete_child(llm, "embedder")
+
+    suffix = "" if expert_index == _PALIGEMMA_LLM_EXPERT_INDEX else f"_{expert_index}"
+    _delete_child(llm, f"final_norm{suffix}")
+
+    layers = _get_child(llm, "layers")
+    if layers is None:
+        return
+    _delete_child(layers, f"pre_attention_norm{suffix}")
+    _delete_child(layers, f"pre_ffw_norm{suffix}")
+    _delete_child(layers, f"mlp{suffix}")
+
+    attn = _get_child(layers, "attn")
+    if attn is None:
+        return
+    for base_name in ("qkv_einsum", "q_einsum", "kv_einsum", "attn_vec_einsum"):
+        _delete_child(attn, f"{base_name}{suffix}")
+
+
+def _get_child(value: Any, name: str) -> Any:
+    if isinstance(value, dict):
+        return value.get(name)
+    return getattr(value, name, None)
+
+
+def _delete_child(value: Any, name: str) -> None:
+    if isinstance(value, dict):
+        value.pop(name, None)
+        return
+    _discard_linen_attribute(value, name)
+    if hasattr(value, name):
+        delattr(value, name)
+
+
+def _discard_linen_attribute(value: Any, name: str) -> None:
+    linen_attributes = getattr(value, "linen_attributes", None)
+    if linen_attributes is None or name not in linen_attributes:
+        return
+    value.linen_attributes = tuple(attr for attr in linen_attributes if attr != name)
 
 
 def planned_warmup_batches(*, max_batch_size: int, warmup_max_batch_size: int) -> tuple[tuple[int, int], ...]:
@@ -125,11 +173,11 @@ def runtime_aligned_denoise_state(
 
 def make_model_observation_factory(model: Any):
     """Construct Observation batches matching a loaded Pi0-like model."""
-    action_dim = int(getattr(model, "action_dim"))
-    max_token_len = int(getattr(model, "max_token_len"))
+    action_dim = int(model.action_dim)
+    max_token_len = int(model.max_token_len)
 
     def factory(batch_size: int):
-        from openpi.models import model as _model  # noqa: PLC0415
+        from openpi.models import model as _model
 
         image = jnp.ones((batch_size, *_model.IMAGE_RESOLUTION, 3), dtype=jnp.float32)
         return _model.Observation(
@@ -152,8 +200,8 @@ def make_model_observation_factory(model: Any):
 
 
 def make_model_noise_factory(model: Any):
-    action_horizon = int(getattr(model, "action_horizon"))
-    action_dim = int(getattr(model, "action_dim"))
+    action_horizon = int(model.action_horizon)
+    action_dim = int(model.action_dim)
 
     def factory(batch_size: int):
         return jnp.zeros((batch_size, action_horizon, action_dim), dtype=jnp.float32)
@@ -172,6 +220,44 @@ def make_prefix_feature_template(model: Any, observation_factory) -> JaxPrefixFe
     )
 
 
+def make_pi0_prefix_feature_template(model_config: Any) -> JaxPrefixFeature:
+    """Create a Pi0 prefix template from config metadata without running vision forward."""
+
+    from openpi.models import gemma as _gemma
+    from openpi.models import siglip as _siglip
+    from openpi.models.pi0_config import Pi0Config
+
+    if not isinstance(model_config, Pi0Config):
+        raise TypeError(f"make_pi0_prefix_feature_template only supports Pi0Config, got {type(model_config)!r}")
+
+    observation_spec, _ = model_config.inputs_spec(batch_size=1)
+    image_spec = next(iter(observation_spec.images.values()))
+    image_height = int(image_spec.shape[1])
+    image_width = int(image_spec.shape[2])
+    patch_h, patch_w = _siglip.decode_variant("So400m/14")["patch_size"]
+    image_tokens_per_image = (image_height // patch_h) * (image_width // patch_w)
+    prefix_len = len(observation_spec.images) * image_tokens_per_image + int(observation_spec.tokenized_prompt.shape[-1])
+
+    paligemma_config = _gemma.get_config(model_config.paligemma_variant)
+    kv_dtype = jnp.dtype(model_config.dtype)
+    kv_shape = (
+        paligemma_config.depth,
+        1,
+        prefix_len,
+        paligemma_config.num_kv_heads,
+        paligemma_config.head_dim,
+    )
+    past_key_values = (
+        jnp.zeros(kv_shape, dtype=kv_dtype),
+        jnp.zeros(kv_shape, dtype=kv_dtype),
+    )
+    return JaxPrefixFeature(
+        past_key_values=past_key_values,
+        prefix_pad_masks=jnp.ones((1, prefix_len), dtype=jnp.bool_),
+        state=jnp.zeros(observation_spec.state.shape, dtype=observation_spec.state.dtype),
+    )
+
+
 def _zeros_from_shape_dtype(value: Any) -> jax.Array:
     return jnp.zeros(value.shape, dtype=value.dtype)
 
@@ -183,7 +269,7 @@ def warmup_vlm_prefix_model(
     max_vlm_batch_size: int,
     config: JaxCompileConfig,
 ) -> dict[str, float]:
-    if not config.warmup_enabled:
+    if not config.warmup_enabled or not config.compile_vlm:
         return {"jax_warmup_batches": 0.0}
     batches = planned_warmup_batches(
         max_batch_size=max_vlm_batch_size,
@@ -215,7 +301,7 @@ def warmup_vlm_ae_slab_writes(
     from openpi.serving.va_split_jax.prefix_cache_pool import write_feature_batch_to_slab_tree
     from openpi.serving.va_split_jax.prefix_cache_pool import write_feature_to_slab_tree
 
-    if not config.warmup_enabled:
+    if not config.warmup_enabled or not config.compile_vlm:
         return {"jax_warmup_batches": 0.0}
     if max_vlm_batch_size <= 0:
         raise ValueError("max_vlm_batch_size must be positive")
@@ -268,7 +354,7 @@ def warmup_vlm_prefix_lane_pool(
     return warmup_vlm_ae_slab_writes(
         model=model,
         observation_factory=observation_factory,
-        backend=prefix_pool._backend,
+        backend=prefix_pool._backend,  # noqa: SLF001
         slab_tree=prefix_pool.local_slab_tree(),
         max_lanes=prefix_pool.max_lanes,
         max_vlm_batch_size=max_vlm_batch_size,
@@ -316,7 +402,7 @@ def warmup_ae_denoise_model(
     map for the true runtime cache key.
     """
     del backend  # retained for call-site compatibility
-    if not config.warmup_enabled:
+    if not config.warmup_enabled or not config.compile_ae:
         return {"jax_warmup_batches": 0.0}
     if max_ae_batch_size <= 0 or max_prefix_slots <= 0:
         raise ValueError("max_ae_batch_size and max_prefix_slots must be positive")
@@ -360,7 +446,7 @@ def warmup_ae_denoise_on_mapped_slabs(
     ``make_prefix_batch(slot_ids)`` should return the same prefix views AE uses
     in :meth:`JaxAEWorker.step_once` (IPC-opened or local mapped slabs).
     """
-    if not config.warmup_enabled:
+    if not config.warmup_enabled or not config.compile_ae:
         return {"jax_warmup_batches": 0.0}
     if max_ae_batch_size <= 0 or max_prefix_slots <= 0:
         raise ValueError("max_ae_batch_size and max_prefix_slots must be positive")
@@ -411,6 +497,8 @@ def warmup_split_model(
     config = JaxCompileConfig(
         enabled=config.enabled,
         warmup_enabled=config.warmup_enabled,
+        compile_ae=config.compile_ae,
+        compile_vlm=config.compile_vlm,
         warmup_max_batch_size=config.warmup_max_batch_size,
         num_steps=num_steps,
     )

@@ -216,6 +216,33 @@ class ProcessVASplitRuntime:
         self._result_queue = ctx.Queue()
         self._release_queue = ctx.Queue()
         self._ready_queue = ctx.Queue()
+        # Serial serving startup: load AE role weights first, then VLM.
+        # Avoids concurrent dual-process weight-load peaks on one GPU.
+        self._ae_process = ctx.Process(
+            target=_run_ae_process,
+            args=(
+                self._ae_model_factory,
+                device,
+                self._prefix_queue,
+                self._result_queue,
+                self._release_queue,
+                max_ae_batch_size,
+                max_prefix_slots,
+                ae_env_updates,
+                enable_component_timing,
+                self._ready_queue,
+            ),
+            daemon=True,
+        )
+        self._ae_process.start()
+        _collect_worker_ready(
+            self._ready_queue,
+            expected_roles=("ae",),
+            timeout_s=result_timeout_s,
+            vlm_process=None,
+            ae_process=self._ae_process,
+        )
+
         self._vlm_process = ctx.Process(
             target=_run_vlm_process,
             args=(
@@ -233,27 +260,10 @@ class ProcessVASplitRuntime:
             ),
             daemon=True,
         )
-        self._ae_process = ctx.Process(
-            target=_run_ae_process,
-            args=(
-                self._ae_model_factory,
-                device,
-                self._prefix_queue,
-                self._result_queue,
-                self._release_queue,
-                max_ae_batch_size,
-                max_prefix_slots,
-                ae_env_updates,
-                enable_component_timing,
-                self._ready_queue,
-            ),
-            daemon=True,
-        )
         self._vlm_process.start()
-        self._ae_process.start()
         _collect_worker_ready(
             self._ready_queue,
-            expected_roles=("vlm", "ae"),
+            expected_roles=("vlm",),
             timeout_s=result_timeout_s,
             vlm_process=self._vlm_process,
             ae_process=self._ae_process,

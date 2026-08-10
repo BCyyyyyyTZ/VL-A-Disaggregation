@@ -135,10 +135,17 @@ class DeviceSlabBackend:
         )
 
     def slice_lanes(self, slab: DeviceSlab, slot_ids: tuple[int, ...]) -> jax.Array:
-        """Return a dense-prefix device-side view for already-mapped lanes without reopening IPC."""
-        if slot_ids != tuple(range(len(slot_ids))):
-            raise ValueError("The first implementation only permits dense-prefix slot ids")
-        return self.view_batch(slab, len(slot_ids))
+        """Return a dense device-side batch gathered from physical lane ids."""
+        for slot_id in slot_ids:
+            if slot_id < 0 or slot_id >= slab.spec.max_lanes:
+                raise ValueError(f"slot_id {slot_id} outside slab capacity {slab.spec.max_lanes}")
+        if not slot_ids:
+            return self.view_batch(slab, 0)
+        lane_ids = jnp.asarray(slot_ids, dtype=jnp.int32)
+        return _logical_view_for_spec(
+            jnp.take(slab.array, lane_ids, axis=slab.spec.normalized_lane_axis),
+            slab.spec,
+        )
 
 
 class CudaIpcDeviceSlabBackend(DeviceSlabBackend):
@@ -166,22 +173,25 @@ class CudaIpcDeviceSlabBackend(DeviceSlabBackend):
     def open_slab(self, handle: DeviceSlabHandle) -> DeviceSlab:
         if handle.transport != self.transport:
             raise RuntimeError(f"unsupported slab transport {handle.transport!r}")
-        _select_numba_device(handle.device_ordinal)
+        print(
+            f"[cuda-ipc] open_slab begin name={handle.spec.name} shape={handle.spec.slab_shape} "
+            f"dtype={handle.spec.dtype} ordinal={handle.device_ordinal}",
+            flush=True,
+        )
         stack = contextlib.ExitStack()
         try:
-            ipc_array = stack.enter_context(
-                cuda.open_ipc_array(
-                    tuple(handle.handle_bytes),
-                    handle.spec.slab_shape,
-                    _storage_dtype_for_spec(handle.spec),
-                    strides=handle.strides,
-                    offset=handle.offset,
-                )
-            )
+            # Prefer driver.IpcHandle + explicit Numba context over cuda.open_ipc_array.
+            # The helper uses @require_context/current_context() and SIGSEGVs on the
+            # second open in a process (JAX/XLA foreign context + multi-slab import).
+            print("[cuda-ipc] driver.IpcHandle.open_array begin", flush=True)
+            ipc_array = stack.enter_context(_open_cuda_ipc_device_array(handle))
+            print("[cuda-ipc] driver.IpcHandle.open_array done; jnp.asarray begin", flush=True)
             array = jnp.asarray(ipc_array)
             array.block_until_ready()
+            print("[cuda-ipc] jnp.asarray done", flush=True)
             if array.unsafe_buffer_pointer() != ipc_array.device_ctypes_pointer.value:
                 raise RuntimeError("JAX imported IPC slab by copy instead of aliasing the opened device allocation")
+            print(f"[cuda-ipc] open_slab done name={handle.spec.name}", flush=True)
             return DeviceSlab(handle.spec, array, handle, stack)
         except Exception:
             stack.close()
@@ -287,6 +297,38 @@ def make_default_device_slab_backend() -> DeviceSlabBackend:
 
 def has_cuda_device() -> bool:
     return _has_cuda_device()
+
+
+@contextlib.contextmanager
+def _open_cuda_ipc_device_array(handle: DeviceSlabHandle) -> Iterator[Any]:
+    """Open a producer IPC allocation without numba.cuda.open_ipc_array.
+
+    ``cuda.open_ipc_array`` is a thin wrapper around ``driver.IpcHandle`` that
+    selects the CUDA context via ``@require_context`` / ``current_context()``.
+    After JAX/XLA has attached a foreign context (or after the first IPC open),
+    a second call reliably SIGSEGVs in this environment. Opening through an
+    explicit context from ``_select_numba_device`` is stable for many slabs.
+    """
+    context = _select_numba_device(handle.device_ordinal)
+    dtype = np.dtype(_storage_dtype_for_spec(handle.spec))
+    shape = tuple(handle.spec.slab_shape)
+    size = int(np.prod(shape)) * int(dtype.itemsize)
+    handle_bytes = bytes(handle.handle_bytes)
+    if driver.USE_NV_BINDING:
+        driver_handle = driver.binding.CUipcMemHandle()
+        driver_handle.reserved = handle_bytes
+    else:
+        driver_handle = driver.drvapi.cu_ipc_mem_handle(*handle_bytes)
+    ipchandle = driver.IpcHandle(None, driver_handle, size, offset=int(handle.offset))
+    try:
+        yield ipchandle.open_array(
+            context,
+            shape=shape,
+            strides=handle.strides,
+            dtype=dtype,
+        )
+    finally:
+        ipchandle.close()
 
 
 def _export_cuda_ipc_handle(spec: DeviceSlabSpec, array: jax.Array) -> DeviceSlabHandle:

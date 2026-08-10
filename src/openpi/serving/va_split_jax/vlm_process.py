@@ -16,6 +16,7 @@ import numpy as np
 from openpi.models import model as _model
 from openpi.models.jax_split_types import JaxPrefixFeature
 from openpi.models.jax_split_types import JaxPrefixSlotHandle
+from openpi.serving.va_split_jax import timeline_log
 from openpi.serving.va_split_jax.device_slab import DeviceSlab
 from openpi.serving.va_split_jax.device_slab import DeviceSlabBackend
 from openpi.serving.va_split_jax.device_slab import DeviceSlabHandle
@@ -23,7 +24,6 @@ from openpi.serving.va_split_jax.device_slab import make_default_device_slab_bac
 from openpi.serving.va_split_jax.prefix_cache_pool import JaxVlmPrefixCacheLanePool
 from openpi.serving.va_split_jax.prefix_cache_pool import write_feature_batch_to_slab_tree
 from openpi.serving.va_split_jax.prefix_cache_pool import write_feature_to_slab_tree
-from openpi.serving.va_split_jax import timeline_log
 from openpi.serving.va_split_jax.timing import timed_queue_get
 from openpi.serving.va_split_jax.types import JaxBatchRequestEnvelope
 from openpi.serving.va_split_jax.types import JaxLaneCredits
@@ -33,7 +33,6 @@ from openpi.serving.va_split_jax.types import JaxReleaseFeature
 from openpi.serving.va_split_jax.types import JaxRequestEnvelope
 from openpi.serving.va_split_jax.types import JaxShutdown
 from openpi.serving.va_split_jax.types import JaxWorkerError
-
 
 _BACKLOG_DRAIN_PER_ROW_MS = 2.0
 _BACKLOG_DRAIN_MAX_MS = 25.0
@@ -97,16 +96,43 @@ class JaxVLMWorker:
 
     def grant_lane_credits(self, credits: JaxLaneCredits | JaxReleaseFeature) -> None:
         if isinstance(credits, JaxReleaseFeature):
-            lane_ids = (credits.slot_id,)
+            lane_ids = (int(credits.slot_id),)
         else:
-            lane_ids = credits.lane_ids
+            lane_ids = tuple(int(lane_id) for lane_id in credits.lane_ids)
+        before = self.available_live_feature_slots
         owned = set(self._lane_credits)
+        granted: list[int] = []
+        skipped: list[int] = []
         for lane_id in lane_ids:
             lid = int(lane_id)
+            self._validate_lane_id(lid)
             if lid in owned:
+                skipped.append(lid)
+                continue
+            # A credit that would overfill available+outstanding is stale or duplicate;
+            # accepting it lets the heap lease an AE-active physical lane again.
+            if len(self._lane_credits) + self.active_count >= self._max_live_features:
+                skipped.append(lid)
                 continue
             heapq.heappush(self._lane_credits, lid)
             owned.add(lid)
+            granted.append(lid)
+        timeline_log.emit(
+            "vlm_credit_grant",
+            kind=type(credits).__name__,
+            req=credits.request_id if isinstance(credits, JaxReleaseFeature) else None,
+            slot=int(credits.slot_id) if isinstance(credits, JaxReleaseFeature) else None,
+            before=before,
+            after=self.available_live_feature_slots,
+            granted=granted,
+            skipped=skipped,
+            outstanding=self.active_count,
+            held=self.available_live_feature_slots + self.active_count,
+        )
+
+    def _validate_lane_id(self, lane_id: int) -> None:
+        if lane_id < 0 or lane_id >= self._max_live_features:
+            raise ValueError(f"lane_id {lane_id} outside VLM live feature capacity {self._max_live_features}")
 
     def has_live_feature_capacity(self, batch_size: int) -> bool:
         return batch_size <= self.available_live_feature_slots
@@ -182,8 +208,29 @@ class JaxVLMWorker:
         )
 
     def release(self, release: JaxReleaseFeature) -> None:
-        self._outstanding.discard(release.request_id)
+        if release.request_id not in self._outstanding:
+            timeline_log.emit(
+                "vlm_credit_release_skip",
+                req=release.request_id,
+                slot=int(release.slot_id),
+                reason="request_not_outstanding",
+                outstanding=self.active_count,
+            )
+            return
+        self._outstanding.remove(release.request_id)
         self.grant_lane_credits(release)
+
+    def _rollback_taken_lane_credits(
+        self,
+        *,
+        request_ids: tuple[str, ...] | list[str],
+        slot_ids: tuple[int, ...] | list[int],
+    ) -> None:
+        """Return lane credits after a failed handoff (before AE observes PrefixReady)."""
+        for request_id in request_ids:
+            self._outstanding.discard(request_id)
+        if slot_ids:
+            self.grant_lane_credits(JaxLaneCredits(lane_ids=tuple(int(slot_id) for slot_id in slot_ids)))
 
     def _take_credit(self) -> int:
         if not self._lane_credits:
@@ -254,58 +301,75 @@ class JaxVLMWorker:
 
         num_steps = int(sample_kwargs.get("num_steps", 10))
         write_start_ns = time.monotonic_ns()
-        timeline_log.emit("vlm_slab_write_begin", batch=batch_size, reqs=list(request_ids))
-        slot_ids = tuple(self._take_credit() for _ in range(batch_size))
-        used_batch_slab_write = self._write_feature_to_lanes(slot_ids, feature)
-        write_ms = (time.monotonic_ns() - write_start_ns) / 1_000_000
-        per_row_write_ms = write_ms / max(batch_size, 1)
-        row_prefix_shape_tree = _prefix_feature_single_row_shape_tree(feature)
-        prefix_dtype_tree = _prefix_feature_dtype_tree(feature)
-        ready: list[JaxPrefixReady] = []
-        for row, request_id in enumerate(request_ids):
-            slot_id = slot_ids[row]
-            self._outstanding.add(request_id)
-            enqueue_ns = enqueue_ns_by_row[row]
-            dequeue_ns = dequeue_ns_by_row[row] or enqueue_ns
-            queue_wait_ms, transfer_ms = _vlm_request_queue_timings(
-                enqueue_ns=enqueue_ns,
-                dequeue_start_ns=dequeue_start_ns_by_row[row],
-                dequeue_ns=dequeue_ns,
-            )
-            batch_wait_ms = max(0.0, (input_stage_start_ns - dequeue_ns) / 1_000_000)
-            row_kwargs = _sample_kwargs_for_row(sample_kwargs, row, batch_size)
-            ready.append(
-                JaxPrefixReady(
-                    request_id=request_id,
-                    slot_handle=JaxPrefixSlotHandle(
-                        slot_id=slot_id,
-                        batch_rows=1,
-                        prefix_shape_tree=row_prefix_shape_tree,
-                        prefix_dtype_tree=prefix_dtype_tree,
-                    ),
-                    num_steps=num_steps,
-                    sample_kwargs=row_kwargs,
-                    timing={
-                        "vlm_prefix_forward_ms": elapsed_ms,
-                        "vlm_effective_batch": float(batch_size),
-                        "vlm_request_queue_wait_ms": queue_wait_ms,
-                        "vlm_request_transfer_ms": transfer_ms,
-                        "vlm_queue_wait_ms": batch_wait_ms,
-                        "vlm_batch_wait_ms": batch_wait_ms,
-                        "vlm_input_stage_ms": input_stage_ms,
-                        **input_stage_timing,
-                        "vlm_slab_write_ms": per_row_write_ms,
-                        "vlm_slab_write_total_ms": write_ms,
-                        "vlm_slab_write_contiguous_batch": 1.0 if used_batch_slab_write else 0.0,
-                        "vlm_slab_write_rows": float(batch_size),
-                    },
+        timeline_log.emit(
+            "vlm_slab_write_begin",
+            batch=batch_size,
+            reqs=list(request_ids),
+            available_before=self.available_live_feature_slots,
+            outstanding=self.active_count,
+        )
+        slot_ids: list[int] = []
+        try:
+            slot_ids.extend(self._take_credit() for _ in range(batch_size))
+            slot_id_tuple = tuple(slot_ids)
+            used_batch_slab_write = self._write_feature_to_lanes(slot_id_tuple, feature)
+            write_ms = (time.monotonic_ns() - write_start_ns) / 1_000_000
+            per_row_write_ms = write_ms / max(batch_size, 1)
+            row_prefix_shape_tree = _prefix_feature_single_row_shape_tree(feature)
+            prefix_dtype_tree = _prefix_feature_dtype_tree(feature)
+            ready: list[JaxPrefixReady] = []
+            for row, request_id in enumerate(request_ids):
+                slot_id = slot_id_tuple[row]
+                self._outstanding.add(request_id)
+                enqueue_ns = enqueue_ns_by_row[row]
+                dequeue_ns = dequeue_ns_by_row[row] or enqueue_ns
+                queue_wait_ms, transfer_ms = _vlm_request_queue_timings(
+                    enqueue_ns=enqueue_ns,
+                    dequeue_start_ns=dequeue_start_ns_by_row[row],
+                    dequeue_ns=dequeue_ns,
                 )
-            )
+                batch_wait_ms = max(0.0, (input_stage_start_ns - dequeue_ns) / 1_000_000)
+                row_kwargs = _sample_kwargs_for_row(sample_kwargs, row, batch_size)
+                ready.append(
+                    JaxPrefixReady(
+                        request_id=request_id,
+                        slot_handle=JaxPrefixSlotHandle(
+                            slot_id=slot_id,
+                            batch_rows=1,
+                            prefix_shape_tree=row_prefix_shape_tree,
+                            prefix_dtype_tree=prefix_dtype_tree,
+                        ),
+                        num_steps=num_steps,
+                        sample_kwargs=row_kwargs,
+                        timing={
+                            "vlm_prefix_forward_ms": elapsed_ms,
+                            "vlm_effective_batch": float(batch_size),
+                            "vlm_request_queue_wait_ms": queue_wait_ms,
+                            "vlm_request_transfer_ms": transfer_ms,
+                            "vlm_queue_wait_ms": batch_wait_ms,
+                            "vlm_batch_wait_ms": batch_wait_ms,
+                            "vlm_input_stage_ms": input_stage_ms,
+                            **input_stage_timing,
+                            "vlm_slab_write_ms": per_row_write_ms,
+                            "vlm_slab_write_total_ms": write_ms,
+                            "vlm_slab_write_contiguous_batch": 1.0 if used_batch_slab_write else 0.0,
+                            "vlm_slab_write_rows": float(batch_size),
+                        },
+                    )
+                )
+        except Exception:
+            # Credits are taken before AE observes PrefixReady. Any failure here must
+            # recycle them or the lane pool permanently shrinks for this runtime.
+            self._rollback_taken_lane_credits(request_ids=request_ids, slot_ids=slot_ids)
+            raise
         timeline_log.emit(
             "vlm_slab_write_end",
             batch=batch_size,
             reqs=list(request_ids),
+            slots=list(slot_id_tuple),
             ms=round(write_ms, 3),
+            available_after=self.available_live_feature_slots,
+            outstanding=self.active_count,
         )
         return ready
 
@@ -344,6 +408,7 @@ class JaxVLMProcess:
 
     def wait_for_ae_export(self, *, timeout_s: float | None = None) -> None:
         """Block until AE publishes PrefixSlabReady + LaneCredits on the release queue."""
+        timeline_log.configure("vlm")
         deadline = None if timeout_s is None else time.monotonic() + timeout_s
         saw_slab = self.worker.has_ae_slab
         saw_credits = self.worker.available_live_feature_slots > 0
@@ -409,7 +474,9 @@ class JaxVLMProcess:
                         )
                 continue
             if not isinstance(message, JaxRequestEnvelope):
-                self._prefix_queue.put(JaxWorkerError(request_id=None, error=f"Unexpected VLM message: {type(message)}"))
+                self._prefix_queue.put(
+                    JaxWorkerError(request_id=None, error=f"Unexpected VLM message: {type(message)}")
+                )
                 continue
             if not self._defer_until_live_feature_capacity(message, 1):
                 continue
@@ -420,6 +487,13 @@ class JaxVLMProcess:
             shutdown_after_batch = False
             try:
                 requests, shutdown_after_batch = self._collect_fcfs_batch(message)
+                timeline_log.emit(
+                    "vlm_batch_dispatch",
+                    batch=len(requests),
+                    available_before=self.worker.available_live_feature_slots,
+                    backlog=len(self._backlog),
+                    reqs=[request.request_id for request in requests],
+                )
                 self._put_prefix_batch(self.worker.handle_batch(requests))
             except Exception as exc:  # pragma: no cover
                 for request in requests:
@@ -440,15 +514,24 @@ class JaxVLMProcess:
                 self.worker.release(message)
             elif isinstance(message, JaxLaneCredits):
                 self.worker.grant_lane_credits(message)
-            elif isinstance(message, JaxPrefixSlabReady):
-                if not self.worker.has_ae_slab:
-                    self.worker.attach_ae_slab(message, JaxLaneCredits(lane_ids=()))
+            elif isinstance(message, JaxPrefixSlabReady) and not self.worker.has_ae_slab:
+                self.worker.attach_ae_slab(message, JaxLaneCredits(lane_ids=()))
 
     def _put_prefix_batch(self, ready_messages: list[JaxPrefixReady]) -> None:
-        for ready in ready_messages:
-            timing = dict(ready.timing or {})
-            timing["_prefix_enqueue_ns"] = float(time.monotonic_ns())
-            self._prefix_queue.put(replace(ready, timing=timing))
+        sent = 0
+        try:
+            for ready in ready_messages:
+                timing = dict(ready.timing or {})
+                timing["_prefix_enqueue_ns"] = float(time.monotonic_ns())
+                self._prefix_queue.put(replace(ready, timing=timing))
+                sent += 1
+        except Exception:
+            # PrefixReady never reached AE for the unsent tail; recycle those credits.
+            for ready in ready_messages[sent:]:
+                self.worker.release(
+                    JaxReleaseFeature(request_id=ready.request_id, slot_id=int(ready.slot_handle.slot_id))
+                )
+            raise
 
     def _collect_fcfs_batch(self, first_request: JaxRequestEnvelope) -> tuple[list[JaxRequestEnvelope], bool]:
         requests = [first_request]
@@ -457,6 +540,13 @@ class JaxVLMProcess:
         collect_start_ns = time.monotonic_ns()
         deadline_ns = self._fcfs_collect_deadline_ns(first_request, collect_start_ns=collect_start_ns)
         self._drain_releases()
+        timeline_log.emit(
+            "vlm_batch_collect_begin",
+            first=first_request.request_id,
+            limit=self._current_fcfs_batch_limit(),
+            available=self.worker.available_live_feature_slots,
+            backlog=len(self._backlog),
+        )
 
         while len(requests) < self._current_fcfs_batch_limit():
             self._drain_releases()
@@ -477,6 +567,15 @@ class JaxVLMProcess:
                 self._backlog.appendleft(message)
                 break
             requests.append(message)
+        timeline_log.emit(
+            "vlm_batch_collect_end",
+            batch=len(requests),
+            limit=self._current_fcfs_batch_limit(),
+            available=self.worker.available_live_feature_slots,
+            backlog=len(self._backlog),
+            shutdown_after_batch=shutdown_after_batch,
+            reqs=[request.request_id for request in requests],
+        )
         return requests, shutdown_after_batch
 
     def _current_fcfs_batch_limit(self) -> int:
@@ -544,6 +643,13 @@ class JaxVLMProcess:
                 )
             return False
         self._backlog.appendleft(message)
+        timeline_log.emit(
+            "vlm_capacity_defer",
+            requested=batch_size,
+            available=available,
+            max_live_features=max_live_features,
+            backlog=len(self._backlog),
+        )
         time.sleep(0.001)
         return False
 
@@ -659,15 +765,16 @@ def _fast_observation_from_dict(data: dict[str, Any]) -> tuple[_model.Observatio
     other_images = 0
     for key, value in data["image"].items():
         dtype = _numpy_dtype(value)
+        image_value = value
         if dtype == np.dtype(np.uint8):
             uint8_images += 1
-            value = value.astype(jnp.float32) / 255.0 * 2.0 - 1.0
-            _block_jax_tree(value)
+            image_value = value.astype(jnp.float32) / 255.0 * 2.0 - 1.0
+            _block_jax_tree(image_value)
         elif dtype == np.dtype(np.float32):
             float32_images += 1
         else:
             other_images += 1
-        images[key] = value
+        images[key] = image_value
     normalize_ms = (time.monotonic_ns() - normalize_start_ns) / 1_000_000
 
     construct_start_ns = time.monotonic_ns()

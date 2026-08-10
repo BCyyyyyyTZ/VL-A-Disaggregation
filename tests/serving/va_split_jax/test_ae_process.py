@@ -119,6 +119,80 @@ def _actions_array(actions):
     return actions
 
 
+def test_jax_ae_worker_does_not_emit_claim_vacated_credit():
+    backend = make_default_device_slab_backend()
+    pool = JaxVlmPrefixCacheLanePool(max_lanes=4, backend=backend)
+    pool.initialize_from_feature(_feature(0.0))
+    pool.write_lane(2, _feature(3.0))
+    worker = JaxAEWorker(model=FakeJaxAEModel(), max_batch_size=4, max_prefix_slots=4, backend=backend, owned_pool=pool)
+    worker.attach_initialized_pool(pool)
+
+    worker.add_prefix(_ready("req-1", 2, num_steps=1))
+
+    assert worker.take_pending_lane_credits() is None
+    _results, releases = worker.step_once()
+    assert releases == [JaxReleaseFeature(request_id="req-1", slot_id=2)]
+    assert worker.take_pending_lane_credits() is None
+
+
+def test_jax_ae_worker_returns_physical_release_credit_when_idle():
+    backend = make_default_device_slab_backend()
+    pool = JaxVlmPrefixCacheLanePool(max_lanes=4, backend=backend)
+    pool.initialize_from_feature(_feature(0.0))
+    pool.write_lane(2, _feature(3.0))
+    worker = JaxAEWorker(model=FakeJaxAEModel(), max_batch_size=4, max_prefix_slots=4, backend=backend, owned_pool=pool)
+    worker.attach_initialized_pool(pool)
+
+    worker.add_prefix(_ready("req-1", 2, num_steps=1))
+
+    assert worker.take_pending_lane_credits() is None
+    _results, releases = worker.step_once()
+    assert releases == [JaxReleaseFeature(request_id="req-1", slot_id=2)]
+    assert worker.take_pending_lane_credits() is None
+
+
+def test_jax_ae_worker_returns_each_completed_physical_lane_after_burst():
+    backend = make_default_device_slab_backend()
+    pool = JaxVlmPrefixCacheLanePool(max_lanes=4, backend=backend)
+    pool.initialize_from_feature(_feature(0.0))
+    pool.write_lane(1, _feature(1.0))
+    pool.write_lane(2, _feature(2.0))
+    pool.write_lane(3, _feature(3.0))
+    worker = JaxAEWorker(model=FakeJaxAEModel(), max_batch_size=4, max_prefix_slots=4, backend=backend, owned_pool=pool)
+    worker.attach_initialized_pool(pool)
+
+    worker.add_prefix(_ready("req-1", 1))
+    worker.add_prefix(_ready("req-2", 2))
+    worker.add_prefix(_ready("req-3", 3))
+
+    assert worker.take_pending_lane_credits() is None
+    _results, releases = worker.step_once()
+    assert releases == [
+        JaxReleaseFeature(request_id="req-1", slot_id=1),
+        JaxReleaseFeature(request_id="req-2", slot_id=2),
+        JaxReleaseFeature(request_id="req-3", slot_id=3),
+    ]
+    assert worker.take_pending_lane_credits() is None
+
+
+def test_jax_ae_worker_close_clears_sparse_owned_pool_lanes():
+    backend = make_default_device_slab_backend()
+    pool = JaxVlmPrefixCacheLanePool(max_lanes=4, backend=backend)
+    pool.initialize_from_feature(_feature(0.0))
+    pool.write_lane(1, _feature(1.0))
+    pool.write_lane(3, _feature(3.0))
+    pool.claim_written_lane("req-1", 1)
+    pool.claim_written_lane("req-3", 3)
+    worker = JaxAEWorker(model=FakeJaxAEModel(), max_batch_size=4, max_prefix_slots=4, backend=backend, owned_pool=pool)
+    worker.attach_initialized_pool(pool)
+
+    worker.close()
+
+    assert pool.active_count == 0
+    assert pool.request_id_at_lane(1) is None
+    assert pool.request_id_at_lane(3) is None
+
+
 def test_jax_ae_worker_batches_two_ready_requests_for_two_denoise_steps():
     model = FakeJaxAEModel()
     backend, pool = _owned_pool_with_written_lanes(1.0, 2.0)
@@ -170,7 +244,7 @@ def test_jax_ae_worker_accepts_host_noise_from_prefix_ready():
     assert results[0].timing["ae_init_denoise_noise_fast_path"] == 1.0
 
 
-def test_jax_ae_worker_compacts_locally_without_slot_moved():
+def test_jax_ae_worker_compacts_dense_state_without_moving_prefix_slot():
     backend, pool = _owned_pool_with_written_lanes(1.0, 2.0)
     worker = JaxAEWorker(model=FakeJaxAEModel(), max_batch_size=2, max_prefix_slots=4, backend=backend, owned_pool=pool)
     worker.attach_initialized_pool(pool)
@@ -179,9 +253,10 @@ def test_jax_ae_worker_compacts_locally_without_slot_moved():
 
     results, releases = worker.step_once()
     assert [result.request_id for result in results] == ["req-1"]
-    assert releases == [JaxReleaseFeature(request_id="req-1", slot_id=1)]
+    assert releases == [JaxReleaseFeature(request_id="req-1", slot_id=0)]
     assert [request.request_id for request in worker.select_ready_lanes()] == ["req-2"]
     assert worker.active["req-2"].active_lane_id == 0
+    assert pool.request_id_at_lane(1) == "req-2"
 
 
 def test_jax_ae_process_waits_for_free_prefix_slot_before_draining_more_ready_messages():

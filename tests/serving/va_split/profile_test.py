@@ -172,6 +172,8 @@ def test_jax_e2e_warmup_until_steady_skips_cold_spikes_before_return(monkeypatch
 def test_args_defaults_to_jax_compile_enabled():
     args = profile_va_split.Args()
     assert args.jax_compile is True
+    assert args.jax_compile_ae is True
+    assert args.jax_compile_vlm is True
     assert args.jax_compile_warmup is True
     assert args.jax_compile_warmup_max_batch_size is None
 
@@ -508,10 +510,10 @@ def test_pytorch_compile_warmup_batch_plan_enumerates_all_shapes():
     assert profile_va_split.pytorch_compile_warmup_batch_plan(24) == tuple(
         (batch_size, 1) for batch_size in range(1, 25)
     )
-    # VA-split keeps runtime prefix capacity at 24 but caps compile warmup at 20 by default.
+    # VA-split keeps runtime prefix capacity at 24 but caps compile warmup at 2x VLM capacity by default.
     assert profile_va_split.profile_warmup_max_batch_size(
         profile_va_split.Args(mode="split-mps", max_vlm_batch_size=8, max_ae_batch_size=999)
-    ) == 20
+    ) == 16
     assert profile_va_split.profile_warmup_max_batch_size(
         profile_va_split.Args(mode="monolithic", batch_size=8)
     ) == 8
@@ -813,7 +815,9 @@ def test_create_policy_for_mode_forwards_split_compile_warmup_cap_to_jax(monkeyp
     )
 
     assert policy == "jax-split-policy"
-    assert captured_kwargs["jax_compile_warmup_max_batch_size"] == 20
+    assert captured_kwargs["jax_compile_warmup_max_batch_size"] == 16
+    assert captured_kwargs["jax_compile_ae"] is True
+    assert captured_kwargs["jax_compile_vlm"] is True
 
 
 
@@ -987,7 +991,16 @@ def test_main_writes_json_with_numpy_actions(tmp_path, monkeypatch):
         policy_timing={"infer_ms": 1.0},
         actions=np.asarray([[1.0, 2.0]], dtype=np.float32),
     )
-    result = profile_va_split.BenchmarkResult(traces=[trace], summary={"num_requests": 1})
+    failed_trace = profile_va_split.RequestTrace(
+        request_id="req-2",
+        scheduled_at_s=0.0,
+        submitted_at_s=0.0,
+        completed_at_s=0.2,
+        status="error",
+        policy_timing={},
+        error="RuntimeError('bad lane credit')",
+    )
+    result = profile_va_split.BenchmarkResult(traces=[trace, failed_trace], summary={"num_requests": 2})
     monkeypatch.setattr(profile_va_split, "run_profile", lambda args: result)
 
     profile_va_split.main(
@@ -998,9 +1011,10 @@ def test_main_writes_json_with_numpy_actions(tmp_path, monkeypatch):
     )
 
     payload = json.loads(output_path.read_text(encoding="utf-8"))
-    assert payload["summary"] == {"num_requests": 1}
+    assert payload["summary"] == {"num_requests": 2}
     assert "traces" not in payload
-    assert payload["per_request_e2e_ms"] == {"req-1": 100.0}
+    assert payload["per_request_e2e_ms"] == {"req-1": 100.0, "req-2": 200.0}
+    assert payload["failed_errors"] == {"req-2": "RuntimeError('bad lane credit')"}
 
 
 def test_validate_mps_environment_requires_pipe_dir(monkeypatch):

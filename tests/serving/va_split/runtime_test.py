@@ -198,11 +198,19 @@ def test_process_runtime_waits_for_both_workers_before_result_thread(monkeypatch
     def collect_ready(_queue, *, expected_roles, timeout_s, vlm_process, ae_process):
         del timeout_s
         events.append("ready:" + ",".join(expected_roles))
-        assert expected_roles == ("vlm", "ae")
-        assert vlm_process is processes["vlm"]
-        assert ae_process is processes["ae"]
-        assert processes["vlm"].started
-        assert processes["ae"].started
+        if expected_roles == ("ae",):
+            assert vlm_process is None
+            assert ae_process is processes["ae"]
+            assert processes["ae"].started
+            assert "vlm" not in processes
+            return
+        if expected_roles == ("vlm",):
+            assert vlm_process is processes["vlm"]
+            assert ae_process is processes["ae"]
+            assert processes["vlm"].started
+            assert processes["ae"].started
+            return
+        raise AssertionError(f"Unexpected ready roles: {expected_roles!r}")
 
     monkeypatch.setattr(runtime_module.torch.multiprocessing, "get_context", lambda _start_method: FakeContext())
     monkeypatch.setattr(runtime_module.threading, "Thread", FakeThread)
@@ -214,7 +222,9 @@ def test_process_runtime_waits_for_both_workers_before_result_thread(monkeypatch
         start_method="spawn",
     )
 
-    assert events.index("ready:vlm,ae") > max(events.index("start:vlm"), events.index("start:ae"))
+    assert events.index("start:ae") < events.index("ready:ae")
+    assert events.index("ready:ae") < events.index("start:vlm")
+    assert events.index("start:vlm") < events.index("ready:vlm")
     assert events[-1] == "thread:start"
     assert runtime._vlm_process is processes["vlm"]
     assert runtime._ae_process is processes["ae"]
@@ -280,5 +290,6 @@ def test_process_runtime_passes_role_specific_model_factories(monkeypatch):
     assert runtime._model_factory is base_factory
     assert runtime._vlm_model_factory is vlm_factory
     assert runtime._ae_model_factory is ae_factory
-    assert process_args[0][0] is vlm_factory
-    assert process_args[1][0] is ae_factory
+    # Serial startup constructs AE first, then VLM.
+    assert process_args[0][0] is ae_factory
+    assert process_args[1][0] is vlm_factory

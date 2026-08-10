@@ -155,12 +155,17 @@ def test_device_slab_handle_opens_in_consumer_process():
     assert consumer.exitcode == 0
 
 
-def test_device_slab_rejects_sparse_slot_view():
+def test_device_slab_slices_sparse_slot_view_by_physical_lane():
     backend = make_default_device_slab_backend()
     slab = backend.create_slab(DeviceSlabSpec(name="x", shape=(1, 2, 3), dtype="float32", max_lanes=4))
-    with pytest.raises(ValueError, match="dense-prefix"):
-        backend.slice_lanes(slab, (0, 2))
-    slab.close()
+    try:
+        backend.copy_lane_from_array(slab, 0, jnp.full((1, 2, 3), 1.0, dtype=jnp.float32))
+        backend.copy_lane_from_array(slab, 2, jnp.full((1, 2, 3), 3.0, dtype=jnp.float32))
+        batch = backend.slice_lanes(slab, (2, 0))
+        np.testing.assert_allclose(np.asarray(batch[0]), np.full((2, 3), 3.0, dtype=np.float32))
+        np.testing.assert_allclose(np.asarray(batch[1]), np.full((2, 3), 1.0, dtype=np.float32))
+    finally:
+        slab.close()
 
 
 def test_cuda_copy_lane_uses_stream_sync_not_device_or_slab_sync():

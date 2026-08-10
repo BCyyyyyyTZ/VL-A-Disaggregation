@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import jax.numpy as jnp
 import numpy as np
+import orbax.checkpoint as ocp
 import pytest
 
 from openpi.policies import jax_va_split_policy
@@ -139,3 +140,27 @@ def test_load_jax_model_rejects_pytorch_only_checkpoint(tmp_path):
 
     with pytest.raises(ValueError, match="JAX checkpoint"):
         jax_va_split_policy._load_jax_model(train_config, tmp_path)  # noqa: SLF001
+
+
+def test_restore_params_for_target_state_skips_extra_value_suffix_leaves(tmp_path):
+    params_dir = tmp_path / "params"
+    with ocp.PyTreeCheckpointer() as ckptr:
+        ckptr.save(
+            params_dir,
+            {
+                "params": {
+                    "keep": {"value": jnp.ones((2,), dtype=jnp.float32)},
+                    "drop": {"value": jnp.ones((3,), dtype=jnp.float32)},
+                }
+            },
+        )
+
+    restored = jax_va_split_policy._restore_params_for_target_state(  # noqa: SLF001
+        params_dir,
+        {"keep": jnp.zeros((2,), dtype=jnp.float32)},
+        dtype=jnp.bfloat16,
+    )
+
+    assert sorted(restored) == ["keep"]
+    assert restored["keep"].shape == (2,)
+    assert restored["keep"].dtype == jnp.bfloat16

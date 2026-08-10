@@ -5,9 +5,13 @@ import contextlib
 from dataclasses import replace
 import multiprocessing as mp
 import os
+from pathlib import Path
 import queue
+import signal
+import subprocess
 import threading
 import time
+import traceback
 from typing import Any
 import uuid
 
@@ -122,9 +126,10 @@ class JaxLocalVASplitRuntime:
         )
         for ready in ready_messages:
             self.ae_worker.add_prefix(ready)
-            pending = self.ae_worker.take_pending_lane_credits()
-            if pending is not None:
-                self.vlm_worker.grant_lane_credits(pending)
+        # Defer lane credits until the whole admit burst settles.
+        pending = self.ae_worker.take_pending_lane_credits()
+        if pending is not None:
+            self.vlm_worker.grant_lane_credits(pending)
 
         results_by_id: dict[str, JaxActionResult] = {}
         while len(results_by_id) < batch_size:
@@ -164,6 +169,102 @@ def _apply_env_updates(env_updates: dict[str, str | None] | None) -> None:
             os.environ[key] = value
 
 
+def _apply_jax_compilation_cache_config() -> None:
+    cache_dir = os.environ.get("JAX_COMPILATION_CACHE_DIR")
+    if cache_dir:
+        jax.config.update("jax_compilation_cache_dir", cache_dir)
+
+    enable_cache = os.environ.get("JAX_ENABLE_COMPILATION_CACHE")
+    if enable_cache is not None:
+        jax.config.update("jax_enable_compilation_cache", _parse_env_bool(enable_cache))
+
+    min_compile_time = os.environ.get("JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS")
+    if min_compile_time is not None:
+        jax.config.update("jax_persistent_cache_min_compile_time_secs", float(min_compile_time))
+
+    min_entry_size = os.environ.get("JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES")
+    if min_entry_size is not None:
+        jax.config.update("jax_persistent_cache_min_entry_size_bytes", int(min_entry_size))
+
+
+def _parse_env_bool(value: str) -> bool:
+    return value.strip().lower() not in {"0", "false", "no", "off"}
+
+
+_MPS_ENV_KEYS = (
+    "CUDA_MPS_PIPE_DIRECTORY",
+    "CUDA_MPS_LOG_DIRECTORY",
+    "CUDA_MPS_ACTIVE_THREAD_PERCENTAGE",
+)
+
+
+def _without_mps_env(env_updates: dict[str, str | None] | None) -> dict[str, str | None]:
+    updates = dict(env_updates or {})
+    for key in _MPS_ENV_KEYS:
+        updates[key] = None
+    return updates
+
+
+def _cleanup_mps_pipe_dir(pipe_dir: str) -> None:
+    for name in (
+        "control",
+        "control_privileged",
+        "control_lock",
+        "log",
+        "nvidia-cuda-mps-control.pid",
+    ):
+        with contextlib.suppress(OSError):
+            Path(pipe_dir, name).unlink()
+
+
+def _stop_mps_daemon() -> bool:
+    pipe_dir = os.environ.get("CUDA_MPS_PIPE_DIRECTORY")
+    if not pipe_dir:
+        return False
+    print(f"[jax-split] stopping MPS before final weight load ({pipe_dir})", flush=True)
+    env = os.environ.copy()
+    env["CUDA_MPS_PIPE_DIRECTORY"] = pipe_dir
+    log_dir = os.environ.get("CUDA_MPS_LOG_DIRECTORY")
+    if log_dir:
+        env["CUDA_MPS_LOG_DIRECTORY"] = log_dir
+    subprocess.run(
+        ["nvidia-cuda-mps-control"],
+        input="quit\n",
+        text=True,
+        env=env,
+        check=False,
+        capture_output=True,
+    )
+    time.sleep(0.5)
+    _cleanup_mps_pipe_dir(pipe_dir)
+    return True
+
+
+def _start_mps_daemon(*, timeout_s: float = 10.0) -> bool:
+    pipe_dir = os.environ.get("CUDA_MPS_PIPE_DIRECTORY")
+    if not pipe_dir:
+        return False
+    log_dir = os.environ.get("CUDA_MPS_LOG_DIRECTORY", pipe_dir)
+    Path(pipe_dir).mkdir(parents=True, exist_ok=True)
+    Path(log_dir).mkdir(parents=True, exist_ok=True)
+    _cleanup_mps_pipe_dir(pipe_dir)
+    print(f"[jax-split] starting MPS before profile ({pipe_dir})", flush=True)
+    env = os.environ.copy()
+    env["CUDA_MPS_PIPE_DIRECTORY"] = pipe_dir
+    env["CUDA_MPS_LOG_DIRECTORY"] = log_dir
+    subprocess.run(["nvidia-cuda-mps-control", "-d"], env=env, check=False)
+    deadline = time.monotonic() + max(timeout_s, 1.0)
+    while time.monotonic() < deadline:
+        if (
+            Path(pipe_dir, "control").exists()
+            or Path(pipe_dir, "control_lock").exists()
+            or Path(pipe_dir, "log").exists()
+        ):
+            return True
+        time.sleep(0.2)
+    raise RuntimeError(f"Failed to restart MPS control daemon at {pipe_dir}")
+
+
 def _run_jax_vlm_process(
     model_factory,
     request_queue,
@@ -177,14 +278,26 @@ def _run_jax_vlm_process(
     warmup_queue=None,
     ready_queue=None,
     warmup_start_queue=None,
+    *,
+    run_after_warmup: bool = True,
+    wait_for_ae_export: bool = True,
+    warmup_ae_slab_writes: bool = True,
 ) -> None:
+    def _phase(msg: str) -> None:
+        print(f"[jax-vlm] {msg}", flush=True)
+
     _apply_env_updates(env_updates)
+    _apply_jax_compilation_cache_config()
+    _phase("load model begin")
     model = model_factory()
+    _phase("load model done")
     observation_factory = make_model_observation_factory(model)
     model = prune_split_model_for_role(model, role="vlm")
+    _phase("prune done")
     vlm_warmup_batches = 0.0
     if compile_config is not None:
         model = maybe_jit_vlm_model(model, compile_config)
+        _phase("maybe_jit done")
     backend = make_default_device_slab_backend()
     process = JaxVLMProcess(
         model=model,
@@ -196,11 +309,16 @@ def _run_jax_vlm_process(
         max_live_features=max_prefix_slots,
         backend=backend,
     )
+    _phase("process constructed")
     if ready_queue is not None:
         ready_queue.put("vlm")
+        _phase("ready sent")
     if warmup_start_queue is not None:
+        _phase("wait warmup_start")
         warmup_start_queue.get()
+        _phase("warmup_start received")
     if compile_config is not None and warmup_queue is not None:
+        _phase("prefix warmup begin")
         stats = warmup_vlm_prefix_model(
             model=model,
             observation_factory=observation_factory,
@@ -208,21 +326,39 @@ def _run_jax_vlm_process(
             config=compile_config,
         )
         vlm_warmup_batches = float(stats["jax_warmup_batches"])
-    # AE-first handshake: wait for slab export + credits on release_queue.
-    process.wait_for_ae_export()
-    if compile_config is not None and warmup_queue is not None and process.worker._writable_slab_tree is not None:
+        _phase(f"prefix warmup done batches={vlm_warmup_batches}")
+    if wait_for_ae_export:
+        # AE-first handshake: wait for slab export + credits on release_queue.
+        _phase("wait_for_ae_export begin")
+        process.wait_for_ae_export()
+        _phase("wait_for_ae_export done")
+    writable_slab_tree = process.worker._writable_slab_tree if wait_for_ae_export else None  # noqa: SLF001
+    if (
+        wait_for_ae_export
+        and warmup_ae_slab_writes
+        and compile_config is not None
+        and warmup_queue is not None
+        and writable_slab_tree is not None
+    ):
+        _phase("slab-write warmup begin")
         pool_stats = warmup_vlm_ae_slab_writes(
             model=model,
             observation_factory=observation_factory,
             backend=backend,
-            slab_tree=process.worker._writable_slab_tree,
+            slab_tree=writable_slab_tree,
             max_lanes=max_prefix_slots,
             max_vlm_batch_size=max_vlm_batch_size,
             config=compile_config,
         )
         vlm_warmup_batches += float(pool_stats["jax_warmup_batches"])
+        _phase(f"slab-write warmup done batches={pool_stats['jax_warmup_batches']}")
     if warmup_queue is not None:
         warmup_queue.put(JaxCompileWarmupDone(role="vlm", jax_warmup_batches=vlm_warmup_batches))
+        _phase("WarmupDone sent")
+    if not run_after_warmup:
+        _phase("exit after warmup")
+        return
+    _phase("process.run begin")
     process.run()
 
 
@@ -238,12 +374,20 @@ def _run_jax_ae_process(
     warmup_queue=None,
     ready_queue=None,
     warmup_start_queue=None,
+    prefix_template_factory=None,
+    *,
+    run_after_warmup: bool = True,
 ) -> None:
     _apply_env_updates(env_updates)
+    _apply_jax_compilation_cache_config()
     model = model_factory()
     observation_factory = make_model_observation_factory(model)
     noise_factory = make_model_noise_factory(model) if compile_config is not None else None
-    template = make_prefix_feature_template(model, observation_factory)
+    template = (
+        prefix_template_factory()
+        if prefix_template_factory is not None
+        else make_prefix_feature_template(model, observation_factory)
+    )
     model = prune_split_model_for_role(model, role="ae")
     if compile_config is not None:
         model = maybe_jit_ae_model(model, compile_config)
@@ -264,7 +408,427 @@ def _run_jax_ae_process(
     ipc_batches = process.bootstrap_owned_pool(template)
     if warmup_queue is not None:
         warmup_queue.put(JaxCompileWarmupDone(role="ae", jax_warmup_batches=float(ipc_batches)))
+    if not run_after_warmup:
+        return
     process.run()
+
+
+def _run_jax_process_entrypoint(role: str, target, warmup_queue, target_args: tuple, target_kwargs: dict) -> None:
+    try:
+        target(*target_args, **target_kwargs)
+    except Exception as exc:
+        if warmup_queue is not None:
+            with contextlib.suppress(Exception):
+                warmup_queue.put(
+                    JaxWorkerError(
+                        request_id=None,
+                        error=f"{role} process failed before/while reporting compile warmup: {exc}",
+                        traceback=traceback.format_exc(),
+                    )
+                )
+        raise
+
+
+def _start_jax_ae_process(
+    ctx,
+    *,
+    model_factory,
+    prefix_queue,
+    result_queue,
+    release_queue,
+    max_ae_batch_size: int,
+    max_prefix_slots: int,
+    compile_config: JaxCompileConfig | None,
+    env_updates: dict[str, str | None] | None,
+    warmup_queue,
+    ready_queue,
+    warmup_start_queue,
+    prefix_template_factory,
+    run_after_warmup: bool,
+):
+    target_args = (
+        model_factory,
+        prefix_queue,
+        result_queue,
+        release_queue,
+        max_ae_batch_size,
+        max_prefix_slots,
+        compile_config,
+        env_updates,
+        warmup_queue,
+        ready_queue,
+        warmup_start_queue,
+        prefix_template_factory,
+    )
+    process = ctx.Process(
+        target=_run_jax_process_entrypoint,
+        args=(
+            "ae",
+            _run_jax_ae_process,
+            warmup_queue,
+            target_args,
+            {"run_after_warmup": run_after_warmup},
+        ),
+        daemon=True,
+    )
+    process.start()
+    return process
+
+
+def _start_jax_vlm_process(
+    ctx,
+    *,
+    model_factory,
+    request_queue,
+    prefix_queue,
+    release_queue,
+    max_vlm_batch_size: int,
+    max_vlm_wait_ms: float,
+    max_prefix_slots: int,
+    compile_config: JaxCompileConfig | None,
+    env_updates: dict[str, str | None] | None,
+    warmup_queue,
+    ready_queue,
+    warmup_start_queue,
+    run_after_warmup: bool,
+    wait_for_ae_export: bool,
+    warmup_ae_slab_writes: bool,
+):
+    target_args = (
+        model_factory,
+        request_queue,
+        prefix_queue,
+        release_queue,
+        max_vlm_batch_size,
+        max_vlm_wait_ms,
+        max_prefix_slots,
+        compile_config,
+        env_updates,
+        warmup_queue,
+        ready_queue,
+        warmup_start_queue,
+    )
+    process = ctx.Process(
+        target=_run_jax_process_entrypoint,
+        args=(
+            "vlm",
+            _run_jax_vlm_process,
+            warmup_queue,
+            target_args,
+            {
+                "run_after_warmup": run_after_warmup,
+                "wait_for_ae_export": wait_for_ae_export,
+                "warmup_ae_slab_writes": warmup_ae_slab_writes,
+            },
+        ),
+        daemon=True,
+    )
+    process.start()
+    return process
+
+
+def _should_stage_compile_warmup(compile_config: JaxCompileConfig | None) -> bool:
+    return (
+        compile_config is not None
+        and compile_config.enabled
+        and compile_config.warmup_enabled
+        and (compile_config.compile_ae or compile_config.compile_vlm)
+    )
+
+
+def _run_staged_compile_warmup(
+    ctx,
+    *,
+    model_factory=None,
+    vlm_model_factory=None,
+    ae_model_factory=None,
+    prefix_template_factory=None,
+    max_ae_batch_size: int,
+    max_vlm_batch_size: int,
+    max_vlm_wait_ms: float,
+    max_prefix_slots: int,
+    ae_env_updates: dict[str, str | None] | None,
+    vlm_env_updates: dict[str, str | None] | None,
+    compile_config: JaxCompileConfig,
+    timeout_s: float,
+) -> dict[str, float]:
+    vlm_model_factory = vlm_model_factory or model_factory
+    ae_model_factory = ae_model_factory or model_factory
+    if vlm_model_factory is None or ae_model_factory is None:
+        raise ValueError("JAX staged compile warmup requires model factories")
+
+    warmed = 0.0
+    if compile_config.compile_ae:
+        ae_timing = _run_staged_ae_compile_warmup(
+            ctx,
+            model_factory=ae_model_factory,
+            prefix_template_factory=prefix_template_factory,
+            max_ae_batch_size=max_ae_batch_size,
+            max_prefix_slots=max_prefix_slots,
+            ae_env_updates=ae_env_updates,
+            compile_config=compile_config,
+            timeout_s=timeout_s,
+        )
+        warmed += float(ae_timing["jax_warmup_batches"])
+    if compile_config.compile_vlm:
+        vlm_timing = _run_staged_vlm_compile_warmup(
+            ctx,
+            model_factory=vlm_model_factory,
+            max_vlm_batch_size=max_vlm_batch_size,
+            max_vlm_wait_ms=max_vlm_wait_ms,
+            max_prefix_slots=max_prefix_slots,
+            vlm_env_updates=vlm_env_updates,
+            compile_config=compile_config,
+            timeout_s=timeout_s,
+        )
+        warmed += float(vlm_timing["jax_warmup_batches"])
+    return {"jax_warmup_batches": warmed}
+
+
+def _run_staged_ae_compile_warmup(
+    ctx,
+    *,
+    model_factory,
+    prefix_template_factory,
+    max_ae_batch_size: int,
+    max_prefix_slots: int,
+    ae_env_updates: dict[str, str | None] | None,
+    compile_config: JaxCompileConfig,
+    timeout_s: float,
+) -> dict[str, float]:
+    prefix_queue = ctx.Queue()
+    result_queue = ctx.Queue()
+    release_queue = ctx.Queue()
+    warmup_queue = ctx.Queue()
+    ready_queue = ctx.Queue()
+    warmup_start_queue = ctx.Queue()
+    process = None
+    try:
+        process = _start_jax_ae_process(
+            ctx,
+            model_factory=model_factory,
+            prefix_queue=prefix_queue,
+            result_queue=result_queue,
+            release_queue=release_queue,
+            max_ae_batch_size=max_ae_batch_size,
+            max_prefix_slots=max_prefix_slots,
+            compile_config=compile_config,
+            env_updates=ae_env_updates,
+            warmup_queue=warmup_queue,
+            ready_queue=ready_queue,
+            warmup_start_queue=warmup_start_queue,
+            prefix_template_factory=prefix_template_factory,
+            run_after_warmup=False,
+        )
+        _collect_worker_ready(
+            ready_queue,
+            expected_roles=("ae",),
+            timeout_s=timeout_s,
+            vlm_process=None,
+            ae_process=process,
+        )
+        warmup_start_queue.put("go")
+        timing = _collect_compile_warmup(
+            warmup_queue,
+            expected_roles=("ae",),
+            timeout_s=timeout_s,
+            vlm_process=None,
+            ae_process=process,
+        )
+        _join_compile_warmup_process(process, role="AE", timeout_s=timeout_s)
+        process = None
+        return timing
+    except BaseException:
+        _terminate_processes((process,))
+        raise
+
+
+def _run_staged_vlm_compile_warmup(
+    ctx,
+    *,
+    model_factory,
+    max_vlm_batch_size: int,
+    max_vlm_wait_ms: float,
+    max_prefix_slots: int,
+    vlm_env_updates: dict[str, str | None] | None,
+    compile_config: JaxCompileConfig,
+    timeout_s: float,
+) -> dict[str, float]:
+    request_queue = ctx.Queue()
+    prefix_queue = ctx.Queue()
+    release_queue = ctx.Queue()
+    warmup_queue = ctx.Queue()
+    ready_queue = ctx.Queue()
+    warmup_start_queue = ctx.Queue()
+    process = None
+    try:
+        process = _start_jax_vlm_process(
+            ctx,
+            model_factory=model_factory,
+            request_queue=request_queue,
+            prefix_queue=prefix_queue,
+            release_queue=release_queue,
+            max_vlm_batch_size=max_vlm_batch_size,
+            max_vlm_wait_ms=max_vlm_wait_ms,
+            max_prefix_slots=max_prefix_slots,
+            compile_config=compile_config,
+            env_updates=vlm_env_updates,
+            warmup_queue=warmup_queue,
+            ready_queue=ready_queue,
+            warmup_start_queue=warmup_start_queue,
+            run_after_warmup=False,
+            wait_for_ae_export=False,
+            warmup_ae_slab_writes=False,
+        )
+        _collect_worker_ready(
+            ready_queue,
+            expected_roles=("vlm",),
+            timeout_s=timeout_s,
+            vlm_process=process,
+            ae_process=None,
+        )
+        warmup_start_queue.put("go")
+        timing = _collect_compile_warmup(
+            warmup_queue,
+            expected_roles=("vlm",),
+            timeout_s=timeout_s,
+            vlm_process=process,
+            ae_process=None,
+        )
+        _join_compile_warmup_process(process, role="VLM", timeout_s=timeout_s)
+        process = None
+        return timing
+    except BaseException:
+        _terminate_processes((process,))
+        raise
+
+
+def _join_compile_warmup_process(process, *, role: str, timeout_s: float) -> None:
+    process.join(timeout=max(timeout_s, 1.0))
+    if not process.is_alive():
+        return
+    process.terminate()
+    process.join(timeout=5)
+    raise RuntimeError(f"{role} compile warmup process did not exit after reporting warmup complete")
+
+
+def _terminate_processes(processes) -> None:
+    for process in processes:
+        if process is None:
+            continue
+        with contextlib.suppress(Exception):
+            if process.is_alive():
+                process.terminate()
+        with contextlib.suppress(Exception):
+            process.join(timeout=5)
+
+
+def _start_serial_serving_pair(
+    ctx,
+    *,
+    ae_model_factory,
+    vlm_model_factory,
+    prefix_template_factory,
+    request_queue,
+    prefix_queue,
+    result_queue,
+    release_queue,
+    warmup_queue,
+    ready_queue,
+    ae_warmup_start_queue,
+    vlm_warmup_start_queue,
+    max_ae_batch_size: int,
+    max_vlm_batch_size: int,
+    max_vlm_wait_ms: float,
+    max_prefix_slots: int,
+    compile_config: JaxCompileConfig | None,
+    ae_env_updates: dict[str, str | None] | None,
+    vlm_env_updates: dict[str, str | None] | None,
+    final_warmup_queue,
+    final_ae_warmup_start_queue,
+    final_vlm_warmup_start_queue,
+    startup_timeout_s: float,
+    startup_phase: str,
+):
+    """Start AE then VLM serially; wait for each role's ready/handshake barrier."""
+    ae_process = _start_jax_ae_process(
+        ctx,
+        model_factory=ae_model_factory,
+        prefix_queue=prefix_queue,
+        result_queue=result_queue,
+        release_queue=release_queue,
+        max_ae_batch_size=max_ae_batch_size,
+        max_prefix_slots=max_prefix_slots,
+        compile_config=compile_config,
+        env_updates=ae_env_updates,
+        warmup_queue=final_warmup_queue,
+        ready_queue=ready_queue,
+        warmup_start_queue=final_ae_warmup_start_queue,
+        prefix_template_factory=prefix_template_factory,
+        run_after_warmup=True,
+    )
+    try:
+        _collect_worker_ready(
+            ready_queue,
+            expected_roles=("ae",),
+            timeout_s=startup_timeout_s,
+            vlm_process=None,
+            ae_process=ae_process,
+        )
+        ae_compile_timing = {"jax_warmup_batches": 0.0}
+        if final_warmup_queue is not None:
+            if final_ae_warmup_start_queue is not None:
+                ae_warmup_start_queue.put("go")
+            ae_compile_timing = _collect_compile_warmup(
+                warmup_queue,
+                expected_roles=("ae",),
+                timeout_s=startup_timeout_s,
+                vlm_process=None,
+                ae_process=ae_process,
+                phase=startup_phase,
+            )
+
+        vlm_process = _start_jax_vlm_process(
+            ctx,
+            model_factory=vlm_model_factory,
+            request_queue=request_queue,
+            prefix_queue=prefix_queue,
+            release_queue=release_queue,
+            max_vlm_batch_size=max_vlm_batch_size,
+            max_vlm_wait_ms=max_vlm_wait_ms,
+            max_prefix_slots=max_prefix_slots,
+            compile_config=compile_config,
+            env_updates=vlm_env_updates,
+            warmup_queue=final_warmup_queue,
+            ready_queue=ready_queue,
+            warmup_start_queue=final_vlm_warmup_start_queue,
+            run_after_warmup=True,
+            wait_for_ae_export=True,
+            warmup_ae_slab_writes=True,
+        )
+        _collect_worker_ready(
+            ready_queue,
+            expected_roles=("vlm",),
+            timeout_s=startup_timeout_s,
+            vlm_process=vlm_process,
+            ae_process=ae_process,
+        )
+        vlm_compile_timing = {"jax_warmup_batches": 0.0}
+        if final_warmup_queue is not None:
+            if final_vlm_warmup_start_queue is not None:
+                vlm_warmup_start_queue.put("go")
+            vlm_compile_timing = _collect_compile_warmup(
+                warmup_queue,
+                expected_roles=("vlm",),
+                timeout_s=startup_timeout_s,
+                vlm_process=vlm_process,
+                ae_process=ae_process,
+                phase=startup_phase,
+            )
+        return ae_process, vlm_process, ae_compile_timing, vlm_compile_timing
+    except BaseException:
+        _terminate_processes((ae_process, locals().get("vlm_process")))
+        raise
 
 
 class JaxProcessVASplitRuntime:
@@ -272,6 +836,9 @@ class JaxProcessVASplitRuntime:
         self,
         *,
         model_factory: Callable[[], object],
+        vlm_model_factory: Callable[[], object] | None = None,
+        ae_model_factory: Callable[[], object] | None = None,
+        prefix_template_factory: Callable[[], object] | None = None,
         max_ae_batch_size: int = 8,
         max_vlm_batch_size: int = 8,
         max_vlm_wait_ms: float = 2.0,
@@ -292,6 +859,10 @@ class JaxProcessVASplitRuntime:
         self._closed = False
         self._condition = threading.Condition()
         self._compile_timing = {"jax_warmup_batches": 0.0}
+        self._model_factory = model_factory
+        self._vlm_model_factory = vlm_model_factory or model_factory
+        self._ae_model_factory = ae_model_factory or model_factory
+        self._prefix_template_factory = prefix_template_factory
 
         ctx = mp.get_context(start_method)
         self._request_queue = ctx.Queue()
@@ -302,73 +873,138 @@ class JaxProcessVASplitRuntime:
         self._ready_queue = ctx.Queue()
         self._ae_warmup_start_queue = ctx.Queue()
         self._vlm_warmup_start_queue = ctx.Queue()
-        self._ae_process = ctx.Process(
-            target=_run_jax_ae_process,
-            args=(
-                model_factory,
-                self._prefix_queue,
-                self._result_queue,
-                self._release_queue,
-                max_ae_batch_size,
-                max_prefix_slots,
-                compile_config,
-                ae_env_updates,
-                self._warmup_queue,
-                self._ready_queue,
-                self._ae_warmup_start_queue,
-            ),
-            daemon=True,
-        )
-        self._vlm_process = ctx.Process(
-            target=_run_jax_vlm_process,
-            args=(
-                model_factory,
-                self._request_queue,
-                self._prefix_queue,
-                self._release_queue,
-                max_vlm_batch_size,
-                max_vlm_wait_ms,
-                max_prefix_slots,
-                compile_config,
-                vlm_env_updates,
-                self._warmup_queue,
-                self._ready_queue,
-                self._vlm_warmup_start_queue,
-            ),
-            daemon=True,
-        )
-        self._ae_process.start()
-        self._vlm_process.start()
-        _collect_worker_ready(
-            self._ready_queue,
-            expected_roles=("ae", "vlm"),
-            timeout_s=warmup_timeout_s if warmup_timeout_s is not None else result_timeout_s,
-            vlm_process=self._vlm_process,
-            ae_process=self._ae_process,
-        )
-        self._ae_warmup_start_queue.put("go")
-        ae_compile_timing = _collect_compile_warmup(
-            self._warmup_queue,
-            expected_roles=("ae",),
-            timeout_s=warmup_timeout_s if warmup_timeout_s is not None else result_timeout_s,
-            vlm_process=self._vlm_process,
-            ae_process=self._ae_process,
-        )
-        self._vlm_warmup_start_queue.put("go")
-        vlm_compile_timing = _collect_compile_warmup(
-            self._warmup_queue,
-            expected_roles=("vlm",),
-            timeout_s=warmup_timeout_s if warmup_timeout_s is not None else result_timeout_s,
-            vlm_process=self._vlm_process,
-            ae_process=self._ae_process,
-        )
-        self._compile_timing = {
-            "jax_warmup_batches": float(
-                ae_compile_timing["jax_warmup_batches"] + vlm_compile_timing["jax_warmup_batches"]
+        startup_timeout_s = warmup_timeout_s if warmup_timeout_s is not None else result_timeout_s
+        self._ae_process = None
+        self._vlm_process = None
+        self._result_thread = None
+        final_compile_config = compile_config
+        staged_compile_warmup = _should_stage_compile_warmup(compile_config)
+        try:
+            if staged_compile_warmup:
+                self._compile_timing = _run_staged_compile_warmup(
+                    ctx,
+                    vlm_model_factory=self._vlm_model_factory,
+                    ae_model_factory=self._ae_model_factory,
+                    prefix_template_factory=self._prefix_template_factory,
+                    max_ae_batch_size=max_ae_batch_size,
+                    max_vlm_batch_size=max_vlm_batch_size,
+                    max_vlm_wait_ms=max_vlm_wait_ms,
+                    max_prefix_slots=max_prefix_slots,
+                    ae_env_updates=ae_env_updates,
+                    vlm_env_updates=vlm_env_updates,
+                    compile_config=compile_config,
+                    timeout_s=startup_timeout_s,
+                )
+                final_compile_config = replace(compile_config, warmup_enabled=False)
+                final_warmup_queue = self._warmup_queue
+                final_ae_warmup_start_queue = None
+                final_vlm_warmup_start_queue = None
+            else:
+                final_warmup_queue = self._warmup_queue
+                final_ae_warmup_start_queue = self._ae_warmup_start_queue
+                final_vlm_warmup_start_queue = self._vlm_warmup_start_queue
+
+            # After staged compile, load the serving pair without MPS first (avoids
+            # MPS+IPC dual-client crashes during weight load / slab attach). Then
+            # restart MPS and respawn the serving pair under MPS for profiling.
+            mps_pipe_configured = bool(os.environ.get("CUDA_MPS_PIPE_DIRECTORY"))
+            reload_under_mps = staged_compile_warmup and mps_pipe_configured
+            startup_phase = (
+                "reporting startup handshake" if staged_compile_warmup else "reporting compile warmup"
             )
-        }
-        self._result_thread = threading.Thread(target=self._collect_results, daemon=True)
-        self._result_thread.start()
+            if reload_under_mps:
+                _stop_mps_daemon()
+                ae_env_for_load = _without_mps_env(ae_env_updates)
+                vlm_env_for_load = _without_mps_env(vlm_env_updates)
+                load_phase = "reporting startup handshake (no-MPS load)"
+            else:
+                ae_env_for_load = ae_env_updates
+                vlm_env_for_load = vlm_env_updates
+                load_phase = startup_phase
+
+            self._ae_process, self._vlm_process, ae_compile_timing, vlm_compile_timing = _start_serial_serving_pair(
+                ctx,
+                ae_model_factory=self._ae_model_factory,
+                vlm_model_factory=self._vlm_model_factory,
+                prefix_template_factory=self._prefix_template_factory,
+                request_queue=self._request_queue,
+                prefix_queue=self._prefix_queue,
+                result_queue=self._result_queue,
+                release_queue=self._release_queue,
+                warmup_queue=self._warmup_queue,
+                ready_queue=self._ready_queue,
+                ae_warmup_start_queue=self._ae_warmup_start_queue,
+                vlm_warmup_start_queue=self._vlm_warmup_start_queue,
+                max_ae_batch_size=max_ae_batch_size,
+                max_vlm_batch_size=max_vlm_batch_size,
+                max_vlm_wait_ms=max_vlm_wait_ms,
+                max_prefix_slots=max_prefix_slots,
+                compile_config=final_compile_config,
+                ae_env_updates=ae_env_for_load,
+                vlm_env_updates=vlm_env_for_load,
+                final_warmup_queue=final_warmup_queue,
+                final_ae_warmup_start_queue=final_ae_warmup_start_queue,
+                final_vlm_warmup_start_queue=final_vlm_warmup_start_queue,
+                startup_timeout_s=startup_timeout_s,
+                startup_phase=load_phase,
+            )
+
+            if reload_under_mps:
+                print(
+                    "[jax-split] no-MPS final load+handshake ok; "
+                    "respawning AE/VLM under MPS for profile",
+                    flush=True,
+                )
+                _terminate_processes((self._vlm_process, self._ae_process))
+                self._vlm_process = None
+                self._ae_process = None
+                self._request_queue = ctx.Queue()
+                self._prefix_queue = ctx.Queue()
+                self._result_queue = ctx.Queue()
+                self._release_queue = ctx.Queue()
+                self._warmup_queue = ctx.Queue()
+                self._ready_queue = ctx.Queue()
+                self._ae_warmup_start_queue = ctx.Queue()
+                self._vlm_warmup_start_queue = ctx.Queue()
+                _start_mps_daemon()
+                self._ae_process, self._vlm_process, _, _ = _start_serial_serving_pair(
+                    ctx,
+                    ae_model_factory=self._ae_model_factory,
+                    vlm_model_factory=self._vlm_model_factory,
+                    prefix_template_factory=self._prefix_template_factory,
+                    request_queue=self._request_queue,
+                    prefix_queue=self._prefix_queue,
+                    result_queue=self._result_queue,
+                    release_queue=self._release_queue,
+                    warmup_queue=self._warmup_queue,
+                    ready_queue=self._ready_queue,
+                    ae_warmup_start_queue=self._ae_warmup_start_queue,
+                    vlm_warmup_start_queue=self._vlm_warmup_start_queue,
+                    max_ae_batch_size=max_ae_batch_size,
+                    max_vlm_batch_size=max_vlm_batch_size,
+                    max_vlm_wait_ms=max_vlm_wait_ms,
+                    max_prefix_slots=max_prefix_slots,
+                    compile_config=final_compile_config,
+                    ae_env_updates=ae_env_updates,
+                    vlm_env_updates=vlm_env_updates,
+                    final_warmup_queue=self._warmup_queue,
+                    final_ae_warmup_start_queue=None,
+                    final_vlm_warmup_start_queue=None,
+                    startup_timeout_s=startup_timeout_s,
+                    startup_phase="reporting startup handshake (MPS profile)",
+                )
+
+            if not staged_compile_warmup:
+                self._compile_timing = {
+                    "jax_warmup_batches": float(
+                        ae_compile_timing["jax_warmup_batches"] + vlm_compile_timing["jax_warmup_batches"]
+                    )
+                }
+            self._result_thread = threading.Thread(target=self._collect_results, daemon=True)
+            self._result_thread.start()
+        except BaseException:
+            _terminate_processes((self._vlm_process, self._ae_process))
+            raise
 
     def infer(self, observation: dict, sample_kwargs: dict) -> JaxActionResult:
         if self._closed:
@@ -472,9 +1108,9 @@ def _collect_worker_ready(
     seen: set[str] = set()
     while len(seen) < len(expected_roles):
         if vlm_process is not None and not vlm_process.is_alive() and "vlm" not in seen:
-            raise RuntimeError("VLM process exited before reporting ready")
+            raise RuntimeError(_process_exited_message("VLM", vlm_process, "reporting ready"))
         if ae_process is not None and not ae_process.is_alive() and "ae" not in seen:
-            raise RuntimeError("AE process exited before reporting ready")
+            raise RuntimeError(_process_exited_message("AE", ae_process, "reporting ready"))
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             missing = sorted(set(expected_roles) - seen)
@@ -493,6 +1129,17 @@ def _worker_error_to_runtime_error(error: JaxWorkerError) -> RuntimeError:
     return RuntimeError(f"JAX VA split worker failed for {error.request_id}: {error.error}{detail}")
 
 
+def _process_exited_message(role: str, process, phase: str) -> str:
+    exitcode = getattr(process, "exitcode", None)
+    if exitcode is None:
+        return f"{role} process exited before {phase}"
+    signal_name = ""
+    if exitcode < 0:
+        with contextlib.suppress(ValueError):
+            signal_name = f" ({signal.Signals(-exitcode).name})"
+    return f"{role} process exited before {phase} (exitcode={exitcode}{signal_name})"
+
+
 def _collect_compile_warmup(
     warmup_queue,
     *,
@@ -500,14 +1147,11 @@ def _collect_compile_warmup(
     timeout_s: float,
     vlm_process,
     ae_process,
+    phase: str = "reporting compile warmup",
 ) -> dict[str, float]:
     deadline = time.monotonic() + max(timeout_s, 1.0)
     seen: dict[str, float] = {}
     while len(seen) < len(expected_roles):
-        if vlm_process is not None and not vlm_process.is_alive() and "vlm" not in seen:
-            raise RuntimeError("VLM process exited before reporting compile warmup")
-        if ae_process is not None and not ae_process.is_alive() and "ae" not in seen:
-            raise RuntimeError("AE process exited before reporting compile warmup")
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             missing = sorted(set(expected_roles) - set(seen))
@@ -515,7 +1159,13 @@ def _collect_compile_warmup(
         try:
             message = warmup_queue.get(timeout=min(remaining, 1.0))
         except queue.Empty:
+            if vlm_process is not None and not vlm_process.is_alive() and "vlm" not in seen:
+                raise RuntimeError(_process_exited_message("VLM", vlm_process, phase)) from None
+            if ae_process is not None and not ae_process.is_alive() and "ae" not in seen:
+                raise RuntimeError(_process_exited_message("AE", ae_process, phase)) from None
             continue
+        if isinstance(message, JaxWorkerError):
+            raise _worker_error_to_runtime_error(message)
         if not isinstance(message, JaxCompileWarmupDone):
             raise RuntimeError(f"Unexpected warmup queue message: {type(message)}")
         seen[message.role] = float(message.jax_warmup_batches)

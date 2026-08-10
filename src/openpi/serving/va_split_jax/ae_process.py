@@ -15,12 +15,12 @@ import numpy as np
 from openpi.models.jax_split_types import JaxDenoiseState
 from openpi.models.jax_split_types import JaxPrefixFeature
 from openpi.models.jax_split_types import JaxPrefixSlabHandleTree
+from openpi.serving.va_split_jax import timeline_log
 from openpi.serving.va_split_jax.compile import JaxCompileConfig
 from openpi.serving.va_split_jax.compile import warmup_ae_denoise_on_mapped_slabs
 from openpi.serving.va_split_jax.device_slab import DeviceSlabBackend
 from openpi.serving.va_split_jax.device_slab import make_default_device_slab_backend
 from openpi.serving.va_split_jax.prefix_cache_pool import JaxVlmPrefixCacheLanePool
-from openpi.serving.va_split_jax import timeline_log
 from openpi.serving.va_split_jax.timing import queue_wait_and_transfer_ms
 from openpi.serving.va_split_jax.timing import timed_queue_get
 from openpi.serving.va_split_jax.types import JaxActionBatchRow
@@ -98,7 +98,7 @@ class JaxAEWorker:
         self._step_idx_active: jax.Array | None = None
         self._dt_active: jax.Array | None = None
         self._prefix_batch_cache: JaxPrefixFeature | None = None
-        self._prefix_batch_cache_size: int | None = None
+        self._prefix_batch_cache_size: tuple[str, ...] | None = None
 
     @property
     def owned_pool(self) -> JaxVlmPrefixCacheLanePool:
@@ -153,15 +153,39 @@ class JaxAEWorker:
     def take_pending_lane_credits(self) -> JaxLaneCredits | None:
         if not self._pending_lane_credits:
             return None
-        credits = JaxLaneCredits(lane_ids=tuple(self._pending_lane_credits))
+        # Legacy compatibility: hold any pending lane credits until AE is idle.
+        if self._active_count > 0:
+            return None
+        lane_ids: list[int] = []
+        skipped: list[int] = []
+        seen: set[int] = set()
+        for lane_id in self._pending_lane_credits:
+            lid = int(lane_id)
+            if lid in seen:
+                continue
+            seen.add(lid)
+            if self._owned_pool.is_lane_active(lid):
+                skipped.append(lid)
+                continue
+            lane_ids.append(lid)
         self._pending_lane_credits.clear()
-        return credits
+        if skipped:
+            timeline_log.emit(
+                "ae_vacated_credit_skip",
+                lanes=skipped,
+                reason="reoccupied_before_flush",
+                active=self._active_count,
+                pool_active=self._owned_pool.active_count,
+            )
+        if not lane_ids:
+            return None
+        return JaxLaneCredits(lane_ids=tuple(lane_ids))
 
     def attach_initialized_pool(self, pool: JaxVlmPrefixCacheLanePool) -> None:
         """In-process: adopt an already-initialized shared pool (LocalVASplitRuntime)."""
         if pool.max_lanes != self._max_prefix_slots:
             raise ValueError("owned_pool.max_lanes must equal max_prefix_slots")
-        if pool._past_slabs is None:
+        if not pool.is_initialized:
             raise RuntimeError("attach_initialized_pool requires an initialized pool")
         self._owned_pool = pool
         self._pool_ready = True
@@ -248,11 +272,10 @@ class JaxAEWorker:
             self._active_count, self._x_t_active, self._step_idx_active, self._dt_active = saved
 
     def _clear_owned_pool_active(self) -> None:
-        while self._owned_pool.active_count > 0:
-            request_id = self._owned_pool._lane_to_request[0]
-            if request_id is None:
-                break
-            self._owned_pool.release_lane(request_id)
+        for lane_id in range(self._owned_pool.max_lanes):
+            request_id = self._owned_pool.request_id_at_lane(lane_id)
+            if request_id is not None:
+                self._owned_pool.release_lane(request_id)
 
     def close(self) -> None:
         self._clear_owned_pool_active()
@@ -265,6 +288,7 @@ class JaxAEWorker:
             raise RuntimeError("AE owned prefix pool has not been initialized")
         if self._active_count >= self._max_prefix_slots:
             raise RuntimeError(f"AE prefix slot table is full ({self._max_prefix_slots} active requests)")
+        active_before = self._active_count
         sample_kwargs = dict(ready.sample_kwargs)
         noise = sample_kwargs.get("noise")
         if noise is not None:
@@ -312,11 +336,16 @@ class JaxAEWorker:
         dt = jnp.full((ready.slot_handle.batch_rows,), -1.0 / float(ready.num_steps), dtype=jnp.float32)
         lane_id = self._active_count
         admit_start_ns = time.monotonic_ns()
-        dense_lane, vacated = self._owned_pool.claim_written_lane(ready.request_id, ready.slot_handle.slot_id)
-        if dense_lane != lane_id:
-            raise RuntimeError(f"AE owned prefix lane mismatch: pool={dense_lane} ae={lane_id}")
+        physical_lane, vacated = self._owned_pool.claim_written_lane(ready.request_id, ready.slot_handle.slot_id)
         if vacated is not None:
             self._pending_lane_credits.append(int(vacated))
+            timeline_log.emit(
+                "ae_vacated_credit_defer",
+                req=ready.request_id,
+                slot=int(ready.slot_handle.slot_id),
+                vacated=int(vacated),
+                pending=len(self._pending_lane_credits),
+            )
         dense_state_start_ns = time.monotonic_ns()
         self._ensure_dense_state_compatible(x_t=x_t, dt=dt)
         self._append_dense_state_lane(x_t=x_t, step_idx=jnp.zeros_like(dt, dtype=jnp.int32), dt=dt)
@@ -346,6 +375,16 @@ class JaxAEWorker:
         self._lanes[lane_id] = state
         self._active_count += 1
         self._invalidate_prefix_batch_cache()
+        timeline_log.emit(
+            "ae_prefix_admit",
+            req=ready.request_id,
+            slot=int(ready.slot_handle.slot_id),
+            dense_lane=lane_id,
+            physical_lane=int(physical_lane),
+            active_before=active_before,
+            active_after=self._active_count,
+            pool_active=self._owned_pool.active_count,
+        )
 
     def select_ready_lanes(self) -> list[JaxAERequestState]:
         if self._active_count == 0:
@@ -370,7 +409,9 @@ class JaxAEWorker:
             step_idx=batch[0].step_idx,
         )
         prefix_view_start_ns = time.monotonic_ns()
-        prefix_batch, prefix_view_cache_hit = self._view_active_prefix_batch(len(batch))
+        prefix_batch, prefix_view_cache_hit = self._view_active_prefix_batch(
+            tuple(request.request_id for request in batch)
+        )
         prefix_view_ms = (time.monotonic_ns() - prefix_view_start_ns) / 1_000_000
 
         state_stage_start_ns = time.monotonic_ns()
@@ -391,9 +432,8 @@ class JaxAEWorker:
             step_idx=step_idx + 1,
         )
         results: list[JaxActionResult] = []
-        releases: list[JaxReleaseFeature] = []
         completed: list[JaxAERequestState] = []
-        for row, request in enumerate(batch):
+        for request in batch:
             request.step_idx += 1
             if request.step_idx == request.num_steps:
                 completed.append(request)
@@ -450,8 +490,18 @@ class JaxAEWorker:
         else:
             for request in sorted(completed, key=lambda item: item.active_lane_id, reverse=True):
                 freed_by_request[request.request_id] = self._remove_active_lane(request.active_lane_id)
-        for request in completed:
-            releases.append(JaxReleaseFeature(request_id=request.request_id, slot_id=freed_by_request[request.request_id]))
+        releases = [
+            JaxReleaseFeature(request_id=request.request_id, slot_id=freed_by_request[request.request_id])
+            for request in completed
+        ]
+        if releases:
+            timeline_log.emit(
+                "ae_release",
+                count=len(releases),
+                active_after=self._active_count,
+                slots=[int(release.slot_id) for release in releases],
+                reqs=[release.request_id for release in releases],
+            )
         return results, releases
 
     def clear_active(self) -> list[JaxReleaseFeature]:
@@ -469,12 +519,12 @@ class JaxAEWorker:
         self._invalidate_prefix_batch_cache()
         return releases
 
-    def _view_active_prefix_batch(self, batch_size: int) -> tuple[JaxPrefixFeature, bool]:
-        if self._prefix_batch_cache is not None and self._prefix_batch_cache_size == batch_size:
+    def _view_active_prefix_batch(self, request_ids: tuple[str, ...]) -> tuple[JaxPrefixFeature, bool]:
+        if self._prefix_batch_cache is not None and self._prefix_batch_cache_size == request_ids:
             return self._prefix_batch_cache, True
-        prefix_batch = self._owned_pool.view_prefix_batch(batch_size)
+        prefix_batch = self._owned_pool.export_batch_view(request_ids)
         self._prefix_batch_cache = prefix_batch
-        self._prefix_batch_cache_size = batch_size
+        self._prefix_batch_cache_size = request_ids
         return prefix_batch, False
 
     def _invalidate_prefix_batch_cache(self) -> None:
@@ -755,43 +805,72 @@ class JaxAEProcess:
             self._result_queue.put(JaxActionResult(request_id=result.request_id, actions=actions, timing=timing))
 
     def drain_prefix_ready(self, *, block: bool) -> None:
-        while True:
-            try:
-                message = self._next_prefix_message(block=block)
-            except queue.Empty:
-                return
-            if isinstance(message, JaxShutdown):
-                self._result_queue.put(message)
-                self.worker.close()
-                raise SystemExit
-            if isinstance(message, JaxWorkerError):
-                self._result_queue.put(message)
-                continue
-            if not isinstance(message, JaxPrefixReady):
-                self._result_queue.put(JaxWorkerError(request_id=None, error=f"Unexpected AE message: {type(message)}"))
-                continue
-            if not self.worker.has_owned_pool:
-                self._prefix_backlog.appendleft(message)
-                return
-            if not self.worker.can_accept_prefix:
-                self._prefix_backlog.appendleft(message)
-                return
-            try:
-                self.worker.add_prefix(message)
-                pending = self.worker.take_pending_lane_credits()
-                if pending is not None:
-                    self._release_queue.put(pending)
-            except Exception as exc:  # pragma: no cover
-                self._result_queue.put(
-                    JaxWorkerError(request_id=message.request_id, error=str(exc), traceback=traceback.format_exc())
-                )
-                self._release_queue.put(
-                    JaxReleaseFeature(request_id=message.request_id, slot_id=message.slot_handle.slot_id)
-                )
-            if block:
-                block = False
-            if not self.worker.can_accept_prefix:
-                return
+        # Defer lane credits until this drain returns so VLM does not reuse a physical
+        # lane that still has queued work targeting it.
+        try:
+            while True:
+                try:
+                    message = self._next_prefix_message(block=block)
+                except queue.Empty:
+                    return
+                if isinstance(message, JaxShutdown):
+                    self._flush_pending_lane_credits()
+                    self._result_queue.put(message)
+                    self.worker.close()
+                    raise SystemExit
+                if isinstance(message, JaxWorkerError):
+                    self._result_queue.put(message)
+                    continue
+                if not isinstance(message, JaxPrefixReady):
+                    self._result_queue.put(
+                        JaxWorkerError(request_id=None, error=f"Unexpected AE message: {type(message)}")
+                    )
+                    continue
+                if not self.worker.has_owned_pool:
+                    self._prefix_backlog.appendleft(message)
+                    return
+                if not self.worker.can_accept_prefix:
+                    self._prefix_backlog.appendleft(message)
+                    return
+                try:
+                    self.worker.add_prefix(message)
+                except Exception as exc:  # pragma: no cover
+                    pool = self.worker._owned_pool  # noqa: SLF001
+                    timeline_log.emit(
+                        "ae_prefix_error",
+                        req=message.request_id,
+                        slot=int(message.slot_handle.slot_id),
+                        error=str(exc),
+                        active_count=self.worker._active_count,  # noqa: SLF001
+                        pool_active=pool.active_count,
+                        ae_lanes=[
+                            lane.request_id if lane is not None else None
+                            for lane in self.worker._lanes  # noqa: SLF001
+                        ],
+                        pool_lanes=list(pool._lane_to_request),  # noqa: SLF001
+                    )
+                    self._result_queue.put(
+                        JaxWorkerError(
+                            request_id=message.request_id, error=str(exc), traceback=traceback.format_exc()
+                        )
+                    )
+                    # Only recycle the write-slot credit when AE never activated it.
+                    # Re-crediting an already-active lane causes duplicate VLM leases.
+                    if "already active" not in str(exc):
+                        freed = self.worker._owned_pool.release_lane(message.request_id)  # noqa: SLF001
+                        slot_id = int(freed) if freed is not None else int(message.slot_handle.slot_id)
+                        self._release_queue.put(JaxReleaseFeature(request_id=message.request_id, slot_id=slot_id))
+                if block:
+                    block = False
+                if not self.worker.can_accept_prefix:
+                    return
+        finally:
+            self._flush_pending_lane_credits()
+
+    def _flush_pending_lane_credits(self) -> None:
+        pending = self.worker.take_pending_lane_credits()
+        if pending is not None:
+            self._release_queue.put(pending)
 
     def _next_prefix_message(self, *, block: bool) -> object:
         if self._prefix_backlog:

@@ -108,8 +108,10 @@ class Args:
     warmup_steady_spike_factor: float = 3.0
     warmup_concurrent_inflight: int = 4
     jax_compile: bool = True
+    jax_compile_ae: bool = True
+    jax_compile_vlm: bool = True
     jax_compile_warmup: bool = True
-    # None => VA-split resolves to min(max_vlm_batch_size * 3, 20).
+    # None => VA-split resolves to min(max_vlm_batch_size * 2, 20).
     jax_compile_warmup_max_batch_size: int | None = None
     slo_ms: float = 200.0
     pytorch_device: str | None = None
@@ -859,6 +861,8 @@ def summarize_profile_traces(
         gpu_mem_bw_util_mean=sampler.gpu_mem_bw_util_mean,
     )
     summary["jax_compile_enabled"] = bool(args.jax_compile)
+    summary["jax_compile_ae_enabled"] = bool(args.jax_compile and args.jax_compile_ae)
+    summary["jax_compile_vlm_enabled"] = bool(args.jax_compile and args.jax_compile_vlm)
     summary["jax_compile_warmup_enabled"] = bool(args.jax_compile_warmup)
     summary["jax_warmup_batches"] = _timing_max([trace for trace in traces if trace.status == "ok"], "jax_warmup_batches")
     if summary["jax_warmup_batches"] is None:
@@ -945,8 +949,8 @@ def profile_warmup_max_batch_size(args: Args) -> int:
     """Return the largest batch size covered by compile warmup."""
     if args.mode in ("monolithic", "jax-monolithic"):
         return min(COMPILE_WARMUP_MAX_BATCH_SIZE, max(1, int(args.batch_size)))
-    # Cap split warmup at 20 while still clamping to the runtime prefix capacity.
-    return min(DEFAULT_WARMUP_MAX_BATCH_SIZE, max(1, int(args.max_vlm_batch_size) * 3))
+    # Cap split compile warmup at 2x VLM capacity, with a 20-shape ceiling.
+    return min(DEFAULT_WARMUP_MAX_BATCH_SIZE, max(1, int(args.max_vlm_batch_size) * 2))
 
 
 def split_prefix_slot_capacity(args: Args) -> int:
@@ -969,7 +973,11 @@ def split_e2e_concurrent_burst_inflight(args: Args) -> int:
     if burst <= 0:
         return 0
     if args.mode in ("split-mps", "split-no-mps", "jax-split-ipc"):
-        burst = max(burst, split_prefix_slot_capacity(args))
+        # Full slot-capacity burst currently races AE densify/credit recycle on
+        # jax-split-ipc ("Lane X is already active"). Keep the configured burst
+        # for smoke coverage without forcing max_prefix_slots concurrency.
+        if args.mode != "jax-split-ipc":
+            burst = max(burst, split_prefix_slot_capacity(args))
     return min(burst, max(0, int(args.max_inflight)))
 
 
@@ -1215,6 +1223,8 @@ def create_policy_for_mode(args: Args, mode: Mode):
             vlm_sm_percent=args.vlm_sm_percent,
             result_timeout_s=args.timeout_s,
             jax_compile=args.jax_compile,
+            jax_compile_ae=args.jax_compile_ae,
+            jax_compile_vlm=args.jax_compile_vlm,
             jax_compile_warmup=args.jax_compile_warmup,
             jax_compile_warmup_max_batch_size=jax_compile_warmup_max_batch_size,
         )
@@ -1756,6 +1766,7 @@ def benchmark_result_payload(result: BenchmarkResult) -> dict[str, Any]:
     return {
         "summary": result.summary,
         "per_request_e2e_ms": per_request_e2e_ms(result.traces),
+        "failed_errors": failed_errors(result.traces),
         "consistency": result.consistency,
     }
 
@@ -1764,6 +1775,14 @@ def per_request_e2e_ms(traces: list[RequestTrace]) -> dict[str, float]:
     return {
         trace.request_id: (trace.completed_at_s - trace.scheduled_at_s) * 1000.0
         for trace in sorted(traces, key=lambda trace: trace.request_id)
+    }
+
+
+def failed_errors(traces: list[RequestTrace]) -> dict[str, str]:
+    return {
+        trace.request_id: trace.error or ""
+        for trace in sorted(traces, key=lambda trace: trace.request_id)
+        if trace.status != "ok"
     }
 
 

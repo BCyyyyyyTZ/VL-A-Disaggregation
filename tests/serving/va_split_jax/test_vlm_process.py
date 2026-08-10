@@ -174,6 +174,124 @@ def test_jax_vlm_worker_writes_ae_lane_and_recycles_credit_on_release():
     assert worker.available_live_feature_slots == 2
 
 
+def test_jax_vlm_worker_returns_credits_when_slab_write_fails():
+    worker = _worker_with_credits(max_lanes=2)
+    assert worker.available_live_feature_slots == 2
+
+    def _boom(*_args, **_kwargs):
+        raise RuntimeError("simulated slab write failure")
+
+    worker._write_feature_to_lanes = _boom  # type: ignore[method-assign]
+
+    try:
+        worker.handle_batch([_request("req-1"), _request("req-2")])
+        raise AssertionError("expected slab write failure")
+    except RuntimeError as exc:
+        assert "simulated slab write failure" in str(exc)
+
+    assert worker.available_live_feature_slots == 2
+    assert worker.active_count == 0
+
+
+def test_jax_vlm_worker_rejects_credit_when_capacity_is_already_held():
+    worker = _worker_with_credits(max_lanes=2)
+
+    first = worker.handle_request(_request("req-1"))
+    assert first.slot_handle.slot_id == 0
+    assert worker.available_live_feature_slots == 1
+    assert worker.active_count == 1
+
+    worker.grant_lane_credits(JaxLaneCredits(lane_ids=(0,)))
+
+    assert worker.available_live_feature_slots == 1
+    second = worker.handle_request(_request("req-2"))
+    assert second.slot_handle.slot_id == 1
+
+
+def test_jax_vlm_worker_recycles_original_physical_release_slot():
+    worker = _worker_with_credits(max_lanes=3)
+
+    first = worker.handle_request(_request("req-1"))
+    second = worker.handle_request(_request("req-2"))
+
+    assert first.slot_handle.slot_id == 0
+    assert second.slot_handle.slot_id == 1
+    assert worker.available_live_feature_slots == 1
+    assert worker.active_count == 2
+
+    worker.release(JaxReleaseFeature(request_id="req-1", slot_id=0))
+
+    assert worker.available_live_feature_slots == 2
+    assert worker.active_count == 1
+    third = worker.handle_request(_request("req-3"))
+    assert third.slot_handle.slot_id == 0
+
+
+def test_jax_vlm_worker_ignores_duplicate_release_for_completed_request():
+    worker = _worker_with_credits(max_lanes=2)
+
+    first = worker.handle_request(_request("req-1"))
+    assert first.slot_handle.slot_id == 0
+    worker.release(JaxReleaseFeature(request_id="req-1", slot_id=0))
+    second = worker.handle_request(_request("req-2"))
+
+    assert second.slot_handle.slot_id == 0
+    assert worker.available_live_feature_slots == 1
+    assert worker.active_count == 1
+
+    worker.release(JaxReleaseFeature(request_id="req-1", slot_id=0))
+
+    assert worker.available_live_feature_slots == 1
+    assert worker.active_count == 1
+    third = worker.handle_request(_request("req-3"))
+    assert third.slot_handle.slot_id == 1
+
+
+def test_jax_vlm_process_returns_unsent_credits_when_prefix_queue_put_fails():
+    model = FakeJaxSplitModel()
+    pool = _shared_pool(max_lanes=2)
+    prefix_queue = SimpleQueue()
+    process = JaxVLMProcess(
+        model=model,
+        request_queue=SimpleQueue(),
+        prefix_queue=prefix_queue,
+        release_queue=SimpleQueue(),
+        max_batch_size=2,
+        max_wait_ms=0.0,
+        max_live_features=2,
+        shared_pool=pool,
+    )
+    process.worker.attach_shared_pool(pool, JaxLaneCredits(lane_ids=(0, 1)))
+    process._ae_export_ready = True
+
+    ready = process.worker.handle_batch([_request("req-1"), _request("req-2")])
+    assert process.worker.available_live_feature_slots == 0
+    assert process.worker.active_count == 2
+
+    original_put = prefix_queue.put
+    calls = {"n": 0}
+
+    def _flaky_put(item):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            original_put(item)
+            return
+        raise RuntimeError("simulated prefix queue failure")
+
+    prefix_queue.put = _flaky_put  # type: ignore[method-assign]
+
+    try:
+        process._put_prefix_batch(ready)
+        raise AssertionError("expected prefix queue failure")
+    except RuntimeError as exc:
+        assert "simulated prefix queue failure" in str(exc)
+
+    # First PrefixReady was handed off; only the unsent credit must come back.
+    assert process.worker.available_live_feature_slots == 1
+    assert process.worker.active_count == 1
+    assert len([item for item in prefix_queue.items if isinstance(item, JaxPrefixReady)]) == 1
+
+
 def test_jax_vlm_request_transfer_excludes_pre_enqueue_blocking_get_wait():
     queue_wait_ms, transfer_ms = _vlm_request_queue_timings(
         enqueue_ns=1_000,
