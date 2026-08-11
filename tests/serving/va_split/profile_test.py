@@ -532,6 +532,17 @@ def test_split_profile_warmup_helpers_cover_vlm_prefix_and_prefix_capacity():
     assert profile_va_split.split_e2e_concurrent_burst_inflight(args) == 24
 
 
+def test_jax_split_ipc_warmup_burst_covers_prefix_slot_capacity():
+    args = profile_va_split.Args(
+        mode="jax-split-ipc",
+        max_vlm_batch_size=8,
+        max_inflight=64,
+        warmup_concurrent_inflight=4,
+    )
+
+    assert profile_va_split.split_e2e_concurrent_burst_inflight(args) == 24
+
+
 def test_make_fixed_size_batch_request_tiles_when_needed():
     requests = _fake_requests(3)
     batch = profile_va_split.make_fixed_size_batch_request(requests, batch_size=8)
@@ -591,7 +602,7 @@ def test_run_profile_compile_warmup_uses_batch_shapes_for_ours(monkeypatch):
         )
     )
 
-    expected_warmup = [*range(1, 21), *range(1, 9)]
+    expected_warmup = [*range(1, 17), *range(1, 9)]
     assert policy.observed_batch_sizes[: len(expected_warmup)] == expected_warmup
     assert policy.infer_batch_calls == len(expected_warmup)
     assert policy.infer_calls == 10
@@ -602,7 +613,9 @@ def test_run_profile_compile_warmup_uses_batch_shapes_for_ours(monkeypatch):
 def test_run_profile_rate_sweep_warms_once_and_reuses_policy(monkeypatch):
     policy = _ConcurrentFakePolicy(sleep_s=0.0)
     create_calls = []
-    monkeypatch.setattr(profile_va_split, "create_policy_for_mode", lambda args, mode: create_calls.append(mode) or policy)
+    monkeypatch.setattr(
+        profile_va_split, "create_policy_for_mode", lambda args, mode: create_calls.append(mode) or policy
+    )
     monkeypatch.setattr(profile_va_split, "make_synthetic_libero_requests", lambda **kwargs: _fake_requests(4))
 
     result = profile_va_split.run_profile_rate_sweep(
@@ -624,7 +637,7 @@ def test_run_profile_rate_sweep_warms_once_and_reuses_policy(monkeypatch):
 
     assert create_calls == ["split-mps"]
     assert [run.summary["target_request_rate_hz"] for run in result.results] == [8.0, 16.0, 32.0]
-    assert policy.observed_batch_sizes == [*range(1, 21), *range(1, 9)]
+    assert policy.observed_batch_sizes == [*range(1, 17), *range(1, 9)]
     assert policy.infer_calls == 14
     assert [run.summary["e2e_warmup_requests"] for run in result.results] == [10.0, 10.0, 10.0]
 

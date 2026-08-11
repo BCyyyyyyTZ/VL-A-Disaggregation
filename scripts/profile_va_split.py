@@ -864,7 +864,9 @@ def summarize_profile_traces(
     summary["jax_compile_ae_enabled"] = bool(args.jax_compile and args.jax_compile_ae)
     summary["jax_compile_vlm_enabled"] = bool(args.jax_compile and args.jax_compile_vlm)
     summary["jax_compile_warmup_enabled"] = bool(args.jax_compile_warmup)
-    summary["jax_warmup_batches"] = _timing_max([trace for trace in traces if trace.status == "ok"], "jax_warmup_batches")
+    summary["jax_warmup_batches"] = _timing_max(
+        [trace for trace in traces if trace.status == "ok"], "jax_warmup_batches"
+    )
     if summary["jax_warmup_batches"] is None:
         summary["jax_warmup_batches"] = 0.0
     e2e_warmup = getattr(policy, "_profile_e2e_warmup_stats", None)
@@ -973,11 +975,7 @@ def split_e2e_concurrent_burst_inflight(args: Args) -> int:
     if burst <= 0:
         return 0
     if args.mode in ("split-mps", "split-no-mps", "jax-split-ipc"):
-        # Full slot-capacity burst currently races AE densify/credit recycle on
-        # jax-split-ipc ("Lane X is already active"). Keep the configured burst
-        # for smoke coverage without forcing max_prefix_slots concurrency.
-        if args.mode != "jax-split-ipc":
-            burst = max(burst, split_prefix_slot_capacity(args))
+        burst = max(burst, split_prefix_slot_capacity(args))
     return min(burst, max(0, int(args.max_inflight)))
 
 
