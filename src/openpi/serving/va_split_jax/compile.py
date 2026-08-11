@@ -65,10 +65,12 @@ def maybe_jit_ae_model(model: Any, config: JaxCompileConfig) -> Any:
 
 
 def maybe_jit_monolithic_model(model: Any, config: JaxCompileConfig) -> Any:
-    if not config.enabled:
-        return model
-    model.sample_actions = nnx_utils.module_jit(model.sample_actions, static_argnames=("num_steps",))
-    return model
+    """JIT baseline as two small graphs (VLM prefix + AE denoise), matching split compile.
+
+    Timed monolithic serving can still call ``sample_actions`` when component timing is
+    disabled; that path remains a separate full-graph jit in :class:`Policy`.
+    """
+    return maybe_jit_split_model(model, config)
 
 
 def prune_split_model_for_role(model: Any, *, role: str) -> Any:
@@ -531,23 +533,17 @@ def warmup_monolithic_model(
     num_steps: int,
     config: JaxCompileConfig,
 ) -> dict[str, float]:
-    if not config.warmup_enabled:
-        return {"jax_warmup_batches": 0.0}
-    batches = planned_warmup_batches(
-        max_batch_size=max_batch_size,
-        warmup_max_batch_size=config.warmup_max_batch_size,
+    """Warm baseline via two small graphs (VLM prefix + AE denoise), not one ``sample_actions`` graph."""
+    return warmup_split_model(
+        model=model,
+        observation_factory=observation_factory,
+        noise_factory=noise_factory,
+        max_vlm_batch_size=max_batch_size,
+        max_ae_batch_size=max_batch_size,
+        max_prefix_slots=max_batch_size,
+        num_steps=num_steps,
+        config=config,
     )
-    if not config.enabled:
-        batches = ((1, 1),)
-    warmed = 0
-    for batch_size, repeats in batches:
-        for _ in range(repeats):
-            obs = observation_factory(batch_size)
-            noise = noise_factory(batch_size)
-            actions = model.sample_actions(jax.random.key(0), obs, noise=noise, num_steps=num_steps)
-            actions.block_until_ready()
-            warmed += 1
-    return {"jax_warmup_batches": float(warmed)}
 
 
 def _build_slab_prefix_batch(

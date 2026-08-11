@@ -77,9 +77,9 @@ def test_compile_helpers_use_module_jit(monkeypatch):
         "denoise_one_batch",
         "build_prefix_feature",
         "denoise_one_batch",
-        "sample_actions",
+        "build_prefix_feature",
+        "denoise_one_batch",
     ]
-    assert calls[-1][2] == {"static_argnames": ("num_steps",)}
 
 
 def test_compile_config_can_disable_vlm_jit_and_warmup(monkeypatch):
@@ -367,5 +367,8 @@ def test_warmup_monolithic_model_uses_planned_batches():
         config=JaxCompileConfig(enabled=True, warmup_enabled=True, warmup_max_batch_size=8),
     )
 
-    assert stats == {"jax_warmup_batches": 5.0}
-    assert model.mono_batches == [1, 1, 2, 3, 4]
+    # Two small graphs: VLM prefix sizes + AE denoise sizes (each [1]+[1..4] with the
+    # first size repeated once by planned_warmup_batches).
+    assert stats == {"jax_warmup_batches": 10.0}
+    assert model.prefix_batches == [1, 1, 2, 3, 4, 1, 1, 2, 3, 4]
+    assert model.mono_batches == []

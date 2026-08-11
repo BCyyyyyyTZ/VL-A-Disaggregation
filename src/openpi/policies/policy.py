@@ -50,8 +50,9 @@ class Policy(BasePolicy):
                           Only relevant when is_pytorch=True.
             is_pytorch: Whether the model is a PyTorch model. If False, assumes JAX model.
             enable_component_timing: If True, split VLM/AE stages for baseline timing when
-                helpers exist. If False, call the full sample_actions entry (needed for a fair
-                torch.compile / JAX jit monolithic graph baseline).
+                helpers exist, and JIT those as two small graphs (not one sample_actions graph).
+                If False, call the full sample_actions entry (needed for a fair
+                torch.compile / JAX jit monolithic big-graph baseline).
         """
         self._model = model
         self._input_transform = _transforms.compose(transforms)
@@ -71,14 +72,17 @@ class Policy(BasePolicy):
             self._jax_denoise_one_batch = None
         else:
             # JAX model setup
-            self._sample_actions = nnx_utils.module_jit(model.sample_actions)
             self._rng = rng or jax.random.key(0)
             if enable_component_timing and _supports_jax_component_timing(model):
+                # Small-graph baseline: compile VLM/AE separately (fair vs VA-split compile).
+                # Timed infer uses these graphs; full sample_actions stays unjitted unless needed.
                 self._jax_build_prefix_feature = nnx_utils.module_jit(model.build_prefix_feature)
                 # init_denoise_state takes a Python int batch_size; do not module_jit it.
                 self._jax_init_denoise_state = model.init_denoise_state
                 self._jax_denoise_one_batch = nnx_utils.module_jit(model.denoise_one_batch)
+                self._sample_actions = model.sample_actions
             else:
+                self._sample_actions = nnx_utils.module_jit(model.sample_actions)
                 self._jax_build_prefix_feature = None
                 self._jax_init_denoise_state = None
                 self._jax_denoise_one_batch = None

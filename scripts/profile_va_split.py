@@ -1179,6 +1179,59 @@ def _with_pytorch_compile_mode(train_config, compile_mode: CompileMode | None):
     )
 
 
+def _warmup_jax_monolithic_small_graphs(policy: Any, args: Args) -> None:
+    """Compile-warmup baseline as two small graphs before e2e/timed profile."""
+    from types import SimpleNamespace
+
+    from openpi.serving.va_split_jax.compile import JaxCompileConfig
+    from openpi.serving.va_split_jax.compile import make_model_noise_factory
+    from openpi.serving.va_split_jax.compile import make_model_observation_factory
+    from openpi.serving.va_split_jax.compile import warmup_monolithic_model
+
+    build_prefix = getattr(policy, "_jax_build_prefix_feature", None)
+    denoise = getattr(policy, "_jax_denoise_one_batch", None)
+    model = getattr(policy, "_model", None)
+    if build_prefix is None or denoise is None or model is None:
+        return
+
+    max_batch_size = (
+        args.jax_compile_warmup_max_batch_size
+        if args.jax_compile_warmup_max_batch_size is not None
+        else profile_warmup_max_batch_size(args)
+    )
+    adapter = SimpleNamespace(
+        build_prefix_feature=build_prefix,
+        denoise_one_batch=denoise,
+    )
+    config = JaxCompileConfig(
+        enabled=args.jax_compile,
+        warmup_enabled=True,
+        compile_ae=args.jax_compile_ae,
+        compile_vlm=args.jax_compile_vlm,
+        warmup_max_batch_size=max_batch_size,
+        num_steps=args.num_steps,
+    )
+    print(
+        f"[profile] jax-monolithic small-graph compile warmup "
+        f"(vlm+ae, max_batch={max_batch_size}, steps={args.num_steps})",
+        flush=True,
+    )
+    stats = warmup_monolithic_model(
+        model=adapter,
+        observation_factory=make_model_observation_factory(model),
+        noise_factory=make_model_noise_factory(model),
+        max_batch_size=max_batch_size,
+        num_steps=args.num_steps,
+        config=config,
+    )
+    policy._jax_compile_warmup_stats = stats  # noqa: SLF001 — profile-only annotation
+    print(
+        f"[profile] jax-monolithic small-graph compile warmup done "
+        f"batches={stats.get('jax_warmup_batches', 0.0)}",
+        flush=True,
+    )
+
+
 def create_policy_for_mode(args: Args, mode: Mode):
     validate_mps_environment(mode, require_mps_env=args.require_mps_env)
 
@@ -1198,12 +1251,15 @@ def create_policy_for_mode(args: Args, mode: Mode):
             enable_component_timing=args.enable_component_timing,
         )
     if mode == "jax-monolithic":
-        return _policy_config.create_trained_policy(
+        policy = _policy_config.create_trained_policy(
             train_config,
             args.policy.dir,
             sample_kwargs=sample_kwargs,
             enable_component_timing=args.enable_component_timing,
         )
+        if args.jax_compile_warmup and args.enable_component_timing:
+            _warmup_jax_monolithic_small_graphs(policy, args)
+        return policy
     if mode == "jax-split-ipc":
         jax_compile_warmup_max_batch_size = (
             args.jax_compile_warmup_max_batch_size
