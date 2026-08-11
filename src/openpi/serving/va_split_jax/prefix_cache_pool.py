@@ -11,11 +11,12 @@ from openpi.serving.va_split_jax.device_slab import DeviceSlabSpec
 
 
 class JaxVlmPrefixCacheLanePool:
-    def __init__(self, *, max_lanes: int, backend: DeviceSlabBackend):
+    def __init__(self, *, max_lanes: int, backend: DeviceSlabBackend, compact_lanes: bool = True):
         if max_lanes <= 0:
             raise ValueError("max_lanes must be positive")
         self.max_lanes = max_lanes
         self._backend = backend
+        self._compact_lanes = compact_lanes
         self._past_slabs: Any | None = None
         self._prefix_pad_masks: DeviceSlab | None = None
         self._state: DeviceSlab | None = None
@@ -27,6 +28,14 @@ class JaxVlmPrefixCacheLanePool:
     @property
     def active_count(self) -> int:
         return self._active_count
+
+    @property
+    def initialized(self) -> bool:
+        return self._past_slabs is not None and self._prefix_pad_masks is not None
+
+    @property
+    def active_request_ids(self) -> tuple[str, ...]:
+        return tuple(self._request_to_lane)
 
     def initialize_from_feature(self, feature: JaxPrefixFeature) -> None:
         """Allocate slab storage from a template row without activating any lane."""
@@ -67,7 +76,7 @@ class JaxVlmPrefixCacheLanePool:
         if self._active_count >= self.max_lanes:
             raise RuntimeError(f"VLM prefix lane pool is full ({self.max_lanes} active requests)")
         _validate_single_row_feature(feature)
-        lane_id = self._active_count
+        lane_id = self._active_count if self._compact_lanes else self._first_free_lane_id()
         self._ensure_initialized(feature)
         self._write_feature_into_lane(lane_id, feature)
         self._request_to_lane[request_id] = lane_id
@@ -91,34 +100,37 @@ class JaxVlmPrefixCacheLanePool:
         if self._past_slabs is None or self._prefix_pad_masks is None:
             raise RuntimeError("Cannot claim lanes before pool initialization")
 
-        vacated: int | None = None
         dense_lane = self._active_count
-        if lane_id != dense_lane:
+        vacated: int | None = None
+        if self._compact_lanes and lane_id != dense_lane:
             self._move_lane(lane_id, dense_lane)
             vacated = lane_id
             lane_id = dense_lane
         self._request_to_lane[request_id] = lane_id
         self._lane_to_request[lane_id] = request_id
         self._active_count += 1
-        return lane_id, vacated
+        return dense_lane, vacated
 
     def release_lane(self, request_id: str) -> int | None:
         """Release and compact. Returns the freed physical lane id (credit for VLM), if any."""
         lane_id = self._request_to_lane.pop(request_id, None)
         if lane_id is None:
             return None
-        last_lane = self._active_count - 1
-        moved_request_id = self._lane_to_request[last_lane]
         self._lane_to_request[lane_id] = None
-        if lane_id != last_lane:
-            if moved_request_id is None:
-                raise RuntimeError(f"Cannot compact empty VLM lane {last_lane}")
-            self._move_lane(last_lane, lane_id)
-            self._lane_to_request[lane_id] = moved_request_id
-            self._request_to_lane[moved_request_id] = lane_id
-        self._lane_to_request[last_lane] = None
+        if self._compact_lanes:
+            last_lane = self._active_count - 1
+            moved_request_id = self._lane_to_request[last_lane]
+            if lane_id != last_lane:
+                if moved_request_id is None:
+                    raise RuntimeError(f"Cannot compact empty VLM lane {last_lane}")
+                self._move_lane(last_lane, lane_id)
+                self._lane_to_request[lane_id] = moved_request_id
+                self._request_to_lane[moved_request_id] = lane_id
+            self._lane_to_request[last_lane] = None
+            self._active_count -= 1
+            return last_lane
         self._active_count -= 1
-        return last_lane
+        return lane_id
 
     def _write_feature_into_lane(self, lane_id: int, feature: JaxPrefixFeature) -> None:
         self._past_slabs = _copy_tree_lane(
@@ -140,16 +152,22 @@ class JaxVlmPrefixCacheLanePool:
         if lane_id < 0 or lane_id >= self.max_lanes:
             raise ValueError(f"lane_id {lane_id} outside pool capacity {self.max_lanes}")
 
+    def _first_free_lane_id(self) -> int:
+        for lane_id, request_id in enumerate(self._lane_to_request):
+            if request_id is None:
+                return lane_id
+        raise RuntimeError(f"VLM prefix lane pool is full ({self.max_lanes} active requests)")
+
     def export_batch_view(self, request_ids: tuple[str, ...]) -> JaxPrefixFeature:
         if not request_ids:
             raise ValueError("request_ids must be non-empty")
         lane_ids = tuple(self._request_to_lane[request_id] for request_id in request_ids)
-        if lane_ids != tuple(range(len(request_ids))):
+        if self._compact_lanes and lane_ids != tuple(range(len(request_ids))):
             raise ValueError(
                 "The first implementation exports only the dense prefix of the VLM lane pool; "
                 "AE batch selection must use the request ids currently occupying lanes [0, batch_size)."
             )
-        return self.view_prefix_batch(len(request_ids))
+        return self._view_prefix_lanes(lane_ids)
 
     def export_slab_handle_tree(self) -> dict[str, Any]:
         if self._past_slabs is None or self._prefix_pad_masks is None:
@@ -172,10 +190,19 @@ class JaxVlmPrefixCacheLanePool:
             raise ValueError(f"batch_size {batch_size} exceeds active lanes {self._active_count}")
         if self._past_slabs is None or self._prefix_pad_masks is None:
             raise RuntimeError("Cannot view prefix batch before initialization")
+        return self._view_prefix_lanes(tuple(range(batch_size)))
+
+    def _view_prefix_lanes(self, lane_ids: tuple[int, ...]) -> JaxPrefixFeature:
+        if self._past_slabs is None or self._prefix_pad_masks is None:
+            raise RuntimeError("Cannot view prefix batch before initialization")
+        if not lane_ids:
+            raise ValueError("lane_ids must be non-empty")
+        if any(self._lane_to_request[lane_id] is None for lane_id in lane_ids):
+            raise ValueError(f"lane_ids must refer to active lanes, got {lane_ids}")
         return JaxPrefixFeature(
-            past_key_values=_view_tree_batch(self._backend, self._past_slabs, batch_size),
-            prefix_pad_masks=self._backend.view_batch(self._prefix_pad_masks, batch_size),
-            state=self._backend.view_batch(self._state, batch_size) if self._state is not None else None,
+            past_key_values=_view_tree_lanes(self._backend, self._past_slabs, lane_ids),
+            prefix_pad_masks=self._backend.slice_lanes(self._prefix_pad_masks, lane_ids),
+            state=self._backend.slice_lanes(self._state, lane_ids) if self._state is not None else None,
         )
 
     def _move_lane(self, src_lane: int, dst_lane: int) -> None:
@@ -341,6 +368,18 @@ def _view_tree_batch(backend: DeviceSlabBackend, slabs: Any, batch_size: int) ->
     raise TypeError(f"Unsupported JAX slab tree node: {type(slabs)}")
 
 
+def _view_tree_lanes(backend: DeviceSlabBackend, slabs: Any, lane_ids: tuple[int, ...]) -> Any:
+    if isinstance(slabs, DeviceSlab):
+        return backend.slice_lanes(slabs, lane_ids)
+    if isinstance(slabs, tuple):
+        return tuple(_view_tree_lanes(backend, item, lane_ids) for item in slabs)
+    if isinstance(slabs, list):
+        return [_view_tree_lanes(backend, item, lane_ids) for item in slabs]
+    if isinstance(slabs, dict):
+        return {key: _view_tree_lanes(backend, item, lane_ids) for key, item in slabs.items()}
+    raise TypeError(f"Unsupported JAX slab tree node: {type(slabs)}")
+
+
 def _export_slab_handle_tree(
     past_slabs: Any,
     prefix_pad_masks: DeviceSlab | None,
@@ -400,7 +439,7 @@ def _validate_single_row_tree(value: Any) -> None:
         if value.ndim < 2 or value.shape[1] != 1:
             raise ValueError(f"prefix tree array must have batch size 1 on axis 1, got {value.shape}")
         return
-    if isinstance(value, (tuple, list)):
+    if isinstance(value, tuple | list):
         for item in value:
             _validate_single_row_tree(item)
         return
@@ -428,7 +467,7 @@ def _validate_batch_tree(value: Any, batch_size: int) -> None:
         if value.ndim < 2 or value.shape[1] != batch_size:
             raise ValueError(f"prefix tree array must have batch size {batch_size} on axis 1, got {value.shape}")
         return
-    if isinstance(value, (tuple, list)):
+    if isinstance(value, tuple | list):
         for item in value:
             _validate_batch_tree(item, batch_size)
         return

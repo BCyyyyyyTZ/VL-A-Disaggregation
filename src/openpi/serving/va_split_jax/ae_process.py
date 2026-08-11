@@ -81,7 +81,11 @@ class JaxAEWorker:
         self._max_batch_size = max_batch_size
         self._max_prefix_slots = max_prefix_slots
         self._backend = backend or make_default_device_slab_backend()
-        self._owned_pool = owned_pool or JaxVlmPrefixCacheLanePool(max_lanes=max_prefix_slots, backend=self._backend)
+        self._owned_pool = owned_pool or JaxVlmPrefixCacheLanePool(
+            max_lanes=max_prefix_slots,
+            backend=self._backend,
+            compact_lanes=False,
+        )
         if self._owned_pool.max_lanes != max_prefix_slots:
             raise ValueError("owned_pool.max_lanes must equal max_prefix_slots")
         self._compile_config = compile_config
@@ -100,7 +104,7 @@ class JaxAEWorker:
         self._step_idx_active: jax.Array | None = None
         self._dt_active: jax.Array | None = None
         self._prefix_batch_cache: JaxPrefixFeature | None = None
-        self._prefix_batch_cache_size: int | None = None
+        self._prefix_batch_cache_key: tuple[str, ...] | None = None
 
     @property
     def owned_pool(self) -> JaxVlmPrefixCacheLanePool:
@@ -163,7 +167,7 @@ class JaxAEWorker:
         """In-process: adopt an already-initialized shared pool (LocalVASplitRuntime)."""
         if pool.max_lanes != self._max_prefix_slots:
             raise ValueError("owned_pool.max_lanes must equal max_prefix_slots")
-        if pool._past_slabs is None:
+        if not pool.initialized:
             raise RuntimeError("attach_initialized_pool requires an initialized pool")
         self._owned_pool = pool
         self._pool_ready = True
@@ -250,10 +254,7 @@ class JaxAEWorker:
             self._active_count, self._x_t_active, self._step_idx_active, self._dt_active = saved
 
     def _clear_owned_pool_active(self) -> None:
-        while self._owned_pool.active_count > 0:
-            request_id = self._owned_pool._lane_to_request[0]
-            if request_id is None:
-                break
+        for request_id in self._owned_pool.active_request_ids:
             self._owned_pool.release_lane(request_id)
 
     def close(self) -> None:
@@ -373,7 +374,7 @@ class JaxAEWorker:
             step_idx=batch[0].step_idx,
         )
         prefix_view_start_ns = time.monotonic_ns()
-        prefix_batch, prefix_view_cache_hit = self._view_active_prefix_batch(len(batch))
+        prefix_batch, prefix_view_cache_hit = self._view_active_prefix_batch(batch)
         prefix_view_ms = (time.monotonic_ns() - prefix_view_start_ns) / 1_000_000
 
         state_stage_start_ns = time.monotonic_ns()
@@ -396,7 +397,7 @@ class JaxAEWorker:
         results: list[JaxActionResult] = []
         releases: list[JaxReleaseFeature] = []
         completed: list[JaxAERequestState] = []
-        for row, request in enumerate(batch):
+        for request in batch:
             request.step_idx += 1
             if request.step_idx == request.num_steps:
                 completed.append(request)
@@ -453,14 +454,14 @@ class JaxAEWorker:
         else:
             for request in sorted(completed, key=lambda item: item.active_lane_id, reverse=True):
                 freed_by_request[request.request_id] = self._remove_active_lane(request.active_lane_id)
-        for request in completed:
-            releases.append(
-                JaxReleaseFeature(
-                    request_id=request.request_id,
-                    slot_id=freed_by_request[request.request_id],
-                    source_worker_id=request.source_worker_id,
-                )
+        releases = [
+            JaxReleaseFeature(
+                request_id=request.request_id,
+                slot_id=freed_by_request[request.request_id],
+                source_worker_id=request.source_worker_id,
             )
+            for request in completed
+        ]
         return results, releases
 
     def clear_active(self) -> list[JaxReleaseFeature]:
@@ -478,17 +479,18 @@ class JaxAEWorker:
         self._invalidate_prefix_batch_cache()
         return releases
 
-    def _view_active_prefix_batch(self, batch_size: int) -> tuple[JaxPrefixFeature, bool]:
-        if self._prefix_batch_cache is not None and self._prefix_batch_cache_size == batch_size:
+    def _view_active_prefix_batch(self, batch: list[JaxAERequestState]) -> tuple[JaxPrefixFeature, bool]:
+        request_ids = tuple(request.request_id for request in batch)
+        if self._prefix_batch_cache is not None and self._prefix_batch_cache_key == request_ids:
             return self._prefix_batch_cache, True
-        prefix_batch = self._owned_pool.view_prefix_batch(batch_size)
+        prefix_batch = self._owned_pool.export_batch_view(request_ids)
         self._prefix_batch_cache = prefix_batch
-        self._prefix_batch_cache_size = batch_size
+        self._prefix_batch_cache_key = request_ids
         return prefix_batch, False
 
     def _invalidate_prefix_batch_cache(self) -> None:
         self._prefix_batch_cache = None
-        self._prefix_batch_cache_size = None
+        self._prefix_batch_cache_key = None
 
     def _ensure_dense_state_compatible(self, *, x_t: jax.Array, dt: jax.Array) -> None:
         if x_t.ndim < 1 or int(x_t.shape[0]) != 1:

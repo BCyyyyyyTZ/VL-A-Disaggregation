@@ -247,17 +247,46 @@ def test_jax_ae_process_releases_active_features_when_step_fails():
     assert process.worker.active == {}
 
 
+def test_jax_ae_process_accepts_out_of_order_sparse_prefix_lanes():
+    backend = make_default_device_slab_backend()
+    pool = JaxVlmPrefixCacheLanePool(max_lanes=4, backend=backend, compact_lanes=False)
+    pool.initialize_from_feature(_feature(0.0))
+    pool.write_lane(1, _feature(1.0))
+    pool.write_lane(0, _feature(2.0))
+    process = JaxAEProcess(
+        model=FakeJaxAEModel(),
+        prefix_queue=SimpleQueue(),
+        result_queue=SimpleQueue(),
+        release_queue=SimpleQueue(),
+        max_batch_size=2,
+        max_prefix_slots=4,
+        backend=backend,
+        owned_pool=pool,
+    )
+    process.worker.attach_initialized_pool(pool)
+
+    process.worker.add_prefix(_ready("req-1", 1))
+    process.worker.add_prefix(_ready("req-2", 0))
+
+    results, releases = process.worker.step_once()
+
+    assert [result.request_id for result in results] == ["req-1", "req-2"]
+    assert [release.request_id for release in releases] == ["req-1", "req-2"]
+    assert process.worker.active == {}
+
+
 def test_jax_ae_process_shutdown_closes_worker():
+    result_queue = SimpleQueue()
     process = JaxAEProcess(
         model=FakeJaxAEModel(),
         prefix_queue=SimpleQueue([JaxShutdown()]),
-        result_queue=SimpleQueue(),
+        result_queue=result_queue,
         release_queue=SimpleQueue(),
         max_batch_size=1,
     )
     with pytest.raises(SystemExit):
         process.drain_prefix_ready(block=True)
-    assert isinstance(process._result_queue.items[0], JaxShutdown)
+    assert isinstance(result_queue.items[0], JaxShutdown)
 
 
 def test_jax_ae_worker_splits_prefix_queue_wait_transfer_and_admit():

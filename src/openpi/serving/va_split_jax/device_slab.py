@@ -138,8 +138,15 @@ class DeviceSlabBackend:
 
     def slice_lanes(self, slab: DeviceSlab, slot_ids: tuple[int, ...]) -> jax.Array:
         """Return a dense-prefix device-side view for already-mapped lanes without reopening IPC."""
+        if any(slot_id < 0 or slot_id >= slab.spec.max_lanes for slot_id in slot_ids):
+            raise ValueError(f"slot_ids must be inside slab capacity {slab.spec.max_lanes}, got {slot_ids}")
         if slot_ids != tuple(range(len(slot_ids))):
-            raise ValueError("The first implementation only permits dense-prefix slot ids")
+            gathered = jnp.take(
+                slab.array,
+                jnp.asarray(slot_ids, dtype=jnp.int32),
+                axis=slab.spec.normalized_lane_axis,
+            )
+            return _logical_view_for_spec(gathered, slab.spec)
         return self.view_batch(slab, len(slot_ids))
 
 

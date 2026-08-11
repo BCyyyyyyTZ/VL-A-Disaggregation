@@ -81,6 +81,43 @@ def test_ae_owned_prefix_cache_lane_pool_batch_write_claim_densifies():
     np.testing.assert_allclose(np.asarray(batch.past_key_values[0][:, 1]), np.full((3, 2, 4), 5.0, dtype=np.float32))
 
 
+def test_sparse_prefix_cache_lane_pool_keeps_out_of_order_physical_lanes():
+    pool = JaxVlmPrefixCacheLanePool(
+        max_lanes=4,
+        backend=make_default_device_slab_backend(),
+        compact_lanes=False,
+    )
+    pool.initialize_from_feature(_feature(0.0))
+    pool.write_lane(1, _feature(4.0))
+    dense_1, vacated_1 = pool.claim_written_lane("req-1", 1)
+    pool.write_lane(0, _feature(5.0))
+    dense_2, vacated_2 = pool.claim_written_lane("req-2", 0)
+
+    assert (dense_1, vacated_1) == (0, None)
+    assert (dense_2, vacated_2) == (1, None)
+    batch = pool.export_batch_view(("req-1", "req-2"))
+    np.testing.assert_allclose(np.asarray(batch.state[0]), np.full((8,), 4.0, dtype=np.float32))
+    np.testing.assert_allclose(np.asarray(batch.state[1]), np.full((8,), 5.0, dtype=np.float32))
+
+
+def test_sparse_prefix_cache_lane_pool_reuses_first_free_lane_on_put():
+    pool = JaxVlmPrefixCacheLanePool(
+        max_lanes=4,
+        backend=make_default_device_slab_backend(),
+        compact_lanes=False,
+    )
+    pool.initialize_from_feature(_feature(0.0))
+    lane_1 = pool.put_lane("req-1", _feature(1.0))
+    lane_2 = pool.put_lane("req-2", _feature(2.0))
+    freed = pool.release_lane("req-1")
+    lane_3 = pool.put_lane("req-3", _feature(3.0))
+
+    assert (lane_1, lane_2, freed, lane_3) == (0, 1, 0, 0)
+    batch = pool.export_batch_view(("req-2", "req-3"))
+    np.testing.assert_allclose(np.asarray(batch.state[0]), np.full((8,), 2.0, dtype=np.float32))
+    np.testing.assert_allclose(np.asarray(batch.state[1]), np.full((8,), 3.0, dtype=np.float32))
+
+
 def test_ae_owned_prefix_cache_lane_pool_rejects_sparse_export():
     pool = JaxVlmPrefixCacheLanePool(max_lanes=4, backend=make_default_device_slab_backend())
     pool.put_lane("req-1", _feature(1.0))

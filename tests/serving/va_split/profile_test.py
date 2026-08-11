@@ -929,7 +929,7 @@ def test_compare_action_traces_reports_max_abs_diff():
 
 def test_main_writes_json_with_numpy_actions(tmp_path, monkeypatch):
     output_path = tmp_path / "profile.json"
-    trace = profile_va_split.RequestTrace(
+    ok_trace = profile_va_split.RequestTrace(
         request_id="req-1",
         scheduled_at_s=0.0,
         submitted_at_s=0.0,
@@ -938,7 +938,16 @@ def test_main_writes_json_with_numpy_actions(tmp_path, monkeypatch):
         policy_timing={"infer_ms": 1.0},
         actions=np.asarray([[1.0, 2.0]], dtype=np.float32),
     )
-    result = profile_va_split.BenchmarkResult(traces=[trace], summary={"num_requests": 1})
+    error_trace = profile_va_split.RequestTrace(
+        request_id="req-2",
+        scheduled_at_s=0.2,
+        submitted_at_s=0.2,
+        completed_at_s=0.3,
+        status="error",
+        policy_timing={},
+        error="RuntimeError('worker failed')",
+    )
+    result = profile_va_split.BenchmarkResult(traces=[ok_trace, error_trace], summary={"num_requests": 2})
     monkeypatch.setattr(profile_va_split, "run_profile", lambda args: result)
 
     profile_va_split.main(
@@ -949,9 +958,27 @@ def test_main_writes_json_with_numpy_actions(tmp_path, monkeypatch):
     )
 
     payload = json.loads(output_path.read_text(encoding="utf-8"))
-    assert payload["summary"] == {"num_requests": 1}
-    assert "traces" not in payload
-    assert payload["per_request_e2e_ms"] == {"req-1": 100.0}
+    assert payload["summary"] == {"num_requests": 2}
+    assert payload["per_request_e2e_ms"] == {"req-1": 100.0, "req-2": 99.99999999999997}
+    assert payload["request_traces"] == [
+        {
+            "request_id": "req-1",
+            "scheduled_at_s": 0.0,
+            "submitted_at_s": 0.0,
+            "completed_at_s": 0.1,
+            "status": "ok",
+            "policy_timing": {"infer_ms": 1.0},
+        },
+        {
+            "request_id": "req-2",
+            "scheduled_at_s": 0.2,
+            "submitted_at_s": 0.2,
+            "completed_at_s": 0.3,
+            "status": "error",
+            "policy_timing": {},
+            "error": "RuntimeError('worker failed')",
+        },
+    ]
 
 
 def test_validate_mps_environment_requires_pipe_dir(monkeypatch):

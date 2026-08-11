@@ -2011,8 +2011,23 @@ def benchmark_result_payload(result: BenchmarkResult) -> dict[str, Any]:
     return {
         "summary": result.summary,
         "per_request_e2e_ms": per_request_e2e_ms(result.traces),
+        "request_traces": [request_trace_payload(trace) for trace in result.traces],
         "consistency": result.consistency,
     }
+
+
+def request_trace_payload(trace: RequestTrace) -> dict[str, Any]:
+    payload = {
+        "request_id": trace.request_id,
+        "scheduled_at_s": trace.scheduled_at_s,
+        "submitted_at_s": trace.submitted_at_s,
+        "completed_at_s": trace.completed_at_s,
+        "status": trace.status,
+        "policy_timing": trace.policy_timing,
+    }
+    if trace.error is not None:
+        payload["error"] = trace.error
+    return payload
 
 
 def per_request_e2e_ms(traces: list[RequestTrace]) -> dict[str, float]:

@@ -142,11 +142,13 @@ def test_device_slab_handle_opens_in_consumer_process():
     assert consumer.exitcode == 0
 
 
-def test_device_slab_rejects_sparse_slot_view():
+def test_device_slab_slice_lanes_supports_sparse_slot_views():
     backend = make_default_device_slab_backend()
     slab = backend.create_slab(DeviceSlabSpec(name="x", shape=(1, 2, 3), dtype="float32", max_lanes=4))
-    with pytest.raises(ValueError, match="dense-prefix"):
-        backend.slice_lanes(slab, (0, 2))
+    value = jnp.arange(4 * 2 * 3, dtype=jnp.float32).reshape(4, 2, 3)
+    slab = backend.copy_batch_from_array(slab, 0, value)
+    sliced = backend.slice_lanes(slab, (0, 2))
+    np.testing.assert_allclose(np.asarray(sliced), np.asarray(value[jnp.asarray([0, 2])]))
     slab.close()
 
 
