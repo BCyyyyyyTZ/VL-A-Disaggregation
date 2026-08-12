@@ -13,7 +13,14 @@ def test_multigpu_config_defaults_to_latency_first_batching():
     assert cfg.max_vlm_wait_ms == 0.0
     assert cfg.max_vlm_batch_size == 8
     assert cfg.max_ae_batch_size == 64
+    assert cfg.max_prefix_admits_per_drain == 1
     assert cfg.max_prefix_slots == 48
+
+
+def test_multigpu_config_can_disable_prefix_admit_limit():
+    cfg = JaxMultiGpuVASplitConfig(vlm_devices=("0", "1"), ae_device="2", max_prefix_admits_per_drain=None)
+
+    assert cfg.max_prefix_admits_per_drain is None
 
 
 def test_multigpu_config_rejects_overlapping_devices():

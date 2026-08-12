@@ -37,6 +37,15 @@ class JaxVlmPrefixCacheLanePool:
     def active_request_ids(self) -> tuple[str, ...]:
         return tuple(self._request_to_lane)
 
+    def template_row(self) -> JaxPrefixFeature:
+        if self._past_slabs is None or self._prefix_pad_masks is None:
+            raise RuntimeError("Cannot view prefix template before initialization")
+        return JaxPrefixFeature(
+            past_key_values=_view_tree_batch(self._backend, self._past_slabs, 1),
+            prefix_pad_masks=self._backend.view_batch(self._prefix_pad_masks, 1),
+            state=self._backend.view_batch(self._state, 1) if self._state is not None else None,
+        )
+
     def initialize_from_feature(self, feature: JaxPrefixFeature) -> None:
         """Allocate slab storage from a template row without activating any lane."""
         _validate_single_row_feature(feature)
@@ -168,6 +177,9 @@ class JaxVlmPrefixCacheLanePool:
                 "AE batch selection must use the request ids currently occupying lanes [0, batch_size)."
             )
         return self._view_prefix_lanes(lane_ids)
+
+    def export_single_view(self, request_id: str) -> JaxPrefixFeature:
+        return self._view_prefix_lanes((self._request_to_lane[request_id],))
 
     def export_slab_handle_tree(self) -> dict[str, Any]:
         if self._past_slabs is None or self._prefix_pad_masks is None:

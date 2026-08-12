@@ -2,9 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Literal
-from typing import TypeAlias
-from typing import cast
+from typing import Literal, TypeAlias, cast
 
 CrossCardTransferStrategy: TypeAlias = Literal["device-direct", "host-staged"]
 _VALID_CROSS_CARD_TRANSFER_STRATEGIES = frozenset({"device-direct", "host-staged"})
@@ -31,6 +29,7 @@ class JaxMultiGpuVASplitConfig:
     max_vlm_batch_size: int = 8
     max_vlm_wait_ms: float = 0.0
     max_ae_batch_size: int = 64
+    max_prefix_admits_per_drain: int | None = 1
     max_prefix_slots: int | None = None
     start_method: str = "spawn"
     cross_card_transfer_strategy: CrossCardTransferStrategy = "device-direct"
@@ -56,6 +55,8 @@ class JaxMultiGpuVASplitConfig:
             raise ValueError("max_vlm_wait_ms must be non-negative")
         if self.max_ae_batch_size <= 0:
             raise ValueError("max_ae_batch_size must be positive")
+        if self.max_prefix_admits_per_drain is not None and self.max_prefix_admits_per_drain <= 0:
+            raise ValueError("max_prefix_admits_per_drain must be positive when set")
         max_prefix_slots = self.max_prefix_slots
         if max_prefix_slots is None:
             max_prefix_slots = max(1, len(vlm_devices)) * max(self.max_vlm_batch_size, 1) * 3

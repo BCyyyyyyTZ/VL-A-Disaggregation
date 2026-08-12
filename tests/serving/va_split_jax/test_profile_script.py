@@ -298,6 +298,8 @@ printf '%s\n' "$@" >"${PYTHON_ARG_LOG}"
     assert _flag_value(args, "--ae-device") == "2"
     assert _flag_value(args, "--cross-card-transfer-strategy") == "host-staged"
     assert _flag_value(args, "--request-rate-hz-values") == "8,16"
+    assert _flag_value(args, "--max-vlm-wait-ms") == "0.0"
+    assert _flag_value(args, "--max-prefix-admits-per-drain") == "1"
     assert "--no-jax-compile" in args
     assert "--no-jax-compile-warmup" in args
 

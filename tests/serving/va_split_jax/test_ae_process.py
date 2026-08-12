@@ -56,6 +56,22 @@ class FailingStepModel(FakeJaxAEModel):
         raise RuntimeError("bad step")
 
 
+class PrefixStateEchoModel(FakeJaxAEModel):
+    def denoise_one_batch(self, prefix_batch: JaxPrefixFeature, denoise_batch: JaxDenoiseState) -> jax.Array:
+        self.batch_sizes.append(int(denoise_batch.x_t.shape[0]))
+        self.prefix_slot_batch_shapes.append(tuple(prefix_batch.prefix_pad_masks.shape))
+        assert prefix_batch.state is not None
+        values = prefix_batch.state[:, :1].reshape((-1, 1, 1))
+        return jnp.broadcast_to(values, denoise_batch.x_t.shape)
+
+
+class PoisonBatchExportPool(JaxVlmPrefixCacheLanePool):
+    def export_batch_view(self, request_ids: tuple[str, ...]) -> JaxPrefixFeature:
+        if len(request_ids) > 1:
+            return _batch_feature(*([99.0] * len(request_ids)))
+        return super().export_batch_view(request_ids)
+
+
 class SimpleQueue:
     def __init__(self, messages=()):
         self._messages = list(messages)
@@ -86,6 +102,17 @@ def _feature(fill: float) -> JaxPrefixFeature:
         ),
         prefix_pad_masks=jnp.ones((1, 3), dtype=jnp.bool_),
         state=jnp.full((1, 8), fill, dtype=jnp.float32),
+    )
+
+
+def _batch_feature(*fills: float) -> JaxPrefixFeature:
+    return JaxPrefixFeature(
+        past_key_values=(
+            jnp.concatenate([jnp.full((3, 1, 2, 4), fill, dtype=jnp.float32) for fill in fills], axis=1),
+            jnp.concatenate([jnp.full((3, 1, 2, 4), fill + 1, dtype=jnp.float32) for fill in fills], axis=1),
+        ),
+        prefix_pad_masks=jnp.ones((len(fills), 3), dtype=jnp.bool_),
+        state=jnp.concatenate([jnp.full((1, 8), fill, dtype=jnp.float32) for fill in fills], axis=0),
     )
 
 
@@ -221,6 +248,36 @@ def test_jax_ae_process_waits_for_free_prefix_slot_before_draining_more_ready_me
     assert list(process.worker.active) == ["req-2"]
 
 
+def test_jax_ae_process_limits_prefix_admits_per_drain():
+    backend = make_default_device_slab_backend()
+    pool = JaxVlmPrefixCacheLanePool(max_lanes=4, backend=backend)
+    pool.initialize_from_feature(_feature(0.0))
+    for lane_id, fill in enumerate((1.0, 2.0, 3.0)):
+        pool.write_lane(lane_id, _feature(fill))
+    prefix_queue = SimpleQueue([
+        _ready("req-1", 0, num_steps=2),
+        _ready("req-2", 1, num_steps=2),
+        _ready("req-3", 2, num_steps=2),
+    ])
+    process = JaxAEProcess(
+        model=FakeJaxAEModel(),
+        prefix_queue=prefix_queue,
+        result_queue=SimpleQueue(),
+        release_queue=SimpleQueue(),
+        max_batch_size=4,
+        max_prefix_slots=4,
+        backend=backend,
+        owned_pool=pool,
+        max_prefix_admits_per_drain=2,
+    )
+    process.worker.attach_initialized_pool(pool)
+
+    process.drain_prefix_ready(block=True)
+
+    assert list(process.worker.active) == ["req-1", "req-2"]
+    assert [message.request_id for message in prefix_queue.remaining()] == ["req-3"]
+
+
 def test_jax_ae_process_releases_active_features_when_step_fails():
     backend, pool = _owned_pool_with_written_lanes(1.0, 2.0)
     result_queue = SimpleQueue()
@@ -273,6 +330,32 @@ def test_jax_ae_process_accepts_out_of_order_sparse_prefix_lanes():
     assert [result.request_id for result in results] == ["req-1", "req-2"]
     assert [release.request_id for release in releases] == ["req-1", "req-2"]
     assert process.worker.active == {}
+
+
+def test_jax_ae_worker_steps_from_dense_active_prefix_shadow():
+    backend = make_default_device_slab_backend()
+    pool = PoisonBatchExportPool(max_lanes=4, backend=backend, compact_lanes=False)
+    pool.initialize_from_feature(_feature(0.0))
+    pool.write_lane(1, _feature(1.0))
+    pool.write_lane(0, _feature(2.0))
+    worker = JaxAEWorker(
+        model=PrefixStateEchoModel(),
+        max_batch_size=2,
+        max_prefix_slots=4,
+        backend=backend,
+        owned_pool=pool,
+        use_prefix_shadow=True,
+    )
+    worker.attach_initialized_pool(pool)
+
+    worker.add_prefix(_ready("req-1", 1))
+    worker.add_prefix(_ready("req-2", 0))
+    results, releases = worker.step_once()
+
+    assert [release.request_id for release in releases] == ["req-1", "req-2"]
+    assert [result.request_id for result in results] == ["req-1", "req-2"]
+    np.testing.assert_allclose(_actions_array(results[0].actions), -jnp.ones((1, 2, 1), dtype=jnp.float32))
+    np.testing.assert_allclose(_actions_array(results[1].actions), -2 * jnp.ones((1, 2, 1), dtype=jnp.float32))
 
 
 def test_jax_ae_process_shutdown_closes_worker():

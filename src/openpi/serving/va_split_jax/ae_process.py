@@ -70,6 +70,7 @@ class JaxAEWorker:
         compile_config: JaxCompileConfig | None = None,
         noise_factory=None,
         owned_pool: JaxVlmPrefixCacheLanePool | None = None,
+        use_prefix_shadow: bool = False,
     ):
         if max_batch_size <= 0:
             raise ValueError("max_batch_size must be positive")
@@ -86,6 +87,14 @@ class JaxAEWorker:
             backend=self._backend,
             compact_lanes=False,
         )
+        self._use_prefix_shadow = use_prefix_shadow
+        self._active_prefix_pool: JaxVlmPrefixCacheLanePool | None = None
+        if self._use_prefix_shadow:
+            self._active_prefix_pool = JaxVlmPrefixCacheLanePool(
+                max_lanes=max_prefix_slots,
+                backend=self._backend,
+                compact_lanes=True,
+            )
         if self._owned_pool.max_lanes != max_prefix_slots:
             raise ValueError("owned_pool.max_lanes must equal max_prefix_slots")
         self._compile_config = compile_config
@@ -137,6 +146,8 @@ class JaxAEWorker:
         self._pool_init_ms = (time.monotonic_ns() - start_ns) / 1_000_000
         self._pool_ready = True
         self._maybe_warmup_owned_pool()
+        if self._active_prefix_pool is not None:
+            self._active_prefix_pool.initialize_from_feature(template)
         return self.export_slab_ready(), self.initial_lane_credits()
 
     def export_slab_ready(self) -> JaxPrefixSlabReady:
@@ -170,6 +181,13 @@ class JaxAEWorker:
         if not pool.initialized:
             raise RuntimeError("attach_initialized_pool requires an initialized pool")
         self._owned_pool = pool
+        if self._use_prefix_shadow:
+            self._active_prefix_pool = JaxVlmPrefixCacheLanePool(
+                max_lanes=self._max_prefix_slots,
+                backend=self._backend,
+                compact_lanes=True,
+            )
+            self._active_prefix_pool.initialize_from_feature(pool.template_row())
         self._pool_ready = True
         self._ipc_warmup_done = True
         self._invalidate_prefix_batch_cache()
@@ -256,6 +274,9 @@ class JaxAEWorker:
     def _clear_owned_pool_active(self) -> None:
         for request_id in self._owned_pool.active_request_ids:
             self._owned_pool.release_lane(request_id)
+        if self._active_prefix_pool is not None:
+            for request_id in self._active_prefix_pool.active_request_ids:
+                self._active_prefix_pool.release_lane(request_id)
 
     def close(self) -> None:
         self._clear_owned_pool_active()
@@ -318,6 +339,14 @@ class JaxAEWorker:
         dense_lane, vacated = self._owned_pool.claim_written_lane(ready.request_id, ready.slot_handle.slot_id)
         if dense_lane != lane_id:
             raise RuntimeError(f"AE owned prefix lane mismatch: pool={dense_lane} ae={lane_id}")
+        prefix_shadow_copy_ms = 0.0
+        if self._active_prefix_pool is not None:
+            prefix_shadow_start_ns = time.monotonic_ns()
+            prefix_row = self._owned_pool.export_single_view(ready.request_id)
+            shadow_lane = self._active_prefix_pool.put_lane(ready.request_id, prefix_row)
+            if shadow_lane != lane_id:
+                raise RuntimeError(f"AE active prefix shadow lane mismatch: pool={shadow_lane} ae={lane_id}")
+            prefix_shadow_copy_ms = (time.monotonic_ns() - prefix_shadow_start_ns) / 1_000_000
         if vacated is not None:
             self._pending_lane_credits.append(int(vacated))
         dense_state_start_ns = time.monotonic_ns()
@@ -325,6 +354,7 @@ class JaxAEWorker:
         self._append_dense_state_lane(x_t=x_t, step_idx=jnp.zeros_like(dt, dtype=jnp.int32), dt=dt)
         timing["ae_state_admit_stage_ms"] = (time.monotonic_ns() - dense_state_start_ns) / 1_000_000
         timing["prefix_lane_ingest_ms"] = 0.0
+        timing["prefix_shadow_copy_ms"] = prefix_shadow_copy_ms
         timing["prefix_pool_write_ms"] = (time.monotonic_ns() - admit_start_ns) / 1_000_000
         state = JaxAERequestState(
             request_id=ready.request_id,
@@ -468,6 +498,8 @@ class JaxAEWorker:
         releases: list[JaxReleaseFeature] = []
         for request_id in list(self.active):
             freed = self._owned_pool.release_lane(request_id)
+            if self._active_prefix_pool is not None:
+                self._active_prefix_pool.release_lane(request_id)
             if freed is not None:
                 releases.append(JaxReleaseFeature(request_id=request_id, slot_id=freed))
         self.active.clear()
@@ -483,7 +515,8 @@ class JaxAEWorker:
         request_ids = tuple(request.request_id for request in batch)
         if self._prefix_batch_cache is not None and self._prefix_batch_cache_key == request_ids:
             return self._prefix_batch_cache, True
-        prefix_batch = self._owned_pool.export_batch_view(request_ids)
+        prefix_pool = self._active_prefix_pool or self._owned_pool
+        prefix_batch = prefix_pool.export_batch_view(request_ids)
         self._prefix_batch_cache = prefix_batch
         self._prefix_batch_cache_key = request_ids
         return prefix_batch, False
@@ -569,6 +602,8 @@ class JaxAEWorker:
         freed_by_request: dict[str, int] = {}
         for request in sorted(completed, key=lambda item: item.active_lane_id, reverse=True):
             freed = self._owned_pool.release_lane(request.request_id)
+            if self._active_prefix_pool is not None:
+                self._active_prefix_pool.release_lane(request.request_id)
             if freed is None:
                 raise RuntimeError(f"Owned pool missing lane for {request.request_id}")
             freed_by_request[request.request_id] = freed
@@ -589,6 +624,8 @@ class JaxAEWorker:
         last_lane = self._active_count - 1
         compact_start_ns = time.monotonic_ns()
         freed = self._owned_pool.release_lane(request.request_id)
+        if self._active_prefix_pool is not None:
+            self._active_prefix_pool.release_lane(request.request_id)
         if freed is None:
             raise RuntimeError(f"Owned pool missing lane for {request.request_id}")
         if lane_id != last_lane:
@@ -713,7 +750,10 @@ class JaxAEProcess:
         compile_config: JaxCompileConfig | None = None,
         noise_factory=None,
         owned_pool: JaxVlmPrefixCacheLanePool | None = None,
+        max_prefix_admits_per_drain: int | None = 1,
     ):
+        if max_prefix_admits_per_drain is not None and max_prefix_admits_per_drain <= 0:
+            raise ValueError("max_prefix_admits_per_drain must be positive when set")
         self.worker = JaxAEWorker(
             model=model,
             max_batch_size=max_batch_size,
@@ -727,6 +767,7 @@ class JaxAEProcess:
         self._result_queue = result_queue
         self._release_queue = release_queue
         self._prefix_backlog: deque[object] = deque()
+        self._max_prefix_admits_per_drain = max_prefix_admits_per_drain
 
     def bootstrap_owned_pool(self, template: JaxPrefixFeature) -> float:
         """Create AE-owned slabs, export to VLM via release_queue, warm denoise."""
@@ -766,6 +807,7 @@ class JaxAEProcess:
             self._result_queue.put(JaxActionResult(request_id=result.request_id, actions=actions, timing=timing))
 
     def drain_prefix_ready(self, *, block: bool) -> None:
+        admitted = 0
         while True:
             try:
                 message = self._next_prefix_message(block=block)
@@ -789,6 +831,7 @@ class JaxAEProcess:
                 return
             try:
                 self.worker.add_prefix(message)
+                admitted += 1
                 pending = self.worker.take_pending_lane_credits()
                 if pending is not None:
                     self._release_queue.put(pending)
@@ -805,6 +848,8 @@ class JaxAEProcess:
                 )
             if block:
                 block = False
+            if self._max_prefix_admits_per_drain is not None and admitted >= self._max_prefix_admits_per_drain:
+                return
             if not self.worker.can_accept_prefix:
                 return
 

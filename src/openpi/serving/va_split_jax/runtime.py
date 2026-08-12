@@ -246,6 +246,7 @@ def _run_jax_ae_process(
     compile_config=None,
     env_updates=None,
     warmup_queue=None,
+    max_prefix_admits_per_drain=1,
 ) -> None:
     _apply_env_updates(env_updates)
     model, template = _unwrap_model_with_prefix_template(model_factory())
@@ -266,6 +267,7 @@ def _run_jax_ae_process(
         max_prefix_slots=max_prefix_slots,
         compile_config=compile_config,
         noise_factory=noise_factory,
+        max_prefix_admits_per_drain=max_prefix_admits_per_drain,
     )
     ipc_batches = process.bootstrap_owned_pool(template)
     if warmup_queue is not None:
@@ -404,6 +406,7 @@ class JaxMultiGpuProcessVASplitRuntime:
                 compile_config,
                 None,
                 self._warmup_queue,
+                config.max_prefix_admits_per_drain,
             ),
             kwargs={"device": config.ae_device, "env_updates": ae_env_updates},
             daemon=True,
@@ -891,6 +894,7 @@ def _aggregate_batch_timing(row_timings: list[dict[str, float]], *, batch_size: 
         "va_split_transfer_ms",
         "va_split_queue_wait_ms",
         "prefix_pool_write_ms",
+        "prefix_shadow_copy_ms",
         "prefix_pool_compact_ms",
         "prefix_pool_overhead_ms",
         "infer_queue_wait_ms",

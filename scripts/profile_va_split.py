@@ -126,6 +126,7 @@ class Args:
     max_ae_batch_size: int = 8
     max_vlm_batch_size: int = 8
     max_vlm_wait_ms: float = 2.0
+    max_prefix_admits_per_drain: int = 1
     vlm_devices: str = ""
     ae_device: str = ""
     baseline_devices: str = ""
@@ -626,6 +627,9 @@ def summarize_traces(
         "prefix_pool_write_mean_ms": _timing_mean(completed, "prefix_pool_write_ms"),
         "prefix_pool_write_p50_ms": _timing_percentile(completed, "prefix_pool_write_ms", 50),
         "prefix_pool_write_p95_ms": _timing_percentile(completed, "prefix_pool_write_ms", 95),
+        "prefix_shadow_copy_mean_ms": _timing_mean(completed, "prefix_shadow_copy_ms"),
+        "prefix_shadow_copy_p50_ms": _timing_percentile(completed, "prefix_shadow_copy_ms", 50),
+        "prefix_shadow_copy_p95_ms": _timing_percentile(completed, "prefix_shadow_copy_ms", 95),
         "prefix_pool_compact_mean_ms": _timing_mean(completed, "prefix_pool_compact_ms"),
         "prefix_pool_compact_p50_ms": _timing_percentile(completed, "prefix_pool_compact_ms", 50),
         "prefix_pool_compact_p95_ms": _timing_percentile(completed, "prefix_pool_compact_ms", 95),
@@ -1463,6 +1467,9 @@ def create_policy_for_mode(args: Args, mode: Mode):
             jax_compile_warmup=args.jax_compile_warmup,
             jax_compile_warmup_max_batch_size=args.jax_compile_warmup_max_batch_size,
             cross_card_transfer_strategy=args.cross_card_transfer_strategy,
+            max_prefix_admits_per_drain=(
+                None if args.max_prefix_admits_per_drain <= 0 else args.max_prefix_admits_per_drain
+            ),
         )
     if mode == "jax-multigpu-baseline":
         return JaxMultiGpuBaselineProfilePolicy(
