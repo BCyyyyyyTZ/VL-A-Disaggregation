@@ -153,6 +153,10 @@ def test_jax_process_runtime_collect_results_records_ae_result_transfer_latency(
     runtime._pending_results = {}
     runtime._pending_errors = {}
     runtime._shutdown_seen = False
+    runtime._admission_semaphore = threading.BoundedSemaphore(1)
+    assert runtime._admission_semaphore.acquire(timeout=0.01)
+    runtime._admission_limit = 1
+    runtime._admitted_request_ids = {"req-1"}
 
     runtime._collect_results()
 
@@ -163,6 +167,25 @@ def test_jax_process_runtime_collect_results_records_ae_result_transfer_latency(
     assert timing["va_split_transfer_ms"] == timing["ae_result_transfer_ms"]
     assert timing["va_split_queue_wait_ms"] == timing["ae_result_queue_wait_ms"]
     assert "_ae_result_enqueue_ns" not in timing
+    assert runtime._admitted_request_ids == set()
+
+
+def test_jax_process_runtime_request_admission_is_released_by_request_id():
+    runtime = object.__new__(JaxProcessVASplitRuntime)
+    runtime._condition = threading.Condition()
+    runtime._admission_semaphore = threading.BoundedSemaphore(1)
+    runtime._admission_limit = 1
+    runtime._admitted_request_ids = set()
+
+    runtime._acquire_request_admission(("req-1",), timeout_s=0.01)
+    with pytest.raises(TimeoutError, match="admission"):
+        runtime._acquire_request_admission(("req-2",), timeout_s=0.01)
+
+    with runtime._condition:
+        runtime._release_request_admission_locked("req-1")
+
+    runtime._acquire_request_admission(("req-2",), timeout_s=0.01)
+    assert runtime._admitted_request_ids == {"req-2"}
 
 
 def test_jax_process_runtime_infer_after_shutdown_raises():

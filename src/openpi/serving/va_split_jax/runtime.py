@@ -858,6 +858,9 @@ class JaxProcessVASplitRuntime:
         self._shutdown_seen = False
         self._closed = False
         self._condition = threading.Condition()
+        self._admission_limit = max(1, int(max_prefix_slots))
+        self._admission_semaphore = threading.BoundedSemaphore(self._admission_limit)
+        self._admitted_request_ids: set[str] = set()
         self._compile_timing = {"jax_warmup_batches": 0.0}
         self._model_factory = model_factory
         self._vlm_model_factory = vlm_model_factory or model_factory
@@ -1010,14 +1013,20 @@ class JaxProcessVASplitRuntime:
         if self._closed:
             raise RuntimeError("JAX VA split runtime is shut down")
         request_id = str(uuid.uuid4())
-        self._request_queue.put(
-            JaxRequestEnvelope(
-                request_id=request_id,
-                observation=observation,
-                sample_kwargs=dict(sample_kwargs),
-                enqueue_ns=time.monotonic_ns(),
+        self._acquire_request_admission((request_id,), timeout_s=self._result_timeout_s)
+        try:
+            self._request_queue.put(
+                JaxRequestEnvelope(
+                    request_id=request_id,
+                    observation=observation,
+                    sample_kwargs=dict(sample_kwargs),
+                    enqueue_ns=time.monotonic_ns(),
+                )
             )
-        )
+        except Exception:
+            with self._condition:
+                self._release_request_admission_locked(request_id)
+            raise
         return self._wait_for_result(request_id)
 
     def infer_batch(self, observation: dict, sample_kwargs: dict) -> JaxActionResult:
@@ -1026,17 +1035,54 @@ class JaxProcessVASplitRuntime:
         batch_size = int(observation["state"].shape[0])
         batch_id = str(uuid.uuid4())
         request_ids = tuple(f"{batch_id}:{row}" for row in range(batch_size))
-        self._request_queue.put(
-            JaxBatchRequestEnvelope(
-                batch_id=batch_id,
-                request_ids=request_ids,
-                observation=observation,
-                sample_kwargs=dict(sample_kwargs),
-                enqueue_ns=time.monotonic_ns(),
+        self._acquire_request_admission(request_ids, timeout_s=self._result_timeout_s)
+        try:
+            self._request_queue.put(
+                JaxBatchRequestEnvelope(
+                    batch_id=batch_id,
+                    request_ids=request_ids,
+                    observation=observation,
+                    sample_kwargs=dict(sample_kwargs),
+                    enqueue_ns=time.monotonic_ns(),
+                )
             )
-        )
+        except Exception:
+            with self._condition:
+                for request_id in request_ids:
+                    self._release_request_admission_locked(request_id)
+            raise
         results_by_id = {request_id: self._wait_for_result(request_id) for request_id in request_ids}
         return _combine_ordered_results(batch_id, request_ids, results_by_id)
+
+    def _acquire_request_admission(self, request_ids: tuple[str, ...], *, timeout_s: float) -> None:
+        deadline = time.monotonic() + max(timeout_s, 0.0)
+        acquired: list[str] = []
+        try:
+            for request_id in request_ids:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not self._admission_semaphore.acquire(timeout=remaining):
+                    raise TimeoutError(
+                        "Timed out waiting for JAX VA split request admission "
+                        f"({len(self._admitted_request_ids)}/{self._admission_limit} admitted)"
+                    )
+                acquired.append(request_id)
+                with self._condition:
+                    self._admitted_request_ids.add(request_id)
+        except Exception:
+            with self._condition:
+                for request_id in acquired:
+                    self._release_request_admission_locked(request_id)
+            raise
+
+    def _release_request_admission_locked(self, request_id: str) -> None:
+        if request_id not in self._admitted_request_ids:
+            return
+        self._admitted_request_ids.remove(request_id)
+        self._admission_semaphore.release()
+
+    def _release_all_request_admissions_locked(self) -> None:
+        for request_id in tuple(self._admitted_request_ids):
+            self._release_request_admission_locked(request_id)
 
     def _wait_for_result(self, request_id: str) -> JaxActionResult:
         deadline = time.monotonic() + self._result_timeout_s
@@ -1047,11 +1093,14 @@ class JaxProcessVASplitRuntime:
                 if request_id in self._pending_errors:
                     raise _worker_error_to_runtime_error(self._pending_errors.pop(request_id))
                 if None in self._pending_errors:
+                    self._release_all_request_admissions_locked()
                     raise _worker_error_to_runtime_error(self._pending_errors[None])
                 if self._shutdown_seen:
+                    self._release_all_request_admissions_locked()
                     raise RuntimeError("JAX VA split worker shut down before producing a result")
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
+                    self._release_request_admission_locked(request_id)
                     raise TimeoutError(f"Timed out waiting for JAX VA split result {request_id}")
                 self._condition.wait(timeout=remaining)
 
@@ -1063,14 +1112,20 @@ class JaxProcessVASplitRuntime:
                 return
             with self._condition:
                 if isinstance(message, JaxActionResult):
+                    self._release_request_admission_locked(message.request_id)
                     self._pending_results[message.request_id] = _mark_collected_result(
                         message,
                         get_start_ns=get_start_ns,
                         get_end_ns=get_end_ns,
                     )
                 elif isinstance(message, JaxWorkerError):
+                    if message.request_id is None:
+                        self._release_all_request_admissions_locked()
+                    else:
+                        self._release_request_admission_locked(message.request_id)
                     self._pending_errors[message.request_id] = message
                 elif isinstance(message, JaxShutdown):
+                    self._release_all_request_admissions_locked()
                     self._shutdown_seen = True
                 self._condition.notify_all()
             if isinstance(message, JaxShutdown):

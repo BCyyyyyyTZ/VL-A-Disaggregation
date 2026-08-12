@@ -36,6 +36,7 @@ from openpi.serving.va_split_jax.types import JaxWorkerError
 
 _BACKLOG_DRAIN_PER_ROW_MS = 2.0
 _BACKLOG_DRAIN_MAX_MS = 25.0
+_LATE_FCFS_TARGET_BATCH_SIZE = 6
 
 
 class JaxVLMWorker:
@@ -540,18 +541,26 @@ class JaxVLMProcess:
         collect_start_ns = time.monotonic_ns()
         deadline_ns = self._fcfs_collect_deadline_ns(first_request, collect_start_ns=collect_start_ns)
         self._drain_releases()
+        batch_limit = self._current_fcfs_batch_limit(
+            first_request,
+            candidate_count=len(requests) + len(self._backlog),
+        )
         timeline_log.emit(
             "vlm_batch_collect_begin",
             first=first_request.request_id,
-            limit=self._current_fcfs_batch_limit(),
+            limit=batch_limit,
             available=self.worker.available_live_feature_slots,
             backlog=len(self._backlog),
         )
 
-        while len(requests) < self._current_fcfs_batch_limit():
+        while len(requests) < batch_limit:
             self._drain_releases()
-            self._prefetch_request_backlog(max_messages=self._current_fcfs_batch_limit() - len(requests))
-            if len(requests) >= self._current_fcfs_batch_limit():
+            self._prefetch_request_backlog(max_messages=self._raw_fcfs_batch_limit() - len(requests))
+            batch_limit = self._current_fcfs_batch_limit(
+                first_request,
+                candidate_count=len(requests) + len(self._backlog),
+            )
+            if len(requests) >= batch_limit:
                 break
             try:
                 message = self._next_fcfs_candidate(deadline_ns)
@@ -570,7 +579,7 @@ class JaxVLMProcess:
         timeline_log.emit(
             "vlm_batch_collect_end",
             batch=len(requests),
-            limit=self._current_fcfs_batch_limit(),
+            limit=batch_limit,
             available=self.worker.available_live_feature_slots,
             backlog=len(self._backlog),
             shutdown_after_batch=shutdown_after_batch,
@@ -578,8 +587,23 @@ class JaxVLMProcess:
         )
         return requests, shutdown_after_batch
 
-    def _current_fcfs_batch_limit(self) -> int:
+    def _current_fcfs_batch_limit(
+        self,
+        first_request: JaxRequestEnvelope | None = None,
+        *,
+        candidate_count: int = 0,
+    ) -> int:
+        limit = self._raw_fcfs_batch_limit()
+        if first_request is not None and self._is_late_fcfs_head(first_request) and candidate_count < limit:
+            limit = min(limit, _LATE_FCFS_TARGET_BATCH_SIZE)
+        return limit
+
+    def _raw_fcfs_batch_limit(self) -> int:
         return min(self._max_batch_size, self.worker.available_live_feature_slots)
+
+    def _is_late_fcfs_head(self, first_request: JaxRequestEnvelope) -> bool:
+        wait_ns = int(self._max_wait_ms * 1_000_000)
+        return wait_ns > 0 and _request_waited_past_fcfs_window(first_request, wait_ns=wait_ns)
 
     def _fcfs_collect_deadline_ns(self, first_request: JaxRequestEnvelope, *, collect_start_ns: int) -> int:
         wait_ns = int(self._max_wait_ms * 1_000_000)

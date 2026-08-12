@@ -432,10 +432,39 @@ def test_jax_vlm_process_fcfs_drains_slow_feeder_when_head_request_is_already_la
     process.run()
 
     ready = [item for item in prefix_queue.items if isinstance(item, JaxPrefixReady)]
+    assert model.prefix_batch_sizes == [6, 2]
+    assert [item.request_id for item in ready] == [f"req-{idx}" for idx in range(8)]
+    assert [item.timing["vlm_effective_batch"] for item in ready] == [6.0] * 6 + [2.0] * 2
+    assert isinstance(prefix_queue.items[-1], JaxShutdown)
+
+
+def test_jax_vlm_process_keeps_full_batch_when_late_head_has_deep_backlog():
+    model = FakeJaxSplitModel()
+    pool = _shared_pool(max_lanes=8)
+    old_enqueue_ns = time.monotonic_ns() - 50_000_000
+    request_queue = SimpleQueue(
+        [_request(f"req-{idx}", enqueue_ns=old_enqueue_ns) for idx in range(8)] + [JaxShutdown()]
+    )
+    prefix_queue = SimpleQueue()
+    process = JaxVLMProcess(
+        model=model,
+        request_queue=request_queue,
+        prefix_queue=prefix_queue,
+        release_queue=SimpleQueue(),
+        max_batch_size=8,
+        max_wait_ms=1.0,
+        max_live_features=8,
+        shared_pool=pool,
+    )
+    process.worker.attach_shared_pool(pool, JaxLaneCredits(lane_ids=tuple(range(8))))
+    process._ae_export_ready = True
+
+    process.run()
+
+    ready = [item for item in prefix_queue.items if isinstance(item, JaxPrefixReady)]
     assert model.prefix_batch_sizes == [8]
     assert [item.request_id for item in ready] == [f"req-{idx}" for idx in range(8)]
     assert [item.timing["vlm_effective_batch"] for item in ready] == [8.0] * 8
-    assert isinstance(prefix_queue.items[-1], JaxShutdown)
 
 
 def test_jax_vlm_worker_keeps_row_noise_host_side_for_prefix_ready():
