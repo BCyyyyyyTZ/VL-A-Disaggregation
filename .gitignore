@@ -18,6 +18,9 @@ logs/V-A/**
 !logs/V-A/**/*.md
 wandb/
 
+# Temporary local diagnostics.
+scripts/diag_*.py
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
@@ -144,6 +147,7 @@ celerybeat.pid
 # Environments
 .env
 .venv
+.venv2
 env/
 venv/
 ENV/
