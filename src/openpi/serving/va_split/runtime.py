@@ -194,7 +194,25 @@ class ProcessVASplitRuntime:
         enable_component_timing: bool = True,
     ):
         if max_prefix_slots is None:
-            max_prefix_slots = max_vlm_batch_size * 3
+            # Optional experiment knobs (default remains max_vlm_batch_size * 3):
+            #   MAX_PREFIX_SLOTS / VA_SPLIT_MAX_PREFIX_SLOTS / JAX_VA_MAX_PREFIX_SLOTS
+            #   PREFIX_SLOT_MULTIPLIER / VA_SPLIT_PREFIX_SLOT_MULTIPLIER / JAX_VA_PREFIX_SLOT_MULTIPLIER
+            env_slots = (
+                os.environ.get("MAX_PREFIX_SLOTS")
+                or os.environ.get("VA_SPLIT_MAX_PREFIX_SLOTS")
+                or os.environ.get("JAX_VA_MAX_PREFIX_SLOTS")
+            )
+            env_mult = (
+                os.environ.get("PREFIX_SLOT_MULTIPLIER")
+                or os.environ.get("VA_SPLIT_PREFIX_SLOT_MULTIPLIER")
+                or os.environ.get("JAX_VA_PREFIX_SLOT_MULTIPLIER")
+            )
+            if env_slots:
+                max_prefix_slots = max(1, int(env_slots))
+            elif env_mult:
+                max_prefix_slots = max(1, int(max_vlm_batch_size) * int(env_mult))
+            else:
+                max_prefix_slots = max_vlm_batch_size * 3
         self._model_factory = model_factory
         self._vlm_model_factory = vlm_model_factory or model_factory
         self._ae_model_factory = ae_model_factory or model_factory

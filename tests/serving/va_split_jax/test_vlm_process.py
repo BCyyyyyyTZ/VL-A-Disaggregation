@@ -10,6 +10,7 @@ import numpy as np
 from openpi.models.jax_split_types import JaxPrefixFeature
 from openpi.serving.va_split_jax.device_slab import make_default_device_slab_backend
 from openpi.serving.va_split_jax.prefix_cache_pool import JaxVlmPrefixCacheLanePool
+from openpi.serving.va_split_jax.types import JaxBatchRequestEnvelope
 from openpi.serving.va_split_jax.types import JaxLaneCredits
 from openpi.serving.va_split_jax.types import JaxPrefixReady
 from openpi.serving.va_split_jax.types import JaxReleaseFeature
@@ -18,6 +19,8 @@ from openpi.serving.va_split_jax.types import JaxShutdown
 from openpi.serving.va_split_jax.vlm_process import JaxVLMProcess
 from openpi.serving.va_split_jax.vlm_process import JaxVLMWorker
 from openpi.serving.va_split_jax.vlm_process import _asarray_model_input
+from openpi.serving.va_split_jax.vlm_process import _split_batch_request_envelope
+from openpi.serving.va_split_jax.vlm_process import _stack_request_observations
 from openpi.serving.va_split_jax.vlm_process import _vlm_request_queue_timings
 
 
@@ -109,11 +112,17 @@ def _request_observation(*, prompt_len: int = 8) -> dict:
     }
 
 
-def _request(request_id: str, *, prompt_len: int = 8, enqueue_ns: int = 123) -> JaxRequestEnvelope:
+def _request(
+    request_id: str,
+    *,
+    prompt_len: int = 8,
+    enqueue_ns: int = 123,
+    num_steps: int = 4,
+) -> JaxRequestEnvelope:
     return JaxRequestEnvelope(
         request_id=request_id,
         observation=_request_observation(prompt_len=prompt_len),
-        sample_kwargs={"num_steps": 4},
+        sample_kwargs={"num_steps": num_steps},
         enqueue_ns=enqueue_ns,
     )
 
@@ -410,7 +419,38 @@ def test_jax_vlm_process_fcfs_drains_pending_credits_before_fixing_batch_limit()
 def test_jax_vlm_process_fcfs_drains_slow_feeder_when_head_request_is_already_late():
     model = FakeJaxSplitModel()
     pool = _shared_pool(max_lanes=8)
-    old_enqueue_ns = time.monotonic_ns() - 50_000_000
+    old_enqueue_ns = time.monotonic_ns() - 75_000_000
+    request_queue = SlowFeederQueue(
+        [_request(f"req-{idx}", enqueue_ns=old_enqueue_ns) for idx in range(8)] + [JaxShutdown()],
+        message_delay_s=0.0015,
+    )
+    prefix_queue = SimpleQueue()
+    process = JaxVLMProcess(
+        model=model,
+        request_queue=request_queue,
+        prefix_queue=prefix_queue,
+        release_queue=SimpleQueue(),
+        max_batch_size=8,
+        max_wait_ms=50.0,
+        max_live_features=8,
+        shared_pool=pool,
+    )
+    process.worker.attach_shared_pool(pool, JaxLaneCredits(lane_ids=tuple(range(8))))
+    process._ae_export_ready = True
+
+    process.run()
+
+    ready = [item for item in prefix_queue.items if isinstance(item, JaxPrefixReady)]
+    assert model.prefix_batch_sizes == [6, 2]
+    assert [item.request_id for item in ready] == [f"req-{idx}" for idx in range(8)]
+    assert [item.timing["vlm_effective_batch"] for item in ready] == [6.0] * 6 + [2.0] * 2
+    assert isinstance(prefix_queue.items[-1], JaxShutdown)
+
+
+def test_jax_vlm_process_collects_deep_target_batch_when_head_request_is_deep_late():
+    model = FakeJaxSplitModel()
+    pool = _shared_pool(max_lanes=8)
+    old_enqueue_ns = time.monotonic_ns() - 150_000_000
     request_queue = SlowFeederQueue(
         [_request(f"req-{idx}", enqueue_ns=old_enqueue_ns) for idx in range(8)] + [JaxShutdown()],
         message_delay_s=0.0015,
@@ -432,13 +472,103 @@ def test_jax_vlm_process_fcfs_drains_slow_feeder_when_head_request_is_already_la
     process.run()
 
     ready = [item for item in prefix_queue.items if isinstance(item, JaxPrefixReady)]
-    assert model.prefix_batch_sizes == [6, 2]
+    assert model.prefix_batch_sizes == [7, 1]
     assert [item.request_id for item in ready] == [f"req-{idx}" for idx in range(8)]
-    assert [item.timing["vlm_effective_batch"] for item in ready] == [6.0] * 6 + [2.0] * 2
+    assert [item.timing["vlm_effective_batch"] for item in ready] == [7.0] * 7 + [1.0]
     assert isinstance(prefix_queue.items[-1], JaxShutdown)
 
 
-def test_jax_vlm_process_keeps_full_batch_when_late_head_has_deep_backlog():
+def test_jax_vlm_process_uses_smaller_target_batch_for_late_long_ae_requests():
+    model = FakeJaxSplitModel()
+    pool = _shared_pool(max_lanes=8)
+    old_enqueue_ns = time.monotonic_ns() - 600_000_000
+    request_queue = SlowFeederQueue(
+        [_request(f"req-{idx}", enqueue_ns=old_enqueue_ns, num_steps=10) for idx in range(8)]
+        + [JaxShutdown()],
+        message_delay_s=0.0015,
+    )
+    prefix_queue = SimpleQueue()
+    process = JaxVLMProcess(
+        model=model,
+        request_queue=request_queue,
+        prefix_queue=prefix_queue,
+        release_queue=SimpleQueue(),
+        max_batch_size=8,
+        max_wait_ms=1.0,
+        max_live_features=8,
+        shared_pool=pool,
+    )
+    process.worker.attach_shared_pool(pool, JaxLaneCredits(lane_ids=tuple(range(8))))
+    process._ae_export_ready = True
+
+    process.run()
+
+    ready = [item for item in prefix_queue.items if isinstance(item, JaxPrefixReady)]
+    assert model.prefix_batch_sizes == [5, 3]
+    assert [item.request_id for item in ready] == [f"req-{idx}" for idx in range(8)]
+    assert [item.timing["vlm_effective_batch"] for item in ready] == [5.0] * 5 + [3.0] * 3
+    assert isinstance(prefix_queue.items[-1], JaxShutdown)
+
+
+def test_jax_vlm_process_deep_late_long_ae_uses_long_drain_budget_without_full_batch_limit():
+    pool = _shared_pool(max_lanes=8)
+    process = JaxVLMProcess(
+        model=FakeJaxSplitModel(),
+        request_queue=SimpleQueue(),
+        prefix_queue=SimpleQueue(),
+        release_queue=SimpleQueue(),
+        max_batch_size=8,
+        max_wait_ms=1.0,
+        max_live_features=8,
+        shared_pool=pool,
+    )
+    process.worker.attach_shared_pool(pool, JaxLaneCredits(lane_ids=tuple(range(8))))
+    now_ns = time.monotonic_ns()
+    request = _request("req-1", enqueue_ns=now_ns - 600_000_000, num_steps=10)
+    request = request.__class__(
+        request_id=request.request_id,
+        observation=request.observation,
+        sample_kwargs=request.sample_kwargs,
+        enqueue_ns=request.enqueue_ns,
+        dequeue_start_ns=now_ns,
+        dequeue_ns=now_ns,
+    )
+
+    assert process._current_fcfs_batch_limit(request, candidate_count=1) == 6
+    deadline_ns = process._fcfs_collect_deadline_ns(request, collect_start_ns=now_ns)
+    assert 15_000_000 <= deadline_ns - now_ns <= 25_000_000
+
+
+def test_jax_vlm_process_long_ae_uses_short_drain_before_heavy_overload():
+    pool = _shared_pool(max_lanes=8)
+    process = JaxVLMProcess(
+        model=FakeJaxSplitModel(),
+        request_queue=SimpleQueue(),
+        prefix_queue=SimpleQueue(),
+        release_queue=SimpleQueue(),
+        max_batch_size=8,
+        max_wait_ms=1.0,
+        max_live_features=8,
+        shared_pool=pool,
+    )
+    process.worker.attach_shared_pool(pool, JaxLaneCredits(lane_ids=tuple(range(8))))
+    now_ns = time.monotonic_ns()
+    request = _request("req-1", enqueue_ns=now_ns - 150_000_000, num_steps=10)
+    request = request.__class__(
+        request_id=request.request_id,
+        observation=request.observation,
+        sample_kwargs=request.sample_kwargs,
+        enqueue_ns=request.enqueue_ns,
+        dequeue_start_ns=now_ns,
+        dequeue_ns=now_ns,
+    )
+
+    assert process._current_fcfs_batch_limit(request, candidate_count=1) == 5
+    deadline_ns = process._fcfs_collect_deadline_ns(request, collect_start_ns=now_ns)
+    assert 3_000_000 <= deadline_ns - now_ns <= 5_000_000
+
+
+def test_jax_vlm_process_caps_late_short_ae_batch_even_when_backlog_is_full():
     model = FakeJaxSplitModel()
     pool = _shared_pool(max_lanes=8)
     old_enqueue_ns = time.monotonic_ns() - 50_000_000
@@ -462,9 +592,9 @@ def test_jax_vlm_process_keeps_full_batch_when_late_head_has_deep_backlog():
     process.run()
 
     ready = [item for item in prefix_queue.items if isinstance(item, JaxPrefixReady)]
-    assert model.prefix_batch_sizes == [8]
+    assert model.prefix_batch_sizes == [7, 1]
     assert [item.request_id for item in ready] == [f"req-{idx}" for idx in range(8)]
-    assert [item.timing["vlm_effective_batch"] for item in ready] == [8.0] * 8
+    assert [item.timing["vlm_effective_batch"] for item in ready] == [7.0] * 7 + [1.0]
 
 
 def test_jax_vlm_worker_keeps_row_noise_host_side_for_prefix_ready():
@@ -488,6 +618,69 @@ def test_jax_vlm_worker_keeps_row_noise_host_side_for_prefix_ready():
     assert isinstance(ready[1].sample_kwargs["noise"], np.ndarray)
     np.testing.assert_allclose(ready[0].sample_kwargs["noise"], np.ones((1, 2, 1), dtype=np.float32))
     np.testing.assert_allclose(ready[1].sample_kwargs["noise"], np.full((1, 2, 1), 2.0, dtype=np.float32))
+
+
+def test_jax_vlm_stack_request_observations_stacks_single_row_numpy_arrays():
+    observations = []
+    for idx in range(3):
+        observations.append(
+            {
+                "image": {"cam": np.full((1, 2, 2, 1), idx, dtype=np.float32)},
+                "image_mask": {"cam": np.ones((1,), dtype=np.bool_)},
+                "state": np.full((1, 2), idx, dtype=np.float32),
+                "tokenized_prompt": np.full((1, 4), idx, dtype=np.int32),
+                "tokenized_prompt_mask": np.ones((1, 4), dtype=np.bool_),
+            }
+        )
+
+    stacked = _stack_request_observations(observations)
+
+    assert isinstance(stacked["state"], jax.Array)
+    assert stacked["state"].shape == (3, 2)
+    np.testing.assert_allclose(np.asarray(stacked["state"]), [[0.0, 0.0], [1.0, 1.0], [2.0, 2.0]])
+    assert stacked["image"]["cam"].shape == (3, 2, 2, 1)
+    np.testing.assert_array_equal(np.asarray(stacked["tokenized_prompt"])[:, 0], np.array([0, 1, 2]))
+
+
+def test_jax_vlm_stack_request_observations_preserves_concat_for_multirow_numpy_arrays():
+    observations = [
+        {
+            "state": np.full((2, 2), idx, dtype=np.float32),
+        }
+        for idx in range(2)
+    ]
+
+    stacked = _stack_request_observations(observations)
+
+    assert stacked["state"].shape == (4, 2)
+    np.testing.assert_allclose(np.asarray(stacked["state"]), [[0.0, 0.0], [0.0, 0.0], [1.0, 1.0], [1.0, 1.0]])
+
+
+def test_jax_vlm_split_batch_request_envelope_preserves_row_timing_and_noise():
+    request = JaxBatchRequestEnvelope(
+        batch_id="batch-1",
+        request_ids=("req-0", "req-1", "req-2"),
+        observation={
+            "state": np.arange(6, dtype=np.float32).reshape(3, 2),
+            "image": {"cam": np.zeros((3, 2, 2, 1), dtype=np.float32)},
+        },
+        sample_kwargs={"num_steps": 5, "noise": np.arange(6, dtype=np.float32).reshape(3, 2, 1)},
+        enqueue_ns=100,
+        enqueue_ns_by_row=(100, 101, 102),
+        dequeue_ns=200,
+        dequeue_start_ns=150,
+    )
+
+    head, tail = _split_batch_request_envelope(request, rows=2)
+
+    assert head.request_ids == ("req-0", "req-1")
+    assert head.enqueue_ns_by_row == (100, 101)
+    assert head.observation["state"].shape == (2, 2)
+    np.testing.assert_array_equal(head.sample_kwargs["noise"][:, 0, 0], np.array([0.0, 2.0]))
+    assert tail.request_ids == ("req-2",)
+    assert tail.enqueue_ns == 102
+    assert tail.enqueue_ns_by_row == (102,)
+    assert tail.observation["state"].shape == (1, 2)
 
 
 def test_jax_vlm_process_release_returns_lane_credit():

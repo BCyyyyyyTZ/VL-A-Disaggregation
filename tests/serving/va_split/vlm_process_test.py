@@ -7,11 +7,13 @@ import pytest
 import torch
 
 from openpi.models_pytorch.pi0_split_types import PrefixFeature
+from openpi.serving.va_split.types import BatchRequestEnvelope
 from openpi.serving.va_split.types import ReleaseFeature
 from openpi.serving.va_split.types import RequestEnvelope
 from openpi.serving.va_split.types import Shutdown
 from openpi.serving.va_split.vlm_process import VLMProcess
 from openpi.serving.va_split.vlm_process import VLMWorker
+from openpi.serving.va_split.vlm_process import _split_batch_request_envelope
 
 
 def _request_observation(*, prompt_len: int = 8, image_size: int = 224) -> dict:
@@ -199,6 +201,33 @@ def test_vlm_worker_enforces_live_feature_capacity_until_release():
     assert ready.request_id == "req-2"
 
 
+def test_vlm_split_batch_request_envelope_preserves_row_timing_and_noise():
+    request = BatchRequestEnvelope(
+        batch_id="batch-1",
+        request_ids=("req-0", "req-1", "req-2"),
+        observation={
+            "state": torch.arange(6, dtype=torch.float32).reshape(3, 2),
+            "image": {"cam": torch.zeros(3, 2, 2, 1)},
+        },
+        sample_kwargs={"num_steps": 5, "noise": torch.arange(6, dtype=torch.float32).reshape(3, 2, 1)},
+        enqueue_ns=100,
+        enqueue_ns_by_row=(100, 101, 102),
+        dequeue_ns=200,
+        dequeue_start_ns=150,
+    )
+
+    head, tail = _split_batch_request_envelope(request, rows=2)
+
+    assert head.request_ids == ("req-0", "req-1")
+    assert head.enqueue_ns_by_row == (100, 101)
+    assert head.observation["state"].shape == (2, 2)
+    torch.testing.assert_close(head.sample_kwargs["noise"][:, 0, 0], torch.tensor([0.0, 2.0]))
+    assert tail.request_ids == ("req-2",)
+    assert tail.enqueue_ns == 102
+    assert tail.enqueue_ns_by_row == (102,)
+    assert tail.observation["state"].shape == (1, 2)
+
+
 def test_vlm_process_fcfs_collector_batches_compatible_ready_requests():
     model = FakeVLMModel()
     request_queue = SimpleQueue([*[_request(f"req-{idx}") for idx in range(5)], Shutdown()])
@@ -245,6 +274,76 @@ def test_vlm_process_prefetches_ready_queue_before_fcfs_wait_window():
     assert model.batch_sizes == [4, 1]
     assert [message.request_id for message in ready] == [f"req-{idx}" for idx in range(5)]
     assert [message.timing["vlm_effective_batch"] for message in ready] == [4.0, 4.0, 4.0, 4.0, 1.0]
+    assert isinstance(prefix_queue.items[-1], Shutdown)
+
+
+def test_vlm_process_caps_late_short_ae_batch_even_when_backlog_is_full():
+    model = FakeVLMModel()
+    old_enqueue_ns = time.monotonic_ns() - 50_000_000
+    request_queue = SimpleQueue(
+        [
+            RequestEnvelope(
+                request_id=f"req-{idx}",
+                observation=_request_observation(),
+                sample_kwargs={"num_steps": 4},
+                enqueue_ns=old_enqueue_ns,
+            )
+            for idx in range(8)
+        ]
+        + [Shutdown()]
+    )
+    prefix_queue = SimpleQueue()
+    process = VLMProcess(
+        model=model,
+        device="cpu",
+        request_queue=request_queue,
+        prefix_queue=prefix_queue,
+        release_queue=SimpleQueue(),
+        max_batch_size=8,
+        max_wait_ms=1.0,
+    )
+
+    process.run()
+
+    ready = prefix_queue.items[:-1]
+    assert model.batch_sizes == [7, 1]
+    assert [message.request_id for message in ready] == [f"req-{idx}" for idx in range(8)]
+    assert [message.timing["vlm_effective_batch"] for message in ready] == [7.0] * 7 + [1.0]
+    assert isinstance(prefix_queue.items[-1], Shutdown)
+
+
+def test_vlm_process_uses_smaller_target_batch_for_late_long_ae_requests():
+    model = FakeVLMModel()
+    old_enqueue_ns = time.monotonic_ns() - 600_000_000
+    request_queue = SimpleQueue(
+        [
+            RequestEnvelope(
+                request_id=f"req-{idx}",
+                observation=_request_observation(),
+                sample_kwargs={"num_steps": 10},
+                enqueue_ns=old_enqueue_ns,
+            )
+            for idx in range(8)
+        ]
+        + [Shutdown()]
+    )
+    prefix_queue = SimpleQueue()
+    process = VLMProcess(
+        model=model,
+        device="cpu",
+        request_queue=request_queue,
+        prefix_queue=prefix_queue,
+        release_queue=SimpleQueue(),
+        max_batch_size=8,
+        max_wait_ms=1.0,
+    )
+
+    process.run()
+
+    ready = prefix_queue.items[:-1]
+    assert model.batch_sizes == [5, 3]
+    assert [message.request_id for message in ready] == [f"req-{idx}" for idx in range(8)]
+    assert [message.timing["vlm_effective_batch"] for message in ready] == [5.0] * 5 + [3.0] * 3
     assert isinstance(prefix_queue.items[-1], Shutdown)
 
 

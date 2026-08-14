@@ -36,7 +36,12 @@ from openpi.serving.va_split_jax.types import JaxWorkerError
 
 _BACKLOG_DRAIN_PER_ROW_MS = 2.0
 _BACKLOG_DRAIN_MAX_MS = 25.0
+_LATE_FCFS_SHORT_DRAIN_MS = 4.0
 _LATE_FCFS_TARGET_BATCH_SIZE = 6
+_LATE_FCFS_DEEP_BATCH_TARGET_SIZE = 7
+_LATE_FCFS_FULL_BATCH_WAIT_MULTIPLIER = 4.0
+_LATE_FCFS_FULL_BATCH_MIN_WAIT_MS = 100.0
+_LATE_FCFS_FULL_BATCH_MAX_NUM_STEPS = 5
 
 
 class JaxVLMWorker:
@@ -194,9 +199,9 @@ class JaxVLMWorker:
             request_ids=request.request_ids,
             observation=observation,
             sample_kwargs=dict(request.sample_kwargs),
-            enqueue_ns_by_row=tuple(request.enqueue_ns for _ in request.request_ids),
-            dequeue_ns_by_row=tuple(request.dequeue_ns for _ in request.request_ids),
-            dequeue_start_ns_by_row=tuple(request.dequeue_start_ns for _ in request.request_ids),
+            enqueue_ns_by_row=_batch_enqueue_ns_by_row(request),
+            dequeue_ns_by_row=_batch_dequeue_ns_by_row(request),
+            dequeue_start_ns_by_row=_batch_dequeue_start_ns_by_row(request),
             input_stage_start_ns=stage_start_ns,
             input_stage_ms=input_stage_ms,
             input_stage_timing={
@@ -459,12 +464,14 @@ class JaxVLMProcess:
                 self._prefix_queue.put(message)
                 return
             if isinstance(message, JaxBatchRequestEnvelope):
-                if not self._defer_until_live_feature_capacity(message, len(message.request_ids)):
+                message = self._trim_batch_request_to_live_feature_capacity(message)
+                if message is None:
                     continue
                 # Drain releases again right before consuming credits for a batch so we
                 # never reuse a lane that AE has not yet freed (Result can race ahead).
                 self._drain_releases()
-                if not self._defer_until_live_feature_capacity(message, len(message.request_ids)):
+                message = self._trim_batch_request_to_live_feature_capacity(message)
+                if message is None:
                     continue
                 try:
                     self._put_prefix_batch(self.worker.handle_batch_request(message))
@@ -593,10 +600,19 @@ class JaxVLMProcess:
         *,
         candidate_count: int = 0,
     ) -> int:
+        del candidate_count
         limit = self._raw_fcfs_batch_limit()
-        if first_request is not None and self._is_late_fcfs_head(first_request) and candidate_count < limit:
-            limit = min(limit, _LATE_FCFS_TARGET_BATCH_SIZE)
+        if first_request is not None and self._is_late_fcfs_head(first_request):
+            target = self._late_fcfs_target_batch_size(first_request)
+            limit = min(limit, target)
         return limit
+
+    def _late_fcfs_target_batch_size(self, first_request: JaxRequestEnvelope) -> int:
+        if _request_num_steps(first_request) > _LATE_FCFS_FULL_BATCH_MAX_NUM_STEPS:
+            return _LATE_FCFS_TARGET_BATCH_SIZE
+        if self._is_deep_late_fcfs_head(first_request):
+            return _LATE_FCFS_DEEP_BATCH_TARGET_SIZE
+        return _LATE_FCFS_TARGET_BATCH_SIZE
 
     def _raw_fcfs_batch_limit(self) -> int:
         return min(self._max_batch_size, self.worker.available_live_feature_slots)
@@ -604,6 +620,23 @@ class JaxVLMProcess:
     def _is_late_fcfs_head(self, first_request: JaxRequestEnvelope) -> bool:
         wait_ns = int(self._max_wait_ms * 1_000_000)
         return wait_ns > 0 and _request_waited_past_fcfs_window(first_request, wait_ns=wait_ns)
+
+    def _is_deep_late_fcfs_head(self, first_request: JaxRequestEnvelope) -> bool:
+        return (
+            _request_num_steps(first_request) <= _LATE_FCFS_FULL_BATCH_MAX_NUM_STEPS
+            and self._request_waited_past_deep_late_fcfs_window(first_request)
+        )
+
+    def _request_waited_past_deep_late_fcfs_window(self, first_request: JaxRequestEnvelope) -> bool:
+        wait_ns = int(self._deep_late_fcfs_wait_ms(first_request) * 1_000_000)
+        return wait_ns > 0 and _request_waited_past_fcfs_window(first_request, wait_ns=wait_ns)
+
+    def _deep_late_fcfs_wait_ms(self, first_request: JaxRequestEnvelope) -> float:
+        wait_ms = max(
+            _LATE_FCFS_FULL_BATCH_MIN_WAIT_MS,
+            self._max_wait_ms * _LATE_FCFS_FULL_BATCH_WAIT_MULTIPLIER,
+        )
+        return wait_ms
 
     def _fcfs_collect_deadline_ns(self, first_request: JaxRequestEnvelope, *, collect_start_ns: int) -> int:
         wait_ns = int(self._max_wait_ms * 1_000_000)
@@ -615,12 +648,16 @@ class JaxVLMProcess:
 
         # Under load, multiprocessing.Queue can have a large logical backlog in
         # the producer-side feeder while get_nowait() briefly reports empty.
-        # Once the head request has already exceeded the FCFS window, spend a
-        # bounded drain budget to pull those already-late requests into a batch.
-        drain_budget_ms = min(
-            _BACKLOG_DRAIN_MAX_MS,
-            max(self._max_wait_ms, _BACKLOG_DRAIN_PER_ROW_MS) * max(self._max_batch_size, 1),
-        )
+        # A modest extra drain trims feeder artifacts without taxing median
+        # latency. Deeply late heads get the longer drain window needed to
+        # recover saturated throughput with larger VLM batches.
+        if self._request_waited_past_deep_late_fcfs_window(first_request):
+            drain_budget_ms = min(
+                _BACKLOG_DRAIN_MAX_MS,
+                max(self._max_wait_ms, _BACKLOG_DRAIN_PER_ROW_MS) * max(self._max_batch_size, 1),
+            )
+        else:
+            drain_budget_ms = max(self._max_wait_ms, _LATE_FCFS_SHORT_DRAIN_MS)
         return max(deadline_ns, collect_start_ns + int(drain_budget_ms * 1_000_000))
 
     def _prefetch_request_backlog(self, *, max_messages: int) -> None:
@@ -677,6 +714,20 @@ class JaxVLMProcess:
         time.sleep(0.001)
         return False
 
+    def _trim_batch_request_to_live_feature_capacity(
+        self, message: JaxBatchRequestEnvelope
+    ) -> JaxBatchRequestEnvelope | None:
+        available = self.worker.available_live_feature_slots
+        if len(message.request_ids) <= available:
+            return message
+        if available <= 0:
+            self._backlog.appendleft(message)
+            time.sleep(0.001)
+            return None
+        head, tail = _split_batch_request_envelope(message, rows=int(available))
+        self._backlog.appendleft(tail)
+        return head
+
 
 def _open_slab_tree(backend: DeviceSlabBackend, value: Any) -> Any:
     if isinstance(value, DeviceSlabHandle):
@@ -707,6 +758,94 @@ def _request_waited_past_fcfs_window(request: JaxRequestEnvelope, *, wait_ns: in
     dequeue_start_ns = request.dequeue_start_ns
     effective_get_start_ns = dequeue_ns if dequeue_start_ns is None else max(dequeue_start_ns, request.enqueue_ns)
     return effective_get_start_ns - request.enqueue_ns > wait_ns
+
+
+def _request_num_steps(request: JaxRequestEnvelope) -> int:
+    return int(request.sample_kwargs.get("num_steps", 10))
+
+
+def _batch_enqueue_ns_by_row(request: JaxBatchRequestEnvelope) -> tuple[int, ...]:
+    if request.enqueue_ns_by_row is None:
+        return tuple(request.enqueue_ns for _ in request.request_ids)
+    if len(request.enqueue_ns_by_row) != len(request.request_ids):
+        raise ValueError("JaxBatchRequestEnvelope.enqueue_ns_by_row must match request_ids")
+    return tuple(int(value) for value in request.enqueue_ns_by_row)
+
+
+def _batch_dequeue_ns_by_row(request: JaxBatchRequestEnvelope) -> tuple[int | None, ...]:
+    if request.dequeue_ns_by_row is None:
+        return tuple(request.dequeue_ns for _ in request.request_ids)
+    if len(request.dequeue_ns_by_row) != len(request.request_ids):
+        raise ValueError("JaxBatchRequestEnvelope.dequeue_ns_by_row must match request_ids")
+    return tuple(None if value is None else int(value) for value in request.dequeue_ns_by_row)
+
+
+def _batch_dequeue_start_ns_by_row(request: JaxBatchRequestEnvelope) -> tuple[int | None, ...]:
+    if request.dequeue_start_ns_by_row is None:
+        return tuple(request.dequeue_start_ns for _ in request.request_ids)
+    if len(request.dequeue_start_ns_by_row) != len(request.request_ids):
+        raise ValueError("JaxBatchRequestEnvelope.dequeue_start_ns_by_row must match request_ids")
+    return tuple(None if value is None else int(value) for value in request.dequeue_start_ns_by_row)
+
+
+def _split_batch_request_envelope(
+    request: JaxBatchRequestEnvelope,
+    *,
+    rows: int,
+) -> tuple[JaxBatchRequestEnvelope, JaxBatchRequestEnvelope]:
+    if rows <= 0 or rows >= len(request.request_ids):
+        raise ValueError("rows must split the batch into non-empty head and tail")
+    enqueue_ns_by_row = _batch_enqueue_ns_by_row(request)
+    head_ids = request.request_ids[:rows]
+    tail_ids = request.request_ids[rows:]
+    head_enqueue = enqueue_ns_by_row[:rows]
+    tail_enqueue = enqueue_ns_by_row[rows:]
+    dequeue_ns_by_row = _batch_dequeue_ns_by_row(request)
+    dequeue_start_ns_by_row = _batch_dequeue_start_ns_by_row(request)
+    return (
+        replace(
+            request,
+            batch_id=f"{request.batch_id}:head{rows}",
+            request_ids=head_ids,
+            observation=_slice_batch_tree(request.observation, 0, rows),
+            sample_kwargs=_slice_batch_sample_kwargs(request.sample_kwargs, 0, rows),
+            enqueue_ns=min(head_enqueue),
+            enqueue_ns_by_row=head_enqueue,
+            dequeue_ns_by_row=dequeue_ns_by_row[:rows],
+            dequeue_start_ns_by_row=dequeue_start_ns_by_row[:rows],
+        ),
+        replace(
+            request,
+            batch_id=f"{request.batch_id}:tail{rows}",
+            request_ids=tail_ids,
+            observation=_slice_batch_tree(request.observation, rows, len(request.request_ids)),
+            sample_kwargs=_slice_batch_sample_kwargs(request.sample_kwargs, rows, len(request.request_ids)),
+            enqueue_ns=min(tail_enqueue),
+            enqueue_ns_by_row=tail_enqueue,
+            dequeue_ns_by_row=dequeue_ns_by_row[rows:],
+            dequeue_start_ns_by_row=dequeue_start_ns_by_row[rows:],
+        ),
+    )
+
+
+def _slice_batch_tree(value: Any, start: int, stop: int) -> Any:
+    if isinstance(value, dict):
+        return {key: _slice_batch_tree(item, start, stop) for key, item in value.items()}
+    if _is_array(value) and value.ndim > 0:
+        return value[start:stop]
+    if isinstance(value, tuple):
+        return tuple(_slice_batch_tree(item, start, stop) for item in value)
+    if isinstance(value, list):
+        return [_slice_batch_tree(item, start, stop) for item in value]
+    return value
+
+
+def _slice_batch_sample_kwargs(sample_kwargs: dict[str, Any], start: int, stop: int) -> dict[str, Any]:
+    row_kwargs = dict(sample_kwargs)
+    noise = row_kwargs.get("noise")
+    if _is_array(noise) and noise.ndim == 3:
+        row_kwargs["noise"] = noise[start:stop]
+    return row_kwargs
 
 
 def _vlm_request_queue_timings(
@@ -861,8 +1000,34 @@ def _asarray_model_input(value: Any) -> jax.Array:
 def _concat_model_input(values: list[Any]) -> jax.Array:
     if any(isinstance(value, jax.Array) for value in values):
         return jnp.concatenate([jnp.asarray(value) for value in values], axis=0)
+    if _can_stack_single_row_numpy(values):
+        first = np.asarray(values[0])
+        stacked = np.empty((len(values),) + first.shape[1:], dtype=first.dtype)
+        for row, value in enumerate(values):
+            stacked[row] = np.asarray(value)[0]
+        return jnp.asarray(stacked)
     arrays = [np.asarray(value) for value in values]
     return jnp.asarray(np.concatenate(arrays, axis=0))
+
+
+def _can_stack_single_row_numpy(values: list[Any]) -> bool:
+    if not values:
+        return False
+    first = values[0]
+    if isinstance(first, jax.Array):
+        return False
+    first_array = np.asarray(first)
+    if first_array.ndim == 0 or int(first_array.shape[0]) != 1:
+        return False
+    first_shape = first_array.shape
+    first_dtype = first_array.dtype
+    for value in values[1:]:
+        if isinstance(value, jax.Array):
+            return False
+        array = np.asarray(value)
+        if array.shape != first_shape or array.dtype != first_dtype:
+            return False
+    return True
 
 
 def _prefix_feature_row_view(feature: JaxPrefixFeature, row: int) -> JaxPrefixFeature:

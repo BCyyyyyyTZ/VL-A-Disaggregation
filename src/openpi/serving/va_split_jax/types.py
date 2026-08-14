@@ -24,6 +24,9 @@ class JaxBatchRequestEnvelope:
     observation: dict[str, Any]
     sample_kwargs: dict[str, Any]
     enqueue_ns: int
+    enqueue_ns_by_row: tuple[int, ...] | None = None
+    dequeue_ns_by_row: tuple[int | None, ...] | None = None
+    dequeue_start_ns_by_row: tuple[int | None, ...] | None = None
     dequeue_ns: int | None = None
     dequeue_start_ns: int | None = None
 

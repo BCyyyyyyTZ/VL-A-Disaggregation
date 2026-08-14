@@ -957,6 +957,20 @@ def profile_warmup_max_batch_size(args: Args) -> int:
 
 def split_prefix_slot_capacity(args: Args) -> int:
     """Return the VA-split prefix-slot capacity used by synthetic warmup."""
+    env_slots = (
+        os.environ.get("MAX_PREFIX_SLOTS")
+        or os.environ.get("VA_SPLIT_MAX_PREFIX_SLOTS")
+        or os.environ.get("JAX_VA_MAX_PREFIX_SLOTS")
+    )
+    if env_slots:
+        return max(1, int(env_slots))
+    env_mult = (
+        os.environ.get("PREFIX_SLOT_MULTIPLIER")
+        or os.environ.get("VA_SPLIT_PREFIX_SLOT_MULTIPLIER")
+        or os.environ.get("JAX_VA_PREFIX_SLOT_MULTIPLIER")
+    )
+    if env_mult:
+        return max(1, int(args.max_vlm_batch_size) * int(env_mult))
     return max(1, int(args.max_vlm_batch_size) * 3)
 
 

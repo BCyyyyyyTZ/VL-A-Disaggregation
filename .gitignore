@@ -16,6 +16,7 @@ logs/V-A/**
 !logs/V-A/**/*.json
 !logs/JAX/**/*.md
 !logs/V-A/**/*.md
+roofline/logs/*
 wandb/
 
 # Temporary local diagnostics.

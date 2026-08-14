@@ -23,6 +23,15 @@ from openpi.serving.va_split.types import RequestEnvelope
 from openpi.serving.va_split.types import Shutdown
 from openpi.serving.va_split.types import WorkerError
 
+_LATE_FCFS_TARGET_BATCH_SIZE = 6
+_LATE_FCFS_DEEP_BATCH_TARGET_SIZE = 7
+_LATE_FCFS_SHORT_DRAIN_MS = 4.0
+_LATE_FCFS_FULL_BATCH_WAIT_MULTIPLIER = 4.0
+_LATE_FCFS_FULL_BATCH_MIN_WAIT_MS = 100.0
+_LATE_FCFS_FULL_BATCH_MAX_NUM_STEPS = 5
+_BACKLOG_DRAIN_PER_ROW_MS = 2.0
+_BACKLOG_DRAIN_MAX_MS = 25.0
+
 
 @dataclass
 class BatchLiveFeature:
@@ -94,9 +103,9 @@ class VLMWorker:
             request_ids=request.request_ids,
             observation=request.observation,
             sample_kwargs=dict(request.sample_kwargs),
-            enqueue_ns_by_row=tuple(request.enqueue_ns for _ in request.request_ids),
-            dequeue_ns_by_row=tuple(request.dequeue_ns for _ in request.request_ids),
-            dequeue_start_ns_by_row=tuple(request.dequeue_start_ns for _ in request.request_ids),
+            enqueue_ns_by_row=_batch_enqueue_ns_by_row(request),
+            dequeue_ns_by_row=_batch_dequeue_ns_by_row(request),
+            dequeue_start_ns_by_row=_batch_dequeue_start_ns_by_row(request),
         )
 
     def _handle_batched_observation(
@@ -226,7 +235,8 @@ class VLMProcess:
                 self._prefix_queue.put(message)
                 return
             if isinstance(message, BatchRequestEnvelope):
-                if not self._defer_until_live_feature_capacity(message, len(message.request_ids)):
+                message = self._trim_batch_request_to_live_feature_capacity(message)
+                if message is None:
                     continue
                 try:
                     for ready in self.worker.handle_batch_request(message):
@@ -284,12 +294,15 @@ class VLMProcess:
         requests = [first_request]
         compatibility_key = _request_compatibility_key(first_request)
         shutdown_after_batch = False
-        available_slots = self.worker.available_live_feature_slots
-        max_batch_size = self._max_batch_size if available_slots is None else min(self._max_batch_size, available_slots)
+        collect_start_ns = time.monotonic_ns()
+        deadline_ns = self._fcfs_collect_deadline_ns(first_request, collect_start_ns=collect_start_ns)
+        max_batch_size = self._current_fcfs_batch_limit(first_request)
         self._prefetch_request_backlog(max_messages=max_batch_size - len(requests))
-        deadline_ns = time.monotonic_ns() + int(self._max_wait_ms * 1_000_000)
 
         while len(requests) < max_batch_size:
+            max_batch_size = self._current_fcfs_batch_limit(first_request)
+            if len(requests) >= max_batch_size:
+                break
             try:
                 message = self._next_fcfs_candidate(deadline_ns)
             except queue.Empty:
@@ -306,6 +319,58 @@ class VLMProcess:
             requests.append(message)
 
         return requests, shutdown_after_batch
+
+    def _current_fcfs_batch_limit(self, first_request: RequestEnvelope | None = None) -> int:
+        available_slots = self.worker.available_live_feature_slots
+        limit = self._max_batch_size if available_slots is None else min(self._max_batch_size, available_slots)
+        if first_request is not None and self._is_late_fcfs_head(first_request):
+            target = self._late_fcfs_target_batch_size(first_request)
+            limit = min(limit, target)
+        return limit
+
+    def _late_fcfs_target_batch_size(self, first_request: RequestEnvelope) -> int:
+        if _request_num_steps(first_request) > _LATE_FCFS_FULL_BATCH_MAX_NUM_STEPS:
+            return _LATE_FCFS_TARGET_BATCH_SIZE
+        if self._is_deep_late_fcfs_head(first_request):
+            return _LATE_FCFS_DEEP_BATCH_TARGET_SIZE
+        return _LATE_FCFS_TARGET_BATCH_SIZE
+
+    def _is_late_fcfs_head(self, first_request: RequestEnvelope) -> bool:
+        wait_ns = int(self._max_wait_ms * 1_000_000)
+        return wait_ns > 0 and _request_waited_past_fcfs_window(first_request, wait_ns=wait_ns)
+
+    def _is_deep_late_fcfs_head(self, first_request: RequestEnvelope) -> bool:
+        return (
+            _request_num_steps(first_request) <= _LATE_FCFS_FULL_BATCH_MAX_NUM_STEPS
+            and self._request_waited_past_deep_late_fcfs_window(first_request)
+        )
+
+    def _request_waited_past_deep_late_fcfs_window(self, first_request: RequestEnvelope) -> bool:
+        wait_ns = int(self._deep_late_fcfs_wait_ms(first_request) * 1_000_000)
+        return wait_ns > 0 and _request_waited_past_fcfs_window(first_request, wait_ns=wait_ns)
+
+    def _deep_late_fcfs_wait_ms(self, first_request: RequestEnvelope) -> float:
+        wait_ms = max(
+            _LATE_FCFS_FULL_BATCH_MIN_WAIT_MS,
+            self._max_wait_ms * _LATE_FCFS_FULL_BATCH_WAIT_MULTIPLIER,
+        )
+        return wait_ms
+
+    def _fcfs_collect_deadline_ns(self, first_request: RequestEnvelope, *, collect_start_ns: int) -> int:
+        wait_ns = int(self._max_wait_ms * 1_000_000)
+        deadline_ns = collect_start_ns + wait_ns
+        if wait_ns <= 0:
+            return deadline_ns
+        if not _request_waited_past_fcfs_window(first_request, wait_ns=wait_ns):
+            return deadline_ns
+        if self._request_waited_past_deep_late_fcfs_window(first_request):
+            drain_budget_ms = min(
+                _BACKLOG_DRAIN_MAX_MS,
+                max(self._max_wait_ms, _BACKLOG_DRAIN_PER_ROW_MS) * max(self._max_batch_size, 1),
+            )
+        else:
+            drain_budget_ms = max(self._max_wait_ms, _LATE_FCFS_SHORT_DRAIN_MS)
+        return max(deadline_ns, collect_start_ns + int(drain_budget_ms * 1_000_000))
 
     def _prefetch_request_backlog(self, *, max_messages: int) -> None:
         for _ in range(max(0, max_messages)):
@@ -354,6 +419,20 @@ class VLMProcess:
         time.sleep(0.001)
         return False
 
+    def _trim_batch_request_to_live_feature_capacity(
+        self, message: BatchRequestEnvelope
+    ) -> BatchRequestEnvelope | None:
+        available = self.worker.available_live_feature_slots
+        if available is None or len(message.request_ids) <= available:
+            return message
+        if available <= 0:
+            self._backlog.appendleft(message)
+            time.sleep(0.001)
+            return None
+        head, tail = _split_batch_request_envelope(message, rows=int(available))
+        self._backlog.appendleft(tail)
+        return head
+
 
 def _mark_dequeued_message(message: Any, *, get_start_ns: int, get_end_ns: int) -> Any:
     if isinstance(message, RequestEnvelope | BatchRequestEnvelope):
@@ -375,6 +454,103 @@ def _vlm_request_queue_timings(
         max(0.0, (effective_get_start_ns - enqueue_ns) / 1_000_000),
         max(0.0, (dequeue_ns - effective_get_start_ns) / 1_000_000),
     )
+
+
+def _request_waited_past_fcfs_window(request: RequestEnvelope, *, wait_ns: int) -> bool:
+    dequeue_ns = request.dequeue_ns
+    if dequeue_ns is None:
+        return False
+    dequeue_start_ns = request.dequeue_start_ns
+    effective_get_start_ns = dequeue_ns if dequeue_start_ns is None else max(dequeue_start_ns, request.enqueue_ns)
+    return effective_get_start_ns - request.enqueue_ns > wait_ns
+
+
+def _request_num_steps(request: RequestEnvelope) -> int:
+    return int(request.sample_kwargs.get("num_steps", 10))
+
+
+def _batch_enqueue_ns_by_row(request: BatchRequestEnvelope) -> tuple[int, ...]:
+    if request.enqueue_ns_by_row is None:
+        return tuple(request.enqueue_ns for _ in request.request_ids)
+    if len(request.enqueue_ns_by_row) != len(request.request_ids):
+        raise ValueError("BatchRequestEnvelope.enqueue_ns_by_row must match request_ids")
+    return tuple(int(value) for value in request.enqueue_ns_by_row)
+
+
+def _batch_dequeue_ns_by_row(request: BatchRequestEnvelope) -> tuple[int | None, ...]:
+    if request.dequeue_ns_by_row is None:
+        return tuple(request.dequeue_ns for _ in request.request_ids)
+    if len(request.dequeue_ns_by_row) != len(request.request_ids):
+        raise ValueError("BatchRequestEnvelope.dequeue_ns_by_row must match request_ids")
+    return tuple(None if value is None else int(value) for value in request.dequeue_ns_by_row)
+
+
+def _batch_dequeue_start_ns_by_row(request: BatchRequestEnvelope) -> tuple[int | None, ...]:
+    if request.dequeue_start_ns_by_row is None:
+        return tuple(request.dequeue_start_ns for _ in request.request_ids)
+    if len(request.dequeue_start_ns_by_row) != len(request.request_ids):
+        raise ValueError("BatchRequestEnvelope.dequeue_start_ns_by_row must match request_ids")
+    return tuple(None if value is None else int(value) for value in request.dequeue_start_ns_by_row)
+
+
+def _split_batch_request_envelope(
+    request: BatchRequestEnvelope,
+    *,
+    rows: int,
+) -> tuple[BatchRequestEnvelope, BatchRequestEnvelope]:
+    if rows <= 0 or rows >= len(request.request_ids):
+        raise ValueError("rows must split the batch into non-empty head and tail")
+    enqueue_ns_by_row = _batch_enqueue_ns_by_row(request)
+    head_ids = request.request_ids[:rows]
+    tail_ids = request.request_ids[rows:]
+    head_enqueue = enqueue_ns_by_row[:rows]
+    tail_enqueue = enqueue_ns_by_row[rows:]
+    dequeue_ns_by_row = _batch_dequeue_ns_by_row(request)
+    dequeue_start_ns_by_row = _batch_dequeue_start_ns_by_row(request)
+    return (
+        replace(
+            request,
+            batch_id=f"{request.batch_id}:head{rows}",
+            request_ids=head_ids,
+            observation=_slice_batch_tree(request.observation, 0, rows),
+            sample_kwargs=_slice_batch_sample_kwargs(request.sample_kwargs, 0, rows),
+            enqueue_ns=min(head_enqueue),
+            enqueue_ns_by_row=head_enqueue,
+            dequeue_ns_by_row=dequeue_ns_by_row[:rows],
+            dequeue_start_ns_by_row=dequeue_start_ns_by_row[:rows],
+        ),
+        replace(
+            request,
+            batch_id=f"{request.batch_id}:tail{rows}",
+            request_ids=tail_ids,
+            observation=_slice_batch_tree(request.observation, rows, len(request.request_ids)),
+            sample_kwargs=_slice_batch_sample_kwargs(request.sample_kwargs, rows, len(request.request_ids)),
+            enqueue_ns=min(tail_enqueue),
+            enqueue_ns_by_row=tail_enqueue,
+            dequeue_ns_by_row=dequeue_ns_by_row[rows:],
+            dequeue_start_ns_by_row=dequeue_start_ns_by_row[rows:],
+        ),
+    )
+
+
+def _slice_batch_tree(value: Any, start: int, stop: int) -> Any:
+    if isinstance(value, dict):
+        return {key: _slice_batch_tree(item, start, stop) for key, item in value.items()}
+    if torch.is_tensor(value) and value.ndim > 0:
+        return value[start:stop]
+    if isinstance(value, tuple):
+        return tuple(_slice_batch_tree(item, start, stop) for item in value)
+    if isinstance(value, list):
+        return [_slice_batch_tree(item, start, stop) for item in value]
+    return value
+
+
+def _slice_batch_sample_kwargs(sample_kwargs: dict[str, Any], start: int, stop: int) -> dict[str, Any]:
+    row_kwargs = dict(sample_kwargs)
+    noise = row_kwargs.get("noise")
+    if torch.is_tensor(noise) and noise.ndim == 3:
+        row_kwargs["noise"] = noise[start:stop]
+    return row_kwargs
 
 
 def _move_tensors_to_device(value: Any, device: str) -> Any:
