@@ -106,7 +106,224 @@ def _cost_metrics(compiled: Any) -> dict[str, Any]:
     }
 
 
-def _make_compiled_methods(model: Any, observation: Any, prefix: Any, denoise_state: Any):
+def _static_pi05_roofline_costs(model: Any, *, batch_size: int) -> dict[str, dict[str, float]]:
+    """Return analytical OpenPI0.5 VLM/AE FLOPs and estimated traffic bytes.
+
+    XLA cost_analysis is kept in the output for diagnostics, but it can
+    undercount scan/remat-heavy models.  These formulas count dominant matmul,
+    convolution, and attention FLOPs from the model shapes used by pi05_libero.
+    Bytes estimate dominant tensor traffic for those same ops.  This is still
+    not a substitute for Nsight DRAM counters, but it avoids the unrealistic AI
+    values produced by counting only weights and final inputs/outputs.
+    """
+    from openpi.models import gemma as _gemma
+    from openpi.models import model as _model
+    from openpi.models import siglip as _siglip
+
+    dtype_bytes = 2.0
+    image_dtype_bytes = 4.0
+    num_images = len(_model.IMAGE_KEYS)
+    image_h, image_w = _model.IMAGE_RESOLUTION
+    patch_h, patch_w = _siglip.decode_variant("So400m/14")["patch_size"]
+    image_tokens = (image_h // patch_h) * (image_w // patch_w)
+
+    vision = _siglip.decode_variant("So400m/14")
+    vision_width = int(vision["width"])
+    vision_depth = int(vision["depth"])
+    vision_mlp = int(vision["mlp_dim"])
+    vision_heads = int(vision["num_heads"])
+    vision_head_dim = vision_width // vision_heads
+
+    pg = _gemma.get_config("gemma_2b")
+    ae = _gemma.get_config("gemma_300m")
+    prefix_tokens = num_images * image_tokens + int(model.max_token_len)
+    suffix_tokens = int(model.action_horizon)
+    action_dim = int(model.action_dim)
+
+    def dense_flops(b: int, t: int, in_dim: int, out_dim: int) -> float:
+        return 2.0 * b * t * in_dim * out_dim
+
+    def weight_bytes(*shape: int) -> float:
+        count = 1
+        for dim in shape:
+            count *= int(dim)
+        return float(count) * dtype_bytes
+
+    def dense_bytes(b: int, t: int, in_dim: int, out_dim: int, *, outputs: int = 1) -> float:
+        m = float(b * t)
+        return (m * in_dim + in_dim * out_dim * outputs + m * out_dim * outputs) * dtype_bytes
+
+    def mlp_activation_bytes(b: int, t: int, hidden_dim: int) -> float:
+        # GELU/gating/product intermediates are materialized unless fully fused.
+        return 4.0 * b * t * hidden_dim * dtype_bytes
+
+    def attention_activation_bytes(
+        *,
+        b: int,
+        query_tokens: int,
+        key_tokens: int,
+        num_heads: int,
+        num_kv_heads: int,
+        head_dim: int,
+    ) -> float:
+        q_elems = float(b * query_tokens * num_heads * head_dim)
+        kv_elems = float(b * key_tokens * num_kv_heads * head_dim)
+        out_elems = q_elems
+        score_elems = float(b * num_heads * query_tokens * key_tokens)
+        # QK writes logits, mask/softmax read and write logits/probs, AV reads
+        # probs and V. Logits/probs are FP32 in the JAX implementation.
+        return (
+            (q_elems + 2.0 * kv_elems + out_elems) * dtype_bytes
+            + 5.0 * score_elems * 4.0
+        )
+
+    vision_stem_flops = 2.0 * batch_size * image_tokens * patch_h * patch_w * 3 * vision_width
+    vision_layer_flops = (
+        3.0 * dense_flops(batch_size, image_tokens, vision_width, vision_width)
+        + dense_flops(batch_size, image_tokens, vision_width, vision_width)
+        + 2.0 * batch_size * vision_heads * image_tokens * image_tokens * vision_head_dim
+        + 2.0 * batch_size * vision_heads * image_tokens * image_tokens * vision_head_dim
+        + dense_flops(batch_size, image_tokens, vision_width, vision_mlp)
+        + dense_flops(batch_size, image_tokens, vision_mlp, vision_width)
+    )
+    vision_head_flops = dense_flops(batch_size, image_tokens, vision_width, pg.width)
+    vision_flops = num_images * (vision_stem_flops + vision_depth * vision_layer_flops + vision_head_flops)
+
+    vision_stem_bytes = (
+        batch_size * image_h * image_w * 3 * image_dtype_bytes
+        + weight_bytes(patch_h, patch_w, 3, vision_width)
+        + batch_size * image_tokens * vision_width * dtype_bytes
+    )
+    vision_layer_bytes = (
+        dense_bytes(batch_size, image_tokens, vision_width, vision_width, outputs=3)
+        + attention_activation_bytes(
+            b=batch_size,
+            query_tokens=image_tokens,
+            key_tokens=image_tokens,
+            num_heads=vision_heads,
+            num_kv_heads=vision_heads,
+            head_dim=vision_head_dim,
+        )
+        + dense_bytes(batch_size, image_tokens, vision_width, vision_width)
+        + dense_bytes(batch_size, image_tokens, vision_width, vision_mlp)
+        + mlp_activation_bytes(batch_size, image_tokens, vision_mlp)
+        + dense_bytes(batch_size, image_tokens, vision_mlp, vision_width)
+    )
+    vision_head_bytes = dense_bytes(batch_size, image_tokens, vision_width, pg.width)
+    vision_bytes = num_images * (vision_stem_bytes + vision_depth * vision_layer_bytes + vision_head_bytes)
+
+    def gemma_layer_flops(config: Any, *, query_tokens: int, key_tokens: int) -> float:
+        q_dim = config.num_heads * config.head_dim
+        kv_dim = config.num_kv_heads * config.head_dim
+        return (
+            dense_flops(batch_size, query_tokens, config.width, q_dim)
+            + 2.0 * dense_flops(batch_size, query_tokens, config.width, kv_dim)
+            + 2.0 * batch_size * config.num_heads * query_tokens * key_tokens * config.head_dim
+            + 2.0 * batch_size * config.num_heads * query_tokens * key_tokens * config.head_dim
+            + dense_flops(batch_size, query_tokens, q_dim, config.width)
+            + 2.0 * dense_flops(batch_size, query_tokens, config.width, config.mlp_dim)
+            + dense_flops(batch_size, query_tokens, config.mlp_dim, config.width)
+        )
+
+    def gemma_layer_weight_bytes(config: Any, *, adarms: bool = False) -> float:
+        q_dim = config.num_heads * config.head_dim
+        kv_dim = config.num_kv_heads * config.head_dim
+        total = (
+            weight_bytes(config.width, q_dim)
+            + 2.0 * weight_bytes(config.width, kv_dim)
+            + weight_bytes(q_dim, config.width)
+            + 2.0 * weight_bytes(config.width, config.mlp_dim)
+            + weight_bytes(config.mlp_dim, config.width)
+        )
+        if adarms:
+            # Two adaptive RMSNorm dense projections per transformer block.
+            total += 2.0 * weight_bytes(config.width, config.width * 3)
+        return total
+
+    def gemma_layer_bytes(config: Any, *, query_tokens: int, key_tokens: int, adarms: bool = False) -> float:
+        q_dim = config.num_heads * config.head_dim
+        kv_dim = config.num_kv_heads * config.head_dim
+        total = (
+            dense_bytes(batch_size, query_tokens, config.width, q_dim)
+            + dense_bytes(batch_size, query_tokens, config.width, kv_dim, outputs=2)
+            + attention_activation_bytes(
+                b=batch_size,
+                query_tokens=query_tokens,
+                key_tokens=key_tokens,
+                num_heads=config.num_heads,
+                num_kv_heads=config.num_kv_heads,
+                head_dim=config.head_dim,
+            )
+            + dense_bytes(batch_size, query_tokens, q_dim, config.width)
+            + dense_bytes(batch_size, query_tokens, config.width, config.mlp_dim, outputs=2)
+            + mlp_activation_bytes(batch_size, query_tokens, config.mlp_dim)
+            + dense_bytes(batch_size, query_tokens, config.mlp_dim, config.width)
+        )
+        if adarms:
+            total += 2.0 * dense_bytes(batch_size, 1, config.width, config.width * 3)
+        return total
+
+    prefix_llm_flops = pg.depth * gemma_layer_flops(pg, query_tokens=prefix_tokens, key_tokens=prefix_tokens)
+    prefix_kv_bytes = (
+        2.0
+        * pg.depth
+        * batch_size
+        * prefix_tokens
+        * pg.num_kv_heads
+        * pg.head_dim
+        * dtype_bytes
+    )
+    prefix_llm_bytes = (
+        pg.depth * gemma_layer_bytes(pg, query_tokens=prefix_tokens, key_tokens=prefix_tokens)
+        + prefix_kv_bytes
+    )
+    vlm_flops = vision_flops + prefix_llm_flops
+    vlm_bytes = vision_bytes + prefix_llm_bytes
+
+    ae_time_mlp_flops = dense_flops(batch_size, 1, ae.width, ae.width) * 2.0
+    ae_action_in_flops = dense_flops(batch_size, suffix_tokens, action_dim, ae.width)
+    ae_action_out_flops = dense_flops(batch_size, suffix_tokens, ae.width, action_dim)
+    ae_step_flops = (
+        ae_action_in_flops
+        + ae_time_mlp_flops
+        + ae.depth * gemma_layer_flops(ae, query_tokens=suffix_tokens, key_tokens=prefix_tokens + suffix_tokens)
+        + ae_action_out_flops
+    )
+    ae_prefix_read_bytes = (
+        2.0
+        * ae.depth
+        * batch_size
+        * prefix_tokens
+        * ae.num_kv_heads
+        * ae.head_dim
+        * dtype_bytes
+    )
+    ae_step_bytes = (
+        dense_bytes(batch_size, suffix_tokens, action_dim, ae.width)
+        + 2.0 * dense_bytes(batch_size, 1, ae.width, ae.width)
+        + ae.depth * gemma_layer_bytes(
+            ae,
+            query_tokens=suffix_tokens,
+            key_tokens=prefix_tokens + suffix_tokens,
+            adarms=True,
+        )
+        + dense_bytes(batch_size, suffix_tokens, ae.width, action_dim)
+        + ae_prefix_read_bytes
+    )
+    return {
+        "vlm": {"flops": vlm_flops, "bytes_accessed": vlm_bytes},
+        "ae_step": {"flops": ae_step_flops, "bytes_accessed": ae_step_bytes},
+    }
+
+
+def _make_compiled_methods(
+    model: Any,
+    observation: Any,
+    denoise_state: Any,
+    *,
+    prefix: Any | None = None,
+    compile_vlm: bool = True,
+):
     import jax
     from flax import nnx
 
@@ -120,14 +337,19 @@ def _make_compiled_methods(model: Any, observation: Any, prefix: Any, denoise_st
         module = nnx.merge(graphdef, module_state)
         return module.denoise_one_batch(prefix_batch, state_batch)
 
-    jitted_vlm = jax.jit(vlm_fn)
-    jitted_ae = jax.jit(ae_fn)
-    compiled_vlm = jitted_vlm.lower(state, observation).compile()
-    compiled_ae = jitted_ae.lower(state, prefix, denoise_state).compile()
+    compiled_vlm = None
+    if compile_vlm:
+        compiled_vlm = jax.jit(vlm_fn).lower(state, observation).compile()
+    compiled_ae = None
+    if prefix is not None:
+        compiled_ae = jax.jit(ae_fn).lower(state, prefix, denoise_state).compile()
     return state, compiled_vlm, compiled_ae
 
 
 def _measure_worker(args: argparse.Namespace) -> None:
+    # Must be set before importing openpi/jaxtyping: lowering passes ArgInfo into
+    # typed dataclasses and fails runtime typechecks otherwise.
+    os.environ.setdefault("JAXTYPING_DISABLE", "1")
     os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
     os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib-openpi-roofline")
 
@@ -168,13 +390,20 @@ def _measure_worker(args: argparse.Namespace) -> None:
         )
         _block_until_ready((observation, noise, denoise_state0))
 
-        # Compile VLM, create a real prefix batch, then compile AE for that prefix layout.
-        state, compiled_vlm_pre, _ = _make_compiled_methods(model, observation, model.build_prefix_feature(None, observation), denoise_state0)
-        prefix = compiled_vlm_pre(state, observation)
+        # Compile VLM first, materialize a real prefix via the compiled path, then
+        # compile AE. Avoids eager build_prefix_feature (OOM at large batch) and a
+        # throwaway AE compile against an eager dummy prefix.
+        state, compiled_vlm, _ = _make_compiled_methods(model, observation, denoise_state0)
+        prefix = compiled_vlm(state, observation)
         _block_until_ready(prefix)
-        state, compiled_vlm, compiled_ae = _make_compiled_methods(model, observation, prefix, denoise_state0)
+        state, _, compiled_ae = _make_compiled_methods(
+            model, observation, denoise_state0, prefix=prefix, compile_vlm=False
+        )
         vlm_cost = _cost_metrics(compiled_vlm)
         ae_step_cost = _cost_metrics(compiled_ae)
+        static_costs = _static_pi05_roofline_costs(model, batch_size=batch_size)
+        point_vlm_cost = static_costs["vlm"] if args.cost_source == "static" else vlm_cost
+        point_ae_step_cost = static_costs["ae_step"] if args.cost_source == "static" else ae_step_cost
 
         for _ in range(int(args.compile_warmup)):
             prefix = compiled_vlm(state, observation)
@@ -233,11 +462,11 @@ def _measure_worker(args: argparse.Namespace) -> None:
             }
 
         points = {
-            "vlm": point_from_cost("VLM", vlm_cost, vlm_samples),
+            "vlm": point_from_cost("VLM", point_vlm_cost, vlm_samples),
             "denoise": {
                 str(steps): point_from_cost(
                     f"Denoise-{steps}",
-                    ae_step_cost,
+                    point_ae_step_cost,
                     denoise_samples[str(steps)],
                     multiplier=int(steps),
                 )
@@ -262,7 +491,15 @@ def _measure_worker(args: argparse.Namespace) -> None:
             "cost_analysis": {
                 "vlm": vlm_cost,
                 "ae_step": ae_step_cost,
-                "note": "XLA compiled executable cost_analysis; denoise-5/10 multiply one-step cost by step count.",
+                "note": "Raw XLA compiled executable cost_analysis retained for diagnostics.",
+            },
+            "static_costs": {
+                **static_costs,
+                "note": "Analytical pi05_libero FLOPs plus conservative lower-bound bytes; denoise-5/10 multiply one-step cost by step count.",
+            },
+            "point_cost_source": {
+                "source": args.cost_source,
+                "note": "static is the default because XLA cost_analysis undercounts scan/remat-heavy OpenPI graphs.",
             },
             "points": points,
             "timing_kind": "compiled_jax_synchronous_gpu_wall_clock_ms_after_warmup",
@@ -290,6 +527,7 @@ def _run_case(args: argparse.Namespace, case: Case) -> dict[str, Any]:
     case_dir.mkdir(parents=True, exist_ok=True)
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
+    env.setdefault("JAXTYPING_DISABLE", "1")
     env.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
     env["PYTHONPATH"] = os.pathsep.join(
         [
@@ -318,6 +556,8 @@ def _run_case(args: argparse.Namespace, case: Case) -> dict[str, Any]:
         str(args.compile_warmup),
         "--measure-repeats",
         str(args.measure_repeats),
+        "--cost-source",
+        args.cost_source,
     ]
     started = time.perf_counter()
     completed = subprocess.run(
@@ -381,6 +621,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--denoise-steps", default="5,10")
     parser.add_argument("--compile-warmup", type=int, default=5, help="Untimed post-compile full VLM+AE iterations")
     parser.add_argument("--measure-repeats", type=int, default=20)
+    parser.add_argument("--cost-source", choices=("static", "xla"), default="static")
     parser.add_argument("--case-timeout-s", type=float, default=None)
     parser.add_argument("--skip-existing", action="store_true")
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)

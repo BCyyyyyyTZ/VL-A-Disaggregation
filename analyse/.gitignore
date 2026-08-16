@@ -1,0 +1,12 @@
+logs/
+**/__pycache__/
+*.pyc
+summary/*.json
+summary/*.csv
+summary/*.png
+summary/*.pdf
+summary/*.svg
+summary/*.qdrep
+summary/*.nsys-rep
+summary/*.sqlite
+summary/memory_snapshots/

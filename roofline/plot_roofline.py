@@ -32,23 +32,37 @@ def main() -> None:
 
     peak_tflops = float(hardware["peak_tflops"])
     peak_tbps = float(hardware["peak_bandwidth_tbps"])
+    ridge = peak_tflops / peak_tbps
     points = [point for point in openpi.get("points", []) if point.get("achieved_tflops", 0.0) > 0.0]
     if not points:
         raise RuntimeError("No passing OpenPI roofline points found")
 
-    max_x = max(max(point["arithmetic_intensity_flop_per_byte"] for point in points) * 1.25, peak_tflops / peak_tbps * 2.0)
-    xs = np.linspace(0.01, max_x, 600)
+    # Both axes linear: AI is now in a normal range (~10-500), so uniform ticks work.
+    max_x = max(point["arithmetic_intensity_flop_per_byte"] for point in points)
+    max_y = max(max(point["achieved_tflops"] for point in points), peak_tflops)
+    x_left = 0.0
+    x_right = max(max_x * 1.15, ridge * 1.35, 50.0)
+    y_bottom = 0.0
+    y_top = max_y * 1.12
+
+    xs = np.linspace(max(x_left, 1e-6), x_right, 800)
     ys = np.minimum(peak_tflops, xs * peak_tbps)
 
     fig, ax = plt.subplots(figsize=(8.4, 5.2), dpi=160)
     ax.plot(xs, ys, color="black", linewidth=2.0, label="Measured roofline")
     ax.axhline(peak_tflops, color="black", linewidth=1.0, linestyle="--", alpha=0.65)
-    ax.axvline(peak_tflops / peak_tbps, color="gray", linewidth=1.0, linestyle=":", alpha=0.8)
+    ax.axvline(ridge, color="gray", linewidth=1.0, linestyle=":", alpha=0.8)
 
     styles = {
         "VLM": {"marker": "o", "color": "#c94f4a", "label": "VLM"},
         "Denoise-5": {"marker": "s", "color": "#4c78a8", "label": "Denoise step=5"},
         "Denoise-10": {"marker": "^", "color": "#59a14f", "label": "Denoise step=10"},
+    }
+    # Stagger label offsets so Denoise-5/10 overlapping AI values stay readable.
+    label_offsets = {
+        "VLM": (6, 6),
+        "Denoise-5": (6, -10),
+        "Denoise-10": (-28, 6),
     }
     seen: set[str] = set()
     for family, style in styles.items():
@@ -71,7 +85,7 @@ def main() -> None:
                 f"BS{point['batch_size']}",
                 (point["arithmetic_intensity_flop_per_byte"], point["achieved_tflops"]),
                 textcoords="offset points",
-                xytext=(5, 5),
+                xytext=label_offsets.get(family, (5, 5)),
                 fontsize=8,
                 color=style["color"],
             )
@@ -79,10 +93,26 @@ def main() -> None:
     ax.set_title(args.title)
     ax.set_xlabel("Arithmetic Intensity (FLOP/Byte)")
     ax.set_ylabel("Achieved Performance (TFLOP/s)")
-    ax.set_xlim(left=0.0, right=max_x)
-    ax.set_ylim(bottom=0.0, top=max(peak_tflops * 1.12, max(point["achieved_tflops"] for point in points) * 1.25))
-    ax.grid(True, which="major", linestyle="--", linewidth=0.6, alpha=0.55)
-    ax.legend(loc="best", frameon=True)
+    ax.set_xlim(x_left, x_right)
+    ax.set_ylim(y_bottom, y_top)
+    from matplotlib.ticker import AutoMinorLocator, MultipleLocator
+
+    if x_right <= 100:
+        x_major = 10.0
+    elif x_right <= 300:
+        x_major = 25.0
+    elif x_right <= 600:
+        x_major = 50.0
+    else:
+        x_major = 100.0
+    ax.xaxis.set_major_locator(MultipleLocator(x_major))
+    ax.xaxis.set_minor_locator(AutoMinorLocator(5))
+    y_major = 25.0 if y_top >= 100 else 10.0
+    ax.yaxis.set_major_locator(MultipleLocator(y_major))
+    ax.yaxis.set_minor_locator(AutoMinorLocator(5))
+    ax.grid(True, which="major", linestyle="--", linewidth=0.65, alpha=0.55)
+    ax.grid(True, which="minor", linestyle=":", linewidth=0.4, alpha=0.25)
+    ax.legend(loc="lower right", frameon=True)
     ax.text(
         0.02,
         0.96,
