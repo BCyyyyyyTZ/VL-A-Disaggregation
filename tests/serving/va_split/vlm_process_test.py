@@ -7,6 +7,8 @@ import pytest
 import torch
 
 from openpi.models_pytorch.pi0_split_types import PrefixFeature
+from openpi.serving.va_split.ae_process import _expand_batch_prefix_ready
+from openpi.serving.va_split.types import BatchPrefixReady
 from openpi.serving.va_split.types import BatchRequestEnvelope
 from openpi.serving.va_split.types import ReleaseFeature
 from openpi.serving.va_split.types import RequestEnvelope
@@ -14,6 +16,17 @@ from openpi.serving.va_split.types import Shutdown
 from openpi.serving.va_split.vlm_process import VLMProcess
 from openpi.serving.va_split.vlm_process import VLMWorker
 from openpi.serving.va_split.vlm_process import _split_batch_request_envelope
+
+
+def _expand_prefix_queue_items(items: list) -> list:
+    """Flatten BatchPrefixReady IPC payloads into per-request PrefixReady rows."""
+    expanded = []
+    for item in items:
+        if isinstance(item, BatchPrefixReady):
+            expanded.extend(_expand_batch_prefix_ready(item))
+        else:
+            expanded.append(item)
+    return expanded
 
 
 def _request_observation(*, prompt_len: int = 8, image_size: int = 224) -> dict:
@@ -119,10 +132,12 @@ def test_vlm_process_splits_request_queue_wait_and_transfer():
 
     process.run()
 
-    ready = next(item for item in prefix_queue.items if hasattr(item, "timing"))
-    assert ready.timing["vlm_request_queue_wait_ms"] >= 4.0
-    assert ready.timing["vlm_request_transfer_ms"] >= 8.0
-    assert ready.timing["vlm_request_transfer_ms"] <= 50.0
+    ready_batch = next(item for item in prefix_queue.items if isinstance(item, BatchPrefixReady))
+    timing = ready_batch.timing_by_row[0]
+    assert timing is not None
+    assert timing["vlm_request_queue_wait_ms"] >= 4.0
+    assert timing["vlm_request_transfer_ms"] >= 8.0
+    assert timing["vlm_request_transfer_ms"] <= 50.0
 
 
 def test_vlm_worker_publishes_prefix_and_releases_live_feature():
@@ -169,10 +184,14 @@ def test_vlm_worker_handle_batch_builds_prefix_once_and_releases_by_refcount():
 
     ready = worker.handle_batch(requests)
 
+    assert isinstance(ready, BatchPrefixReady)
     assert model.batch_sizes == [2]
-    assert [message.request_id for message in ready] == ["req-0", "req-1"]
-    assert all(message.feature.prefix_pad_masks.shape == (1, 3) for message in ready)
-    assert all(message.timing is not None and message.timing["vlm_effective_batch"] == 2 for message in ready)
+    assert ready.request_ids == ("req-0", "req-1")
+    assert ready.feature.prefix_pad_masks.shape == (2, 3)
+    assert all(timing is not None and timing["vlm_effective_batch"] == 2 for timing in ready.timing_by_row)
+    rows = _expand_batch_prefix_ready(ready)
+    assert [message.request_id for message in rows] == ["req-0", "req-1"]
+    assert all(message.feature.prefix_pad_masks.shape == (1, 3) for message in rows)
     assert set(worker.live_features) == {"req-0", "req-1"}
     assert len(worker.live_batches) == 1
 
@@ -244,7 +263,8 @@ def test_vlm_process_fcfs_collector_batches_compatible_ready_requests():
 
     process.run()
 
-    ready = prefix_queue.items[:-1]
+    assert all(isinstance(item, BatchPrefixReady) for item in prefix_queue.items[:-1])
+    ready = _expand_prefix_queue_items(prefix_queue.items[:-1])
     assert model.batch_sizes == [4, 1]
     assert [message.request_id for message in ready] == [f"req-{idx}" for idx in range(5)]
     assert [message.timing["vlm_effective_batch"] for message in ready] == [4.0, 4.0, 4.0, 4.0, 1.0]
@@ -270,7 +290,8 @@ def test_vlm_process_prefetches_ready_queue_before_fcfs_wait_window():
 
     process.run()
 
-    ready = prefix_queue.items[:-1]
+    assert all(isinstance(item, BatchPrefixReady) for item in prefix_queue.items[:-1])
+    ready = _expand_prefix_queue_items(prefix_queue.items[:-1])
     assert model.batch_sizes == [4, 1]
     assert [message.request_id for message in ready] == [f"req-{idx}" for idx in range(5)]
     assert [message.timing["vlm_effective_batch"] for message in ready] == [4.0, 4.0, 4.0, 4.0, 1.0]
@@ -279,19 +300,28 @@ def test_vlm_process_prefetches_ready_queue_before_fcfs_wait_window():
 
 def test_vlm_process_caps_late_short_ae_batch_even_when_backlog_is_full():
     model = FakeVLMModel()
-    old_enqueue_ns = time.monotonic_ns() - 50_000_000
-    request_queue = SimpleQueue(
-        [
-            RequestEnvelope(
-                request_id=f"req-{idx}",
-                observation=_request_observation(),
-                sample_kwargs={"num_steps": 4},
-                enqueue_ns=old_enqueue_ns,
-            )
-            for idx in range(8)
-        ]
-        + [Shutdown()]
-    )
+    # Stamp enqueue *after* building observations so tensor alloc time cannot push
+    # age past the deep-late window (100ms) and flip the target from 6 → 7.
+    envelopes = [
+        RequestEnvelope(
+            request_id=f"req-{idx}",
+            observation=_request_observation(),
+            sample_kwargs={"num_steps": 4},
+            enqueue_ns=0,
+        )
+        for idx in range(8)
+    ]
+    old_enqueue_ns = time.monotonic_ns() - 20_000_000
+    envelopes = [
+        RequestEnvelope(
+            request_id=env.request_id,
+            observation=env.observation,
+            sample_kwargs=env.sample_kwargs,
+            enqueue_ns=old_enqueue_ns,
+        )
+        for env in envelopes
+    ]
+    request_queue = SimpleQueue(envelopes + [Shutdown()])
     prefix_queue = SimpleQueue()
     process = VLMProcess(
         model=model,
@@ -305,10 +335,11 @@ def test_vlm_process_caps_late_short_ae_batch_even_when_backlog_is_full():
 
     process.run()
 
-    ready = prefix_queue.items[:-1]
-    assert model.batch_sizes == [7, 1]
+    assert all(isinstance(item, BatchPrefixReady) for item in prefix_queue.items[:-1])
+    ready = _expand_prefix_queue_items(prefix_queue.items[:-1])
+    assert model.batch_sizes == [6, 2]
     assert [message.request_id for message in ready] == [f"req-{idx}" for idx in range(8)]
-    assert [message.timing["vlm_effective_batch"] for message in ready] == [7.0] * 7 + [1.0]
+    assert [message.timing["vlm_effective_batch"] for message in ready] == [6.0] * 6 + [2.0] * 2
     assert isinstance(prefix_queue.items[-1], Shutdown)
 
 
@@ -340,10 +371,11 @@ def test_vlm_process_uses_smaller_target_batch_for_late_long_ae_requests():
 
     process.run()
 
-    ready = prefix_queue.items[:-1]
-    assert model.batch_sizes == [5, 3]
+    assert all(isinstance(item, BatchPrefixReady) for item in prefix_queue.items[:-1])
+    ready = _expand_prefix_queue_items(prefix_queue.items[:-1])
+    assert model.batch_sizes == [6, 2]
     assert [message.request_id for message in ready] == [f"req-{idx}" for idx in range(8)]
-    assert [message.timing["vlm_effective_batch"] for message in ready] == [5.0] * 5 + [3.0] * 3
+    assert [message.timing["vlm_effective_batch"] for message in ready] == [6.0] * 6 + [2.0] * 2
     assert isinstance(prefix_queue.items[-1], Shutdown)
 
 
@@ -363,6 +395,7 @@ def test_vlm_process_fcfs_collector_splits_incompatible_prompt_lengths():
 
     process.run()
 
-    ready = prefix_queue.items[:-1]
+    assert all(isinstance(item, BatchPrefixReady) for item in prefix_queue.items[:-1])
+    ready = _expand_prefix_queue_items(prefix_queue.items[:-1])
     assert model.batch_sizes == [1, 1]
     assert [message.request_id for message in ready] == ["req-1", "req-2"]

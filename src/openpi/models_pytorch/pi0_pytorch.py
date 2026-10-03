@@ -157,9 +157,19 @@ class PI0Pytorch(nn.Module):
         return func(*args, **kwargs)
 
     def _prepare_attention_masks_4d(self, att_2d_masks):
-        """Helper method to prepare 4D attention masks for transformer."""
+        """Helper method to prepare 4D attention masks for transformer.
+
+        Additive float mask must match query dtype for torch SDPA (Dexmal
+        realtime-vla creates masks with ``dtype=q.dtype``).
+        """
         att_2d_masks_4d = att_2d_masks[:, None, :, :]
-        return torch.where(att_2d_masks_4d, 0.0, -2.3819763e38)
+        # Prefer bf16 on CUDA to match Pi0 compute dtype; float32 elsewhere.
+        dtype = torch.bfloat16 if att_2d_masks.device.type == "cuda" else torch.float32
+        return torch.where(
+            att_2d_masks_4d,
+            torch.zeros((), dtype=dtype, device=att_2d_masks.device),
+            torch.tensor(-2.3819763e38, dtype=dtype, device=att_2d_masks.device),
+        )
 
     def _preprocess_observation(self, observation, *, train=True):
         """Helper method to preprocess observation."""
@@ -196,7 +206,8 @@ class PI0Pytorch(nn.Module):
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
         prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
-        self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
+        # Align with Dexmal realtime-vla batched SDPA path (fused gemma_pytorch also uses SDPA).
+        self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "sdpa"  # noqa: SLF001
 
         _, past_key_values = self.paligemma_with_expert.forward(
             attention_mask=prefix_att_2d_masks_4d,
@@ -480,7 +491,7 @@ class PI0Pytorch(nn.Module):
 
         # Prepare attention masks
         full_att_2d_masks_4d = self._prepare_attention_masks_4d(full_att_2d_masks)
-        self.paligemma_with_expert.gemma_expert.model.config._attn_implementation = "eager"  # noqa: SLF001
+        self.paligemma_with_expert.gemma_expert.model.config._attn_implementation = "sdpa"  # noqa: SLF001
 
         outputs_embeds, _ = self.paligemma_with_expert.forward(
             attention_mask=full_att_2d_masks_4d,

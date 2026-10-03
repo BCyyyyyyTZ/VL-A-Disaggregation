@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Sequence
 
 import torch
 from transformers.cache_utils import DynamicCache
@@ -53,6 +53,76 @@ class PrefixCacheLanePool:
         )
         if self._state_pool is not None:
             self._state_pool.narrow(0, dst_lane, 1).copy_(self._state_pool.narrow(0, src_lane, 1), non_blocking=True)
+
+    def gather_lanes(self, lane_ids: Sequence[int]) -> PrefixFeature:
+        """Contiguous prefix batch for arbitrary physical lanes (no compaction)."""
+        if not lane_ids:
+            raise ValueError("lane_ids must be non-empty")
+        if self._past_pool is None or self._prefix_pad_masks is None:
+            raise RuntimeError("Cannot gather prefix lanes before the prefix pool is initialized")
+        for lane_id in lane_ids:
+            self._validate_lane_id(int(lane_id))
+        index = torch.tensor(list(lane_ids), device=self._prefix_pad_masks.device, dtype=torch.long)
+        state = self._state_pool.index_select(0, index) if self._state_pool is not None else None
+        return PrefixFeature(
+            past_key_values=self._past_pool.gather(index),
+            prefix_pad_masks=self._prefix_pad_masks.index_select(0, index),
+            state=state,
+        )
+
+    def gather_lanes_cached(
+        self,
+        lane_ids: Sequence[int],
+        *,
+        cached_lane_ids: Sequence[int] | None = None,
+        dest: PrefixFeature | None = None,
+    ) -> PrefixFeature:
+        """Gather into packed buffers, skipping rows whose lane id is unchanged.
+
+        Mirrors realtime-vla ``load_into_packed_buffers(..., cached_lane_ids=...)``:
+        an identical layout reuses ``dest`` with zero copies; otherwise only dirty
+        rows are copied when ``dest`` already has the right batch size.
+        """
+        wanted = [int(lane_id) for lane_id in lane_ids]
+        if not wanted:
+            raise ValueError("lane_ids must be non-empty")
+        if self._past_pool is None or self._prefix_pad_masks is None:
+            raise RuntimeError("Cannot gather prefix lanes before the prefix pool is initialized")
+        for lane_id in wanted:
+            self._validate_lane_id(lane_id)
+
+        cached = [int(lane_id) for lane_id in cached_lane_ids] if cached_lane_ids is not None else []
+        if dest is not None and cached == wanted:
+            return dest
+
+        if dest is None or int(dest.prefix_pad_masks.shape[0]) != len(wanted):
+            return self.gather_lanes(wanted)
+
+        if not _can_copy_lanes_into_prefix(self._past_pool, dest.past_key_values):
+            return self.gather_lanes(wanted)
+
+        dirty_rows: list[int] = []
+        dirty_lanes: list[int] = []
+        for row, lane_id in enumerate(wanted):
+            if row < len(cached) and cached[row] == lane_id:
+                continue
+            dirty_rows.append(row)
+            dirty_lanes.append(lane_id)
+        if not dirty_rows:
+            return dest
+
+        _copy_lanes_into_prefix(
+            pool=self,
+            dest=dest,
+            dirty_rows=dirty_rows,
+            dirty_lanes=dirty_lanes,
+        )
+        return dest
+
+    def export_layer_slabs(self) -> tuple[tuple[torch.Tensor, torch.Tensor], ...]:
+        if not isinstance(self._past_pool, _DynamicCachePool):
+            raise RuntimeError("Shared prefix lanes require a DynamicCache slab")
+        return tuple((layer.key, layer.value) for layer in self._past_pool._layers)
 
     def view_prefix_batch(self, batch_size: int) -> PrefixFeature:
         if batch_size <= 0:
@@ -107,6 +177,9 @@ class _PastPool:
     def view_batch(self, batch_size: int) -> Any:
         raise NotImplementedError
 
+    def gather(self, index: torch.Tensor) -> Any:
+        raise NotImplementedError
+
     def validate(self, value: Any) -> None:
         raise NotImplementedError
 
@@ -132,6 +205,13 @@ class _DynamicCachePool(_PastPool):
         cache = DynamicCache()
         for layer_idx, layer_pool in enumerate(self._layers):
             key, value = layer_pool.view_batch(batch_size)
+            cache.update(key, value, layer_idx=layer_idx)
+        return cache
+
+    def gather(self, index: torch.Tensor) -> DynamicCache:
+        cache = DynamicCache()
+        for layer_idx, layer_pool in enumerate(self._layers):
+            key, value = layer_pool.gather(index)
             cache.update(key, value, layer_idx=layer_idx)
         return cache
 
@@ -164,6 +244,9 @@ class _LayerPool:
     def view_batch(self, batch_size: int) -> tuple[torch.Tensor, torch.Tensor]:
         return self.key.narrow(0, 0, batch_size), self.value.narrow(0, 0, batch_size)
 
+    def gather(self, index: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.key.index_select(0, index), self.value.index_select(0, index)
+
     def validate(self, key: torch.Tensor, value: torch.Tensor) -> None:
         _validate_tensor_compatible(self.key, key, name="cache key")
         _validate_tensor_compatible(self.value, value, name="cache value")
@@ -181,6 +264,9 @@ class _TensorTreePool(_PastPool):
 
     def view_batch(self, batch_size: int) -> Any:
         return _view_tensor_tree_batch(self._tree, batch_size)
+
+    def gather(self, index: torch.Tensor) -> Any:
+        return _gather_tensor_tree(self._tree, index)
 
     def validate(self, value: Any) -> None:
         _validate_tensor_tree(self._tree, value)
@@ -206,6 +292,10 @@ class _FallbackPastPool(_PastPool):
     def view_batch(self, batch_size: int) -> Any:
         values = self._values[:batch_size]
         return values[0] if values else None
+
+    def gather(self, index: torch.Tensor) -> Any:
+        lane_id = int(index[0].item()) if int(index.shape[0]) else 0
+        return self._values[lane_id]
 
     def validate(self, value: Any) -> None:
         if not isinstance(value, self._value_type):
@@ -238,6 +328,39 @@ def _validate_single_row_feature(feature: PrefixFeature) -> None:
     _validate_single_row_tensor(feature.prefix_pad_masks, name="prefix_pad_masks")
     if feature.state is not None:
         _validate_single_row_tensor(feature.state, name="state")
+
+
+def _can_copy_lanes_into_prefix(past_pool: _PastPool, dest_past: Any) -> bool:
+    layers = getattr(past_pool, "_layers", None)
+    if layers is None or not isinstance(dest_past, DynamicCache):
+        return False
+    return len(layers) == len(dest_past)
+
+
+def _copy_lanes_into_prefix(
+    *,
+    pool: PrefixCacheLanePool,
+    dest: PrefixFeature,
+    dirty_rows: Sequence[int],
+    dirty_lanes: Sequence[int],
+) -> None:
+    assert pool._past_pool is not None
+    assert pool._prefix_pad_masks is not None
+    layers = pool._past_pool._layers  # noqa: SLF001
+    for row, lane_id in zip(dirty_rows, dirty_lanes, strict=True):
+        dest.prefix_pad_masks.narrow(0, row, 1).copy_(
+            pool._prefix_pad_masks.narrow(0, lane_id, 1),
+            non_blocking=True,
+        )
+        if dest.state is not None and pool._state_pool is not None:
+            dest.state.narrow(0, row, 1).copy_(
+                pool._state_pool.narrow(0, lane_id, 1),
+                non_blocking=True,
+            )
+        for layer_idx, layer in enumerate(layers):
+            dest_key, dest_value = dest.past_key_values[layer_idx]
+            dest_key.narrow(0, row, 1).copy_(layer.key.narrow(0, lane_id, 1), non_blocking=True)
+            dest_value.narrow(0, row, 1).copy_(layer.value.narrow(0, lane_id, 1), non_blocking=True)
 
 
 def _validate_single_row_tensor(tensor: torch.Tensor, *, name: str = "tensor") -> None:
@@ -297,6 +420,16 @@ def _move_tensor_tree_lane(pool: Any, src_lane: int, dst_lane: int) -> None:
         for child_pool in pool:
             _move_tensor_tree_lane(child_pool, src_lane, dst_lane)
         return
+    raise TypeError(f"Unsupported tensor tree pool node: {type(pool)}")
+
+
+def _gather_tensor_tree(pool: Any, index: torch.Tensor) -> Any:
+    if torch.is_tensor(pool):
+        return pool.index_select(0, index)
+    if isinstance(pool, tuple):
+        return tuple(_gather_tensor_tree(child_pool, index) for child_pool in pool)
+    if isinstance(pool, list):
+        return [_gather_tensor_tree(child_pool, index) for child_pool in pool]
     raise TypeError(f"Unsupported tensor tree pool node: {type(pool)}")
 
 

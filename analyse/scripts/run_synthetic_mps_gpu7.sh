@@ -3,7 +3,9 @@ set -euo pipefail
 
 REPO_ROOT="${REPO_ROOT:-/home/miliang/VL-A-Disaggregation}"
 PYTHON="${PYTHON:-${REPO_ROOT}/.venv/bin/python}"
+# Physical GPU for MPS; clients use remapped device 0.
 GPU="${GPU:-7}"
+CLIENT_GPU="${CLIENT_GPU:-0}"
 OUTPUT_DIR="${OUTPUT_DIR:-${REPO_ROOT}/analyse/summary/synthetic_mps}"
 MPS_ROOT="${MPS_ROOT:-/tmp/openpi-synthetic-mps-${USER:-user}-${GPU}}"
 
@@ -20,10 +22,12 @@ cleanup_mps() {
 }
 trap cleanup_mps EXIT
 
+echo quit | nvidia-cuda-mps-control >/dev/null 2>&1 || true
+sleep 1
 CUDA_VISIBLE_DEVICES="${GPU}" nvidia-cuda-mps-control -d
 
 "${PYTHON}" analyse/src/synthetic_mps_overlap.py \
-  --gpu "${GPU}" \
+  --gpu "${CLIENT_GPU}" \
   --output-dir "${OUTPUT_DIR}" \
   --duration-s 8 \
   2>&1 | tee "analyse/logs/synthetic_mps_gpu${GPU}.log"

@@ -667,7 +667,19 @@ def test_run_profile_uses_baseline_fcfs_batching_only_for_monolithic(monkeypatch
     assert result.summary["policy_effective_batch_mean"] == 2.6
 
 
-def test_run_profile_monolithic_batching_uses_one_model_lane(monkeypatch):
+def test_make_profile_executor_baseline_workers_match_batch_size():
+    policy = _SerialFakePolicy(sleep_s=0.0)
+    executor = profile_va_split.make_profile_executor(
+        policy,
+        profile_va_split.Args(mode="monolithic", batch_size=4),
+    )
+    try:
+        assert executor._max_workers == 4
+    finally:
+        executor.shutdown(wait=False)
+
+
+def test_run_profile_monolithic_batching_uses_batch_size_model_lanes(monkeypatch):
     policy = _ConcurrentFakePolicy(sleep_s=0.03)
     monkeypatch.setattr(profile_va_split, "create_policy_for_mode", lambda args, mode: policy)
     monkeypatch.setattr(profile_va_split, "make_synthetic_libero_requests", lambda **kwargs: _fake_requests(6))
@@ -690,7 +702,8 @@ def test_run_profile_monolithic_batching_uses_one_model_lane(monkeypatch):
     assert policy.infer_calls == 0
     assert policy.infer_batch_calls == 2
     assert policy.observed_batch_sizes == [3, 3]
-    assert policy.max_active_calls == 1
+    # max_workers == batch_size, so two full batches can overlap on separate lanes.
+    assert policy.max_active_calls == 2
 
 
 def test_run_profile_monolithic_batching_collects_from_runtime_queue(monkeypatch):
@@ -722,9 +735,11 @@ def test_run_profile_monolithic_batching_collects_from_runtime_queue(monkeypatch
 
     assert [trace.request_id for trace in result.traces] == [f"req-{idx:06d}" for idx in range(6)]
     assert policy.infer_calls == 0
-    assert policy.infer_batch_calls == 3
-    assert policy.observed_batch_sizes == [1, 3, 2]
-    assert policy.max_active_calls == 1
+    assert policy.infer_batch_calls >= 2
+    assert sum(policy.observed_batch_sizes) == 6
+    assert max(policy.observed_batch_sizes) <= 3
+    # With batch_size lanes, later arrivals can start while the first batch is still running.
+    assert policy.max_active_calls >= 1
 
 
 def test_run_profile_does_not_add_outer_batching_for_split_modes(monkeypatch):

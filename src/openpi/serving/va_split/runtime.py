@@ -13,9 +13,11 @@ import torch
 
 from openpi.serving.va_split.ae_process import AEProcess
 from openpi.serving.va_split.ae_process import AEWorker
+from openpi.serving.va_split.ae_process import _expand_batch_prefix_ready
 from openpi.serving.va_split.timing import queue_wait_and_transfer_ms
 from openpi.serving.va_split.timing import timed_queue_get
 from openpi.serving.va_split.types import ActionResult
+from openpi.serving.va_split.types import BatchPrefixReady
 from openpi.serving.va_split.types import BatchRequestEnvelope
 from openpi.serving.va_split.types import RequestEnvelope
 from openpi.serving.va_split.types import Shutdown
@@ -74,7 +76,7 @@ class LocalVASplitRuntime:
         batch_size = int(observation["state"].shape[0])
         batch_id = str(uuid.uuid4())
         request_ids = tuple(f"{batch_id}:{row}" for row in range(batch_size))
-        ready_messages = self.vlm_worker.handle_batch_request(
+        batch_ready = self.vlm_worker.handle_batch_request(
             BatchRequestEnvelope(
                 batch_id=batch_id,
                 request_ids=request_ids,
@@ -83,7 +85,9 @@ class LocalVASplitRuntime:
                 enqueue_ns=time.monotonic_ns(),
             )
         )
-        for ready in ready_messages:
+        if not isinstance(batch_ready, BatchPrefixReady):
+            raise TypeError(f"Expected BatchPrefixReady, got {type(batch_ready)}")
+        for ready in _expand_batch_prefix_ready(batch_ready):
             self.ae_worker.add_prefix(ready)
 
         results_by_id: dict[str, ActionResult] = {}
@@ -125,6 +129,7 @@ def _run_vlm_process(
     env_updates=None,
     enable_component_timing=True,
     ready_queue=None,
+    use_shared_prefix_lanes=False,
 ) -> None:
     _apply_env_updates(env_updates)
     model = _prepare_model(model_factory, device)
@@ -138,7 +143,11 @@ def _run_vlm_process(
         max_wait_ms=max_vlm_wait_ms,
         max_live_features=max_live_features,
         enable_component_timing=enable_component_timing,
+        use_shared_prefix_lanes=use_shared_prefix_lanes,
     )
+    if use_shared_prefix_lanes:
+        # Triton: attach shared pool + warm B=1..N before announcing ready.
+        process.bootstrap_shared_pool_before_ready(warmup_max_batch=max_vlm_batch_size)
     if ready_queue is not None:
         ready_queue.put("vlm")
     process.run()
@@ -155,6 +164,7 @@ def _run_ae_process(
     env_updates=None,
     enable_component_timing=True,
     ready_queue=None,
+    use_shared_prefix_lanes=False,
 ) -> None:
     _apply_env_updates(env_updates)
     model = _prepare_model(model_factory, device)
@@ -167,6 +177,7 @@ def _run_ae_process(
         max_batch_size=max_ae_batch_size,
         max_prefix_slots=max_prefix_slots,
         enable_component_timing=enable_component_timing,
+        use_shared_prefix_lanes=use_shared_prefix_lanes,
     )
     if ready_queue is not None:
         ready_queue.put("ae")
@@ -194,7 +205,7 @@ class ProcessVASplitRuntime:
         enable_component_timing: bool = True,
     ):
         if max_prefix_slots is None:
-            # Optional experiment knobs (default remains max_vlm_batch_size * 3):
+            # Optional experiment knobs (default remains a fixed 24-slot live/admission pool):
             #   MAX_PREFIX_SLOTS / VA_SPLIT_MAX_PREFIX_SLOTS / JAX_VA_MAX_PREFIX_SLOTS
             #   PREFIX_SLOT_MULTIPLIER / VA_SPLIT_PREFIX_SLOT_MULTIPLIER / JAX_VA_PREFIX_SLOT_MULTIPLIER
             env_slots = (
@@ -212,7 +223,7 @@ class ProcessVASplitRuntime:
             elif env_mult:
                 max_prefix_slots = max(1, int(max_vlm_batch_size) * int(env_mult))
             else:
-                max_prefix_slots = max_vlm_batch_size * 3
+                max_prefix_slots = 24
         self._model_factory = model_factory
         self._vlm_model_factory = vlm_model_factory or model_factory
         self._ae_model_factory = ae_model_factory or model_factory
@@ -249,6 +260,7 @@ class ProcessVASplitRuntime:
                 ae_env_updates,
                 enable_component_timing,
                 self._ready_queue,
+                True,
             ),
             daemon=True,
         )
@@ -275,6 +287,7 @@ class ProcessVASplitRuntime:
                 vlm_env_updates,
                 enable_component_timing,
                 self._ready_queue,
+                True,
             ),
             daemon=True,
         )
@@ -426,10 +439,17 @@ def _aggregate_batch_timing(row_timings: list[dict[str, float]], *, batch_size: 
     }
     for key in (
         "vlm_prefix_forward_ms",
+        "vlm_prefix_forward_cuda_ms",
+        "vlm_credit_acquire_ms",
+        "vlm_prefix_write_ms",
+        "vlm_prefix_publish_ms",
+        "vlm_inter_batch_gap_ms",
         "vlm_queue_wait_ms",
         "vlm_effective_batch",
         "ae_step_ms",
+        "ae_step_cuda_ms",
         "ae_step_total_ms",
+        "ae_step_cuda_total_ms",
         "ae_result_cpu_copy_ms",
     ):
         values = [float(row[key]) for row in row_timings if key in row]

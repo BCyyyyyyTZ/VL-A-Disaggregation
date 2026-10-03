@@ -76,7 +76,7 @@ def test_run_va_split_mps_profile_mode_invokes_profile_workload(tmp_path):
     assert result.returncode == 0, result.stderr
     args = python_arg_log.read_text(encoding="utf-8").splitlines()
     assert args[:2] == ["scripts/profile_va_split.py", "--policy.config"]
-    assert _flag_value(args, "--policy.dir") == "/mnt/tianze/models/pi05_libero_pytorch"
+    assert _flag_value(args, "--policy.dir") == "/mnt/tianze/models/RLinf-Pi05-LIBERO-SFT"
     assert _flag_value(args, "--mode") == "split-mps"
     assert _flag_value(args, "--num-requests") == "3"
     assert _flag_value(args, "--request-rate-hz") == "7"

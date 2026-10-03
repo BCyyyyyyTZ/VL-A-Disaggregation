@@ -13,6 +13,8 @@ from openpi.models_pytorch.pi0_split_types import DenoiseState
 from openpi.models_pytorch.pi0_split_types import PrefixFeature
 from openpi.serving.va_split.ae_process import AEProcess
 from openpi.serving.va_split.ae_process import AEWorker
+from openpi.serving.va_split.shared_prefix_pool import LaneCredits
+from openpi.serving.va_split.shared_prefix_pool import SharedPrefixLanePool
 from openpi.serving.va_split.types import PrefixReady
 from openpi.serving.va_split.types import WorkerError
 
@@ -304,3 +306,62 @@ def test_ae_process_releases_active_features_when_step_fails():
     assert all(isinstance(item, WorkerError) for item in result_queue.items)
     assert [item.request_id for item in release_queue.items] == ["req-1", "req-2"]
     assert process.worker.active == {}
+
+
+def test_shared_lane_uses_physical_slot_without_compaction_copy():
+    template = _dynamic_cache_ready("template", 1.0).feature
+    shared = SharedPrefixLanePool.create_owned_from_feature(template, max_lanes=4)
+    shared.write_feature(3, _dynamic_cache_ready("req", 7.0).feature, record_ready=False)
+    worker = AEWorker(model=FakeAEModel(), device="cpu", max_batch_size=4, max_prefix_slots=4)
+    worker.bind_shared_pool(shared)
+    worker.add_prefix(
+        PrefixReady(
+            request_id="req",
+            feature=None,
+            num_steps=1,
+            sample_kwargs={"noise": torch.zeros(1, 2, 1)},
+            slot_id=3,
+        )
+    )
+
+    results, releases = worker.step_once()
+
+    assert [result.request_id for result in results] == ["req"]
+    assert releases[0].slot_id == 3
+    assert worker.active == {}
+    assert worker._lanes[0] is None
+    assert worker._lanes[3] is None
+    gathered = shared.pool.gather_lanes([3])
+    key, _value = gathered.past_key_values[0]
+    torch.testing.assert_close(key, torch.full((1, 1, 3, 4), 7.0))
+
+
+def test_ae_process_returns_lane_credits_after_shared_step():
+    shared = SharedPrefixLanePool.create_owned_from_feature(_dynamic_cache_ready("template", 1.0).feature, max_lanes=2)
+    shared.write_feature(1, _dynamic_cache_ready("req", 4.0).feature, record_ready=False)
+    release_queue = SimpleQueue()
+    process = AEProcess(
+        model=FakeAEModel(),
+        device="cpu",
+        prefix_queue=SimpleQueue(),
+        result_queue=SimpleQueue(),
+        release_queue=release_queue,
+        max_batch_size=2,
+        max_prefix_slots=2,
+        use_shared_prefix_lanes=True,
+    )
+    process.worker.bind_shared_pool(shared)
+    process.worker.add_prefix(
+        PrefixReady(
+            request_id="req",
+            feature=None,
+            num_steps=1,
+            sample_kwargs={"noise": torch.zeros(1, 2, 1)},
+            slot_id=1,
+        )
+    )
+
+    process.step_active_once()
+
+    assert isinstance(release_queue.items[-1], LaneCredits)
+    assert release_queue.items[-1].lane_ids == (1,)

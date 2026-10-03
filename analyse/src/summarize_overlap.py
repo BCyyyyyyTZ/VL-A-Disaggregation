@@ -98,53 +98,138 @@ def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         writer.writerows(rows)
 
 
+def _xy(rows: list[dict[str, Any]], key: str) -> tuple[list[float], list[float]]:
+    xs, ys = [], []
+    for row in rows:
+        if key in row and row[key] is not None:
+            xs.append(float(row["batch_size"]))
+            ys.append(float(row[key]))
+    return xs, ys
+
+
+def _error_text(result: dict[str, Any] | None) -> str:
+    if not result:
+        return ""
+    parts = [str(result.get("error_message") or "")]
+    for role in ("vlm", "ae"):
+        blob = result.get(role)
+        if isinstance(blob, dict):
+            parts.append(str(blob.get("error_message") or ""))
+    return "\n".join(parts)
+
+
+def _is_oom(text: str) -> bool:
+    return "RESOURCE_EXHAUSTED" in text or "Out of memory" in text
+
+
+def _concurrent_failures(output_dir: Path, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    failures: list[dict[str, Any]] = []
+    for row in rows:
+        if "vlm_concurrent_ms" in row:
+            continue
+        batch_size = int(row["batch_size"])
+        result = _read_case(output_dir, f"concurrent_b{batch_size}_ae{row['ae_batch_size']}")
+        text = _error_text(result)
+        oom_roles = []
+        if result:
+            for role in ("vlm", "ae"):
+                blob = result.get(role)
+                if isinstance(blob, dict) and _is_oom(str(blob.get("error_message") or "")):
+                    oom_roles.append(role.upper())
+        if _is_oom(text):
+            kind = "OOM"
+            detail = "+".join(oom_roles) if oom_roles else "concurrent"
+        elif result is None:
+            kind = "missing"
+            detail = "no result"
+        else:
+            kind = "failed"
+            detail = "concurrent failed"
+        failures.append({"batch_size": batch_size, "kind": kind, "detail": detail})
+    return failures
+
+
+def _style_xaxis(ax: Any, batch_sizes: list[int]) -> None:
+    ax.set_xscale("log", base=2)
+    ax.set_xticks(batch_sizes)
+    ax.set_xticklabels([str(value) for value in batch_sizes])
+    ax.set_xlim(min(batch_sizes) / 1.35, max(batch_sizes) * 1.35)
+    ax.set_xlabel("Batch size")
+    ax.grid(True, alpha=0.3)
+
+
+def _mark_failures(ax: Any, failures: list[dict[str, Any]]) -> None:
+    for item in failures:
+        x = item["batch_size"]
+        ax.axvline(x, color="#c0392b", linestyle=":", linewidth=1.0, alpha=0.7, zorder=0)
+        ax.text(
+            x,
+            1.03,
+            item["kind"],
+            transform=ax.get_xaxis_transform(),
+            ha="center",
+            va="bottom",
+            fontsize=8,
+            color="#c0392b",
+            fontweight="bold",
+            clip_on=False,
+        )
+    if failures:
+        ax.plot([], [], color="#c0392b", linestyle=":", marker="x", label="Concurrent OOM (omitted)")
+
+
 def plot(output_dir: Path, rows: list[dict[str, Any]]) -> None:
     if not rows:
         return
     import matplotlib.pyplot as plt
 
-    bs = [row["batch_size"] for row in rows]
-    fig, axes = plt.subplots(2, 2, figsize=(11, 7), dpi=150)
+    batch_sizes = [int(row["batch_size"]) for row in rows]
+    failures = _concurrent_failures(output_dir, rows)
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8.2), dpi=150)
+
     ax = axes[0][0]
-    ax.plot(bs, [row.get("vlm_solo_ms", 0) for row in rows], marker="o", label="VLM solo")
-    ax.plot(bs, [row.get("ae_solo_ms", 0) for row in rows], marker="s", label="AE solo")
-    ax.plot(bs, [row.get("vlm_concurrent_ms", 0) for row in rows], marker="o", linestyle="--", label="VLM concurrent")
-    ax.plot(bs, [row.get("ae_concurrent_ms", 0) for row in rows], marker="s", linestyle="--", label="AE concurrent")
-    ax.set_xscale("log", base=2)
-    ax.set_xlabel("Batch size")
+    ax.plot(*_xy(rows, "vlm_solo_ms"), marker="o", label="VLM solo")
+    ax.plot(*_xy(rows, "ae_solo_ms"), marker="s", label="AE solo")
+    ax.plot(*_xy(rows, "vlm_concurrent_ms"), marker="o", linestyle="--", label="VLM concurrent")
+    ax.plot(*_xy(rows, "ae_concurrent_ms"), marker="s", linestyle="--", label="AE concurrent")
+    _mark_failures(ax, failures)
+    _style_xaxis(ax, batch_sizes)
     ax.set_ylabel("Latency (ms)")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=8)
 
     ax = axes[0][1]
-    ax.plot(bs, [row.get("vlm_slowdown", 0) for row in rows], marker="o", label="VLM slowdown")
-    ax.plot(bs, [row.get("ae_slowdown", 0) for row in rows], marker="s", label="AE slowdown")
+    ax.plot(*_xy(rows, "vlm_slowdown"), marker="o", label="VLM slowdown")
+    ax.plot(*_xy(rows, "ae_slowdown"), marker="s", label="AE slowdown")
     ax.axhline(1.0, color="black", linewidth=1)
-    ax.set_xscale("log", base=2)
-    ax.set_xlabel("Batch size")
+    _mark_failures(ax, failures)
+    _style_xaxis(ax, batch_sizes)
     ax.set_ylabel("Concurrent / solo")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=8)
 
     ax = axes[1][0]
-    ax.plot(bs, [row.get("ideal_speedup", 0) for row in rows], marker="o", label="Ideal speedup")
-    ax.plot(bs, [row.get("actual_speedup_est", 0) for row in rows], marker="s", label="Actual speedup est.")
+    ax.plot(*_xy(rows, "ideal_speedup"), marker="o", label="Ideal speedup")
+    ax.plot(*_xy(rows, "actual_speedup_est"), marker="s", label="Actual speedup est.")
     ax.axhline(1.0, color="black", linewidth=1)
-    ax.set_xscale("log", base=2)
-    ax.set_xlabel("Batch size")
+    _mark_failures(ax, failures)
+    _style_xaxis(ax, batch_sizes)
     ax.set_ylabel("Speedup")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=8)
 
     ax = axes[1][1]
-    ax.plot(bs, [row.get("overlap_efficiency", 0) for row in rows], marker="o")
+    ax.plot(*_xy(rows, "overlap_efficiency"), marker="o", label="Overlap efficiency")
     ax.axhline(0.0, color="black", linewidth=1)
     ax.axhline(1.0, color="black", linewidth=1, linestyle="--")
-    ax.set_xscale("log", base=2)
-    ax.set_xlabel("Batch size")
+    _mark_failures(ax, failures)
+    _style_xaxis(ax, batch_sizes)
     ax.set_ylabel("Overlap efficiency")
-    ax.grid(True, alpha=0.3)
-    fig.tight_layout()
+    ax.legend(fontsize=8)
+
+    if failures:
+        note = "Concurrent VLM+AE omitted: " + "; ".join(
+            f"BS={item['batch_size']} {item['kind']} ({item['detail']})" for item in failures
+        )
+        fig.text(0.5, 0.015, note, ha="center", va="bottom", fontsize=8.5, color="#c0392b")
+    fig.tight_layout(rect=(0.0, 0.05, 1.0, 0.96))
     fig.savefig(output_dir / "overlap_summary.png")
     fig.savefig(output_dir / "overlap_summary.pdf")
 

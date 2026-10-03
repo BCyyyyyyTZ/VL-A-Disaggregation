@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import queue
 import threading
 import time
 from types import SimpleNamespace
@@ -113,6 +114,11 @@ class _ResultQueue:
         self._get_delay_s = get_delay_s
 
     def get(self):
+        return self.get_nowait()
+
+    def get_nowait(self):
+        if not self._messages:
+            raise queue.Empty
         if self._get_delay_s:
             time.sleep(self._get_delay_s)
         return self._messages.pop(0)

@@ -78,8 +78,9 @@ def _block_until_ready(value: Any) -> None:
 
 
 class TraceRange:
-    def __init__(self, name: str):
+    def __init__(self, name: str, domain: str | None = None):
         self.name = name
+        self.domain = domain or os.environ.get("VA_NVTX_DOMAIN") or None
         self._jax_ctx = None
         self._nvtx_ctx = None
 
@@ -94,7 +95,13 @@ class TraceRange:
         try:
             import nvtx  # type: ignore
 
-            self._nvtx_ctx = nvtx.annotate(self.name)
+            if self.domain:
+                try:
+                    self._nvtx_ctx = nvtx.annotate(self.name, domain=self.domain)
+                except TypeError:
+                    self._nvtx_ctx = nvtx.annotate(self.name)
+            else:
+                self._nvtx_ctx = nvtx.annotate(self.name)
             self._nvtx_ctx.__enter__()
         except Exception:
             self._nvtx_ctx = None
@@ -266,6 +273,7 @@ def _timed_loop(fn, *, repeats: int, duration_s: float | None, trace_prefix: str
 def _worker_main(args: argparse.Namespace) -> None:
     os.environ.setdefault("JAXTYPING_DISABLE", "1")
     os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+    os.environ["VA_NVTX_DOMAIN"] = str(args.role).upper()
     started = time.perf_counter()
     result_path = Path(args.result_path)
     snapshot_dir = Path(args.snapshot_dir)
@@ -309,20 +317,22 @@ def _worker_main(args: argparse.Namespace) -> None:
             while not start_path.exists():
                 time.sleep(0.01)
 
-        if args.role == "vlm":
-            measured = _timed_loop(
-                lambda: _run_vlm_once(ctx),
-                repeats=args.repeats,
-                duration_s=args.duration_s if args.duration_s > 0 else None,
-                trace_prefix="VLM",
-            )
-        else:
-            measured = _timed_loop(
-                lambda: _run_ae_once(ctx),
-                repeats=args.repeats,
-                duration_s=args.duration_s if args.duration_s > 0 else None,
-                trace_prefix="AE",
-            )
+        os.environ["VA_NVTX_DOMAIN"] = str(args.role).upper()
+        with TraceRange("MEASURE_WINDOW"):
+            if args.role == "vlm":
+                measured = _timed_loop(
+                    lambda: _run_vlm_once(ctx),
+                    repeats=args.repeats,
+                    duration_s=args.duration_s if args.duration_s > 0 else None,
+                    trace_prefix="VLM",
+                )
+            else:
+                measured = _timed_loop(
+                    lambda: _run_ae_once(ctx),
+                    repeats=args.repeats,
+                    duration_s=args.duration_s if args.duration_s > 0 else None,
+                    trace_prefix="AE",
+                )
         snapshots.append(
             _save_memory_snapshot(
                 snapshot_dir,
@@ -434,9 +444,11 @@ def _run_concurrent(args: argparse.Namespace, *, batch_size: int, ae_batch_size:
         if vlm_proc.poll() is not None or ae_proc.poll() is not None:
             break
         time.sleep(0.05)
-    start.write_text("start\n", encoding="utf-8")
-    vlm_out, vlm_err = vlm_proc.communicate(timeout=max(args.case_timeout_s, 1))
-    ae_out, ae_err = ae_proc.communicate(timeout=max(args.case_timeout_s, 1))
+    os.environ["VA_NVTX_DOMAIN"] = "ORCH"
+    with TraceRange("MEASURE_WINDOW"):
+        start.write_text("start\n", encoding="utf-8")
+        vlm_out, vlm_err = vlm_proc.communicate(timeout=max(args.case_timeout_s, 1))
+        ae_out, ae_err = ae_proc.communicate(timeout=max(args.case_timeout_s, 1))
     (case_dir / "vlm_stdout.log").write_text(vlm_out or "", encoding="utf-8")
     (case_dir / "vlm_stderr.log").write_text(vlm_err or "", encoding="utf-8")
     (case_dir / "ae_stdout.log").write_text(ae_out or "", encoding="utf-8")
@@ -694,8 +706,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--snapshot-dir", default=str(DEFAULT_SNAPSHOT_DIR))
     parser.add_argument("--gpu", default="7")
     parser.add_argument("--batch-sizes", default="1,2,4,8,16,32,64")
-    parser.add_argument("--batch-size", type=int, default=1)
-    parser.add_argument("--ae-batch-size", type=int, default=0, help="0 means use --batch-size for each case")
+    parser.add_argument("--batch-size", type=int, default=1, help="Worker/single-process batch size")
+    parser.add_argument(
+        "--ae-batch-size",
+        type=int,
+        default=0,
+        help="AE batch size. 0 means match each --batch-sizes entry (parent) or --batch-size (worker)",
+    )
     parser.add_argument("--num-steps", type=int, default=5)
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--repeats", type=int, default=10)
@@ -716,12 +733,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
-    if args.ae_batch_size == 0:
-        args.ae_batch_size = args.batch_size
-    if args.worker:
-        _worker_main(args)
-        return
-    if args.single_worker:
+    # Only materialize ae_batch_size for workers. Parent keeps 0 so each
+    # --batch-sizes entry can pair AE batch with that VLM batch.
+    if args.worker or args.single_worker:
+        if args.ae_batch_size == 0:
+            args.ae_batch_size = args.batch_size
+        if args.worker:
+            _worker_main(args)
+            return
         _single_worker_main(args)
         return
     _run_all(args)

@@ -33,11 +33,37 @@ class BatchRequestEnvelope:
 @dataclass(frozen=True, slots=True)
 class PrefixReady:
     request_id: str
-    feature: PrefixFeature
+    feature: PrefixFeature | None
     num_steps: int
     sample_kwargs: dict[str, Any]
     timing: dict[str, float] | None = None
     slot_id: int = -1
+
+
+@dataclass(frozen=True, slots=True)
+class PrefixPoolBootstrap:
+    """One-time shape template so AE can allocate the shared prefix slab.
+
+    Sent once. Later batches do not carry KV tensors.
+    """
+
+    feature: PrefixFeature
+
+
+@dataclass(frozen=True, slots=True)
+class BatchPrefixReady:
+    """One VLM batch → AE.
+
+    Shared-lane mode leaves ``feature`` empty and carries ``slot_ids`` (physical
+    lane ids). The legacy path still sends the KV payload in ``feature``.
+    """
+
+    request_ids: tuple[str, ...]
+    feature: PrefixFeature | None
+    num_steps: int
+    sample_kwargs_by_row: tuple[dict[str, Any], ...]
+    timing_by_row: tuple[dict[str, float] | None, ...]
+    slot_ids: tuple[int, ...] | None = None
 
 
 @dataclass(frozen=True, slots=True)

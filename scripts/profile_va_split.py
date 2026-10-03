@@ -353,6 +353,7 @@ async def run_benchmark_runtime_batch_requests(
     max_batch_size: int,
     max_wait_ms: float,
     executor: ThreadPoolExecutor | None = None,
+    max_concurrent_batches: int | None = None,
 ) -> list[RequestTrace]:
     if max_inflight <= 0:
         raise ValueError("max_inflight must be positive")
@@ -368,13 +369,19 @@ async def run_benchmark_runtime_batch_requests(
     in_flight = 0
     owns_executor = executor is None
     if executor is None:
-        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="va-profile-baseline-model")
+        executor = ThreadPoolExecutor(
+            max_workers=baseline_model_lane_count(max_batch_size),
+            thread_name_prefix="va-profile-baseline-model",
+        )
+    if max_concurrent_batches is None:
+        max_concurrent_batches = max(1, int(getattr(executor, "_max_workers", max_batch_size)))
+    if max_concurrent_batches <= 0:
+        raise ValueError("max_concurrent_batches must be positive")
 
     try:
         queued_requests: list[SyntheticRequest] = []
         next_request_index = 0
-        running_task: asyncio.Task[list[RequestTrace]] | None = None
-        running_batch_size = 0
+        running_tasks: dict[asyncio.Task[list[RequestTrace]], int] = {}
 
         def admit_due_requests() -> None:
             nonlocal in_flight, next_request_index
@@ -436,26 +443,35 @@ async def run_benchmark_runtime_batch_requests(
                 len(batch),
             )
 
-        while next_request_index < len(requests) or queued_requests or running_task is not None:
+        while next_request_index < len(requests) or queued_requests or running_tasks:
             admit_due_requests()
 
-            if running_task is not None and running_task.done():
-                traces.extend(running_task.result())
-                in_flight -= running_batch_size
-                running_task = None
-                running_batch_size = 0
-                continue
+            finished = [task for task in running_tasks if task.done()]
+            for task in finished:
+                traces.extend(task.result())
+                in_flight -= running_tasks.pop(task)
 
-            if running_task is None and queued_requests:
-                running_task, running_batch_size = start_batch(await collect_runtime_batch())
-                continue
+            while len(running_tasks) < max_concurrent_batches and queued_requests:
+                task, batch_size = start_batch(await collect_runtime_batch())
+                running_tasks[task] = batch_size
 
             next_arrival_s = next_admittable_arrival_abs_s()
-            if running_task is not None:
-                if next_arrival_s is None:
-                    await asyncio.sleep(0.001)
-                else:
-                    await asyncio.sleep(min(max(0.0, next_arrival_s - time.monotonic()), 0.001))
+            if finished:
+                continue
+
+            if running_tasks:
+                # Poll briefly so later arrivals can open new lanes while earlier
+                # batches are still running (max_workers == max_batch_size).
+                # IMPORTANT: do not reuse the name ``timeout_s`` — that is the
+                # per-request deadline passed into ``_run_one_batch_request``.
+                poll_timeout_s = 0.001
+                if next_arrival_s is not None:
+                    poll_timeout_s = min(poll_timeout_s, max(0.0, next_arrival_s - time.monotonic()))
+                await asyncio.wait(
+                    set(running_tasks),
+                    timeout=poll_timeout_s,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
                 continue
 
             if next_arrival_s is not None:
@@ -511,6 +527,14 @@ def summarize_traces(
         "end_to_end_latency_p95_ms": _percentile(end_to_end_latency_ms, 95),
         "vlm_prefix_forward_mean_ms": _timing_mean(completed, "vlm_prefix_forward_ms"),
         "vlm_prefix_forward_p50_ms": _timing_percentile(completed, "vlm_prefix_forward_ms", 50),
+        "vlm_prefix_forward_cuda_p50_ms": _timing_percentile(completed, "vlm_prefix_forward_cuda_ms", 50),
+        "vlm_credit_acquire_p50_ms": _timing_percentile(completed, "vlm_credit_acquire_ms", 50),
+        "vlm_credit_acquire_p95_ms": _timing_percentile(completed, "vlm_credit_acquire_ms", 95),
+        "vlm_prefix_write_p50_ms": _timing_percentile(completed, "vlm_prefix_write_ms", 50),
+        "vlm_prefix_write_p95_ms": _timing_percentile(completed, "vlm_prefix_write_ms", 95),
+        "vlm_prefix_publish_p50_ms": _timing_percentile(completed, "vlm_prefix_publish_ms", 50),
+        "vlm_inter_batch_gap_p50_ms": _timing_percentile(completed, "vlm_inter_batch_gap_ms", 50),
+        "vlm_inter_batch_gap_p95_ms": _timing_percentile(completed, "vlm_inter_batch_gap_ms", 95),
         "baseline_vlm_latency_mean_ms": _timing_mean(completed, "baseline_vlm_ms"),
         "baseline_vlm_latency_p50_ms": _timing_percentile(completed, "baseline_vlm_ms", 50),
         "baseline_vlm_latency_p95_ms": _timing_percentile(completed, "baseline_vlm_ms", 95),
@@ -631,6 +655,9 @@ def summarize_traces(
         "ae_step_mean_ms": _timing_mean(completed, "ae_step_ms"),
         "ae_step_p50_ms": _timing_percentile(completed, "ae_step_ms", 50),
         "ae_step_p95_ms": _timing_percentile(completed, "ae_step_ms", 95),
+        "ae_step_cuda_p50_ms": _timing_percentile(completed, "ae_step_cuda_ms", 50),
+        "ae_step_cuda_p95_ms": _timing_percentile(completed, "ae_step_cuda_ms", 95),
+        "ae_step_cuda_total_p50_ms": _timing_percentile(completed, "ae_step_cuda_total_ms", 50),
         "ae_prefix_view_mean_ms": _timing_mean(completed, "ae_prefix_view_ms"),
         "ae_prefix_view_p50_ms": _timing_percentile(completed, "ae_prefix_view_ms", 50),
         "ae_prefix_view_p95_ms": _timing_percentile(completed, "ae_prefix_view_ms", 95),
@@ -792,9 +819,32 @@ def profile_request_rates(args: Args) -> tuple[float, ...]:
     return rates
 
 
+def baseline_model_lane_count(batch_size: int) -> int:
+    """Number of concurrent baseline model lanes (= max batch size by default).
+
+    Override with ``BASELINE_MODEL_LANES`` when a single CUDA context cannot
+    usefully overlap multiple compiled ``sample_actions`` calls (common on one
+    4090): multi-lane admission then inflates per-call latency ~3-4x.
+    """
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+    env = os.environ.get("BASELINE_MODEL_LANES")
+    if env is not None and str(env).strip() != "":
+        lanes = int(env)
+        if lanes <= 0:
+            raise ValueError("BASELINE_MODEL_LANES must be positive")
+        return lanes
+    return batch_size
+
+
 def make_profile_executor(policy: Any, args: Args) -> ThreadPoolExecutor:
     if args.mode in ("monolithic", "jax-monolithic") and args.batch_size > 1:
-        return ThreadPoolExecutor(max_workers=1, thread_name_prefix="va-profile-baseline-model")
+        # Baseline max BS only helps when multiple model lanes can run; previously
+        # max_workers=1 serialized every batch and capped useful concurrency at 1.
+        return ThreadPoolExecutor(
+            max_workers=baseline_model_lane_count(args.batch_size),
+            thread_name_prefix="va-profile-baseline-model",
+        )
     supports_concurrent_infer = bool(getattr(policy, "supports_concurrent_infer", False))
     max_workers = args.max_inflight if supports_concurrent_infer else 1
     return ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="va-profile")
@@ -835,6 +885,7 @@ async def run_timed_workload(
             max_batch_size=args.batch_size,
             max_wait_ms=args.max_vlm_wait_ms,
             executor=executor,
+            max_concurrent_batches=baseline_model_lane_count(args.batch_size),
         )
     return await run_benchmark_requests(
         policy,

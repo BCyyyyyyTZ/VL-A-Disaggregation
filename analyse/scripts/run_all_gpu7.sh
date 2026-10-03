@@ -3,7 +3,10 @@ set -euo pipefail
 
 REPO_ROOT="${REPO_ROOT:-/home/miliang/VL-A-Disaggregation}"
 PYTHON="${PYTHON:-${REPO_ROOT}/.venv/bin/python}"
+# Physical GPU for MPS. After MPS starts with CUDA_VISIBLE_DEVICES=$GPU,
+# client processes must use the remapped device index 0.
 GPU="${GPU:-7}"
+CLIENT_GPU="${CLIENT_GPU:-0}"
 CHECKPOINT_DIR="${CHECKPOINT_DIR:-/home/miliang/model/openpi-assets/checkpoints/pi05_libero}"
 OUTPUT_DIR="${OUTPUT_DIR:-${REPO_ROOT}/analyse/summary/jax_va_overlap}"
 SNAPSHOT_DIR="${SNAPSHOT_DIR:-${REPO_ROOT}/analyse/summary/memory_snapshots}"
@@ -22,21 +25,24 @@ cleanup_mps() {
 }
 trap cleanup_mps EXIT
 
+echo quit | nvidia-cuda-mps-control >/dev/null 2>&1 || true
+sleep 1
 CUDA_VISIBLE_DEVICES="${GPU}" nvidia-cuda-mps-control -d
 
 "${PYTHON}" analyse/src/jax_va_overlap_bench.py \
-    --gpu "${GPU}" \
-    --checkpoint-dir "${CHECKPOINT_DIR}" \
-    --output-dir "${OUTPUT_DIR}" \
-    --snapshot-dir "${SNAPSHOT_DIR}" \
-    --batch-sizes 1,2,4,8,16,32,64 \
-    --num-steps 5 \
-    --warmup 3 \
-    --repeats 10 \
-    --concurrent-duration-s 12 \
-    --experiment all \
-    2>&1 | tee analyse/logs/run_all_gpu${GPU}.log
+  --gpu "${CLIENT_GPU}" \
+  --checkpoint-dir "${CHECKPOINT_DIR}" \
+  --output-dir "${OUTPUT_DIR}" \
+  --snapshot-dir "${SNAPSHOT_DIR}" \
+  --batch-sizes 1,2,4,8,16,32,64 \
+  --ae-batch-size 0 \
+  --num-steps 5 \
+  --warmup 3 \
+  --repeats 10 \
+  --concurrent-duration-s 12 \
+  --experiment all \
+  2>&1 | tee "analyse/logs/run_all_gpu${GPU}.log"
 
 "${PYTHON}" analyse/src/summarize_overlap.py \
   --output-dir "${OUTPUT_DIR}" \
-  2>&1 | tee analyse/logs/summarize_gpu${GPU}.log
+  2>&1 | tee "analyse/logs/summarize_gpu${GPU}.log"

@@ -196,15 +196,23 @@ class PaliGemmaWithExpertModel(nn.Module):
                 batch_size = query_states.shape[0]
                 scaling = self.paligemma.language_model.layers[layer_idx].self_attn.scaling
 
-                # Attention computation
-                att_output, _ = modeling_gemma.eager_attention_forward(
-                    self.paligemma.language_model.layers[layer_idx].self_attn,
+                # Attention computation — match Dexmal realtime-vla batched path (SDPA),
+                # not OpenPI's default eager matmul+softmax.
+                attn_module = self.paligemma.language_model.layers[layer_idx].self_attn
+                key_states = modeling_gemma.repeat_kv(key_states, attn_module.num_key_value_groups)
+                value_states = modeling_gemma.repeat_kv(value_states, attn_module.num_key_value_groups)
+                sdpa_mask = (
+                    attention_mask.to(dtype=query_states.dtype) if attention_mask is not None else None
+                )
+                att_output = torch.nn.functional.scaled_dot_product_attention(
                     query_states,
                     key_states,
                     value_states,
-                    attention_mask,
-                    scaling,
+                    attn_mask=sdpa_mask,
+                    dropout_p=0.0,
+                    scale=scaling,
                 )
+                att_output = att_output.transpose(1, 2).contiguous()
                 # Get head_dim from the current layer, not from the model
                 head_dim = self.paligemma.language_model.layers[layer_idx].self_attn.head_dim
                 att_output = att_output.reshape(batch_size, -1, 1 * 8 * head_dim)

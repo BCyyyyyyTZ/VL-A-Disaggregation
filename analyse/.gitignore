@@ -10,3 +10,8 @@ summary/*.qdrep
 summary/*.nsys-rep
 summary/*.sqlite
 summary/memory_snapshots/
+summary/ae_slowdown_diagnosis/
+summary/ae_slowdown_diagnosis_quota_env/
+summary/nsys_kernel_cases/
+summary/pytorch_quota_smoke_cuda2/
+summary/pytorch_quota_sweep/
