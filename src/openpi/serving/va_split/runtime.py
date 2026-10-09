@@ -36,7 +36,7 @@ class LocalVASplitRuntime:
         device: str,
         max_ae_batch_size: int = 8,
         max_prefix_slots: int | None = None,
-        enable_component_timing: bool = True,
+        enable_component_timing: bool = False,
     ):
         self.vlm_worker = VLMWorker(
             model=model,
@@ -127,7 +127,7 @@ def _run_vlm_process(
     max_vlm_wait_ms,
     max_live_features,
     env_updates=None,
-    enable_component_timing=True,
+    enable_component_timing=False,
     ready_queue=None,
     use_shared_prefix_lanes=False,
 ) -> None:
@@ -162,7 +162,7 @@ def _run_ae_process(
     max_ae_batch_size,
     max_prefix_slots,
     env_updates=None,
-    enable_component_timing=True,
+    enable_component_timing=False,
     ready_queue=None,
     use_shared_prefix_lanes=False,
 ) -> None:
@@ -202,7 +202,7 @@ class ProcessVASplitRuntime:
         result_timeout_s: float = 120.0,
         vlm_env_updates: dict[str, str | None] | None = None,
         ae_env_updates: dict[str, str | None] | None = None,
-        enable_component_timing: bool = True,
+        enable_component_timing: bool = False,
     ):
         if max_prefix_slots is None:
             # Optional experiment knobs (default remains a fixed 24-slot live/admission pool):

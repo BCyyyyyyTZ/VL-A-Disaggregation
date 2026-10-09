@@ -20,7 +20,7 @@ def test_run_va_split_mps_defaults_to_libero_env_python():
     assert 'WARMUP_CONCURRENT_INFLIGHT="${WARMUP_CONCURRENT_INFLIGHT:-${MAX_VLM_BATCH_SIZE}}"' in script
     assert 'BATCH_SIZE="${BATCH_SIZE:-${MAX_VLM_BATCH_SIZE}}"' in script
     assert 'ENABLE_POLICY_BATCH="${ENABLE_POLICY_BATCH:-true}"' in script
-    assert 'ENABLE_COMPONENT_TIMING="${ENABLE_COMPONENT_TIMING:-true}"' in script
+    assert 'ENABLE_COMPONENT_TIMING="${ENABLE_COMPONENT_TIMING:-false}"' in script
     assert 'VA_SPLIT_MAX_VLM_BATCH_SIZE="${VA_SPLIT_MAX_VLM_BATCH_SIZE:-8}"' in script
     assert 'VA_SPLIT_MAX_VLM_WAIT_MS="${VA_SPLIT_MAX_VLM_WAIT_MS:-1.0}"' in script
     assert 'PYTORCH_COMPILE_MODE="${PYTORCH_COMPILE_MODE:-}"' in script
@@ -88,7 +88,7 @@ def test_run_va_split_mps_profile_mode_invokes_profile_workload(tmp_path):
     assert _flag_value(args, "--warmup-concurrent-inflight") == "13"
     assert "--no-warmup-until-steady" in args
     assert _flag_value(args, "--pytorch-compile-mode") == "default"
-    assert "--enable-component-timing" in args
+    assert "--no-enable-component-timing" in args
     assert _flag_value(args, "--max-vlm-batch-size") == "13"
     assert _flag_value(args, "--max-vlm-wait-ms") == "1.5"
     assert _flag_value(args, "--gpu-device-index") == "5"
@@ -113,7 +113,7 @@ def test_run_va_split_mps_profile_mode_invokes_profile_workload(tmp_path):
     assert "MAX_VLM_WAIT_MS=1.5" in gpu_binding
     assert "BATCH_SIZE=3" in gpu_binding
     assert "ENABLE_POLICY_BATCH=true" in gpu_binding
-    assert "ENABLE_COMPONENT_TIMING=true" in gpu_binding
+    assert "ENABLE_COMPONENT_TIMING=false" in gpu_binding
 
 
 def test_run_va_split_mps_profile_rates_passes_rate_list(tmp_path):
@@ -281,7 +281,7 @@ def test_run_va_split_mps_server_forwards_safe_compile_mode(tmp_path):
     assert _flag_value(args, "--va-split-max-vlm-batch-size") == "5"
     assert _flag_value(args, "--va-split-max-vlm-wait-ms") == "0.5"
     assert "--no-enable-policy-batch" in args
-    assert "--enable-component-timing" in args
+    assert "--no-enable-component-timing" in args
 
 
 def _prepare_stub_tools(

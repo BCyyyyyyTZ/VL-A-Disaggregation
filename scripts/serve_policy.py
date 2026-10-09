@@ -64,7 +64,7 @@ class Args:
     ae_sm_percent: int = 20
     vlm_sm_percent: int = 0
     enable_policy_batch: bool = True
-    enable_component_timing: bool = True
+    enable_component_timing: bool = False
     pytorch_device: str | None = None
     pytorch_compile_mode: CompileMode | None = None
 

@@ -22,7 +22,7 @@ def create_trained_policy(
     default_prompt: str | None = None,
     norm_stats: dict[str, transforms.NormStats] | None = None,
     pytorch_device: str | None = None,
-    enable_component_timing: bool = True,
+    enable_component_timing: bool = False,
 ) -> _policy.Policy:
     """Create a policy from a trained checkpoint.
 

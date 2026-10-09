@@ -35,7 +35,7 @@ class Policy(BasePolicy):
         metadata: dict[str, Any] | None = None,
         pytorch_device: str = "cpu",
         is_pytorch: bool = False,
-        enable_component_timing: bool = True,
+        enable_component_timing: bool = False,
     ):
         """Initialize the Policy.
 

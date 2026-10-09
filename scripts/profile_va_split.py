@@ -116,7 +116,7 @@ class Args:
     slo_ms: float = 200.0
     pytorch_device: str | None = None
     pytorch_compile_mode: CompileMode | None = None
-    enable_component_timing: bool = True
+    enable_component_timing: bool = False
     max_ae_batch_size: int = 8
     max_vlm_batch_size: int = 8
     max_vlm_wait_ms: float = 2.0

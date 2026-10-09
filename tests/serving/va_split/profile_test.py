@@ -808,7 +808,7 @@ def test_create_policy_for_mode_uses_profile_timeout_for_split_runtime(monkeypat
     assert captured_kwargs["result_timeout_s"] == 321.0
     assert captured_kwargs["max_vlm_batch_size"] == 6
     assert captured_kwargs["max_vlm_wait_ms"] == 1.25
-    assert captured_kwargs["enable_component_timing"] is True
+    assert captured_kwargs["enable_component_timing"] is False
 
 
 def test_create_policy_for_mode_forwards_split_compile_warmup_cap_to_jax(monkeypatch):

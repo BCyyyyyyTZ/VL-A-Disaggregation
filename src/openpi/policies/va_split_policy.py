@@ -232,7 +232,7 @@ def create_trained_va_split_policy(
     ae_sm_percent: int = 20,
     vlm_sm_percent: int = 0,
     result_timeout_s: float = 120.0,
-    enable_component_timing: bool = True,
+    enable_component_timing: bool = False,
 ) -> VASplitPolicy:
     """Create a PyTorch VA split policy from a trained checkpoint."""
     repack_transforms = repack_transforms or _transforms.Group()

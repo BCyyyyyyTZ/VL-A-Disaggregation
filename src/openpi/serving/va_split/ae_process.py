@@ -60,7 +60,7 @@ class AEWorker:
         max_batch_size: int,
         max_prefix_slots: int | None = None,
         *,
-        enable_component_timing: bool = True,
+        enable_component_timing: bool = False,
     ):
         if max_batch_size <= 0:
             raise ValueError("max_batch_size must be positive")
@@ -389,7 +389,7 @@ class AEProcess:
         release_queue,
         max_batch_size: int,
         max_prefix_slots: int | None = None,
-        enable_component_timing: bool = True,
+        enable_component_timing: bool = False,
         use_shared_prefix_lanes: bool = False,
     ):
         self.worker = AEWorker(

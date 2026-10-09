@@ -59,7 +59,7 @@ class VLMWorker:
         device: str,
         max_live_features: int | None = None,
         *,
-        enable_component_timing: bool = True,
+        enable_component_timing: bool = False,
     ):
         if max_live_features is not None and max_live_features <= 0:
             raise ValueError("max_live_features must be positive")
@@ -233,7 +233,7 @@ class VLMProcess:
         max_batch_size: int = 8,
         max_wait_ms: float = 2.0,
         max_live_features: int | None = None,
-        enable_component_timing: bool = True,
+        enable_component_timing: bool = False,
         use_shared_prefix_lanes: bool = False,
     ):
         if max_batch_size <= 0:
